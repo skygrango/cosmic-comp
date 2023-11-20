@@ -1506,7 +1506,7 @@ impl KmsState {
                                     .unwrap_or_else(|_| String::from("Unknown"))
                             )
                         })?;
-                        surface.surface = Some(target);
+                        surface.surface = Some(dbg!(target));
                         true
                     };
                     shell.add_output(output);
