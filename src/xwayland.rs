@@ -32,7 +32,7 @@ use smithay::{
         Buffer as BufferCoords, Logical, Point, Rectangle, SERIAL_COUNTER, Serial, Size, Transform,
     },
     wayland::{
-        selection::{
+        compositor::with_states, seat::WaylandFocus, selection::{
             SelectionTarget,
             data_device::{
                 clear_data_device_selection, current_data_device_selection_userdata,
@@ -42,8 +42,7 @@ use smithay::{
                 clear_primary_selection, current_primary_selection_userdata,
                 request_primary_client_selection, set_primary_selection,
             },
-        },
-        xdg_activation::XdgActivationToken,
+        }, shell::xdg::SurfaceCachedState, xdg_activation::XdgActivationToken
     },
     xwayland::{
         X11Surface, X11Wm, XWayland, XWaylandClientData, XWaylandEvent, XwmHandler,
@@ -813,6 +812,26 @@ impl XwmHandler for State {
         {
             return;
         }
+
+        // if let Some(size) = window.max_size() {
+        //    let _ = window.configure(Some(Rectangle::from_size(size)));
+        // }
+
+
+        // if let Some(mapped) = shell
+        //         .element_for_surface(&window)
+        //         .filter(|mapped| !mapped.is_minimized())
+        // {
+        //     if mapped.geometry() != window.geometry() {
+        //         if let Some(workspace) = shell.space_for(mapped) {
+        //             if let Some(geo) = workspace
+        //             .element_geometry(mapped)
+        //             .map(|geo| geo.to_global(workspace.output())) {
+        //                 mapped.set_geometry(window.to_global());
+        //             }
+        //         }
+        //     }
+        // }
         shell.map_override_redirect(window)
     }
 
@@ -853,77 +872,228 @@ impl XwmHandler for State {
         h: Option<u32>,
         _reorder: Option<Reorder>,
     ) {
+    //     fn fullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
+    //     let mut shell = self.common.shell.write();
+    //     let seat = shell.seats.last_active().clone();
+    //     let output = window
+    //         .wl_surface()
+    //         .and_then(|surface| shell.visible_output_for_surface(&surface).cloned())
+    //         .unwrap_or_else(|| seat.focused_or_active_output());
+
+    //     match shell.fullscreen_request(&window, output.clone(), &self.common.event_loop_handle) {
+    //         Some(target) => {
+    //             std::mem::drop(shell);
+    //             Shell::set_focus(self, Some(&target), &seat, None, true);
+    //         }
+    //         None => {
+    //             if let Some(pending) = shell
+    //                 .pending_windows
+    //                 .iter_mut()
+    //                 .find(|pending| pending.surface.x11_surface() == Some(&window))
+    //             {
+    //                 pending.fullscreen = Some(output);
+    //             }
+    //         }
+    //     }
+    // }
         // We only allow floating X11 windows to resize themselves. Nothing else
-        let shell = self.common.shell.read();
-
-        // TODO: Fullscreen
-        if let Some(mapped) = shell
-            .element_for_surface(&window)
-            .filter(|mapped| !mapped.is_minimized())
-        {
-            let current_geo = if let Some(workspace) = shell.space_for(mapped) {
-                workspace
-                    .element_geometry(mapped)
-                    .filter(|_| workspace.is_floating(&window))
-                    .map(|geo| geo.to_global(workspace.output()))
-            } else if let Some((output, set)) = shell
-                .workspaces
-                .sets
-                .iter()
-                .find(|(_, set)| set.sticky_layer.mapped().any(|m| m == mapped))
+        
+        if window.is_fullscreen() {
+            let mut shell = self.common.shell.write();
+            if let Some(mapped) = shell
+                .element_for_surface(&window)
+                .filter(|mapped| !mapped.is_minimized())
             {
-                Some(
-                    set.sticky_layer
+                let current_geo: Option<Rectangle<i32, Global>> = if let Some(workspace) = shell.space_for(mapped) {
+                    workspace
                         .element_geometry(mapped)
-                        .unwrap()
-                        .to_global(output),
-                )
-            } else {
-                None
-            };
-
-            if let Some(current_geo) = current_geo {
-                let ssd_height = mapped.ssd_height(false).unwrap_or(0);
-                mapped.set_geometry(Rectangle::new(
-                    current_geo.loc,
-                    (
-                        w.map(|w| w as i32).unwrap_or(current_geo.size.w),
-                        h.map(|h| h as i32 + ssd_height)
-                            .unwrap_or(current_geo.size.h),
+                        .filter(|_| !workspace.is_tiled(&window))
+                        .map(|geo| geo.to_global(workspace.output()))
+                } else if let Some((output, set)) = shell
+                    .workspaces
+                    .sets
+                    .iter()
+                    .find(|(_, set)| set.sticky_layer.mapped().any(|m| m == mapped))
+                {
+                    Some(
+                        set.sticky_layer
+                            .element_geometry(mapped)
+                            .unwrap()
+                            .to_global(output),
                     )
+                } else {
+                    None
+                };
+
+                if let Some(current_geo) = current_geo {
+                    let geo = Rectangle::new(
+                        current_geo.loc,
+                        (
+                            w.map(|w| w as i32).unwrap_or(current_geo.size.w),
+                            h.map(|h| h as i32 )
+                                .unwrap_or(current_geo.size.h),
+                        )
                         .into(),
-                ))
+                    );
+                    mapped.set_geometry(geo);
+                    // let local_geo = Rectangle::from_size((
+                    //         w.map(|w| w as i32).unwrap_or(current_geo.size.w),
+                    //         h.map(|h| h as i32 )
+                    //             .unwrap_or(current_geo.size.h),
+                    //     )
+                    //     .into());
+                    // let _ = window.configure(Rectangle::from_size((
+                    //         w.map(|w| w as i32).unwrap_or(current_geo.size.w),
+                    //         h.map(|h| h as i32 )
+                    //             .unwrap_or(current_geo.size.h),
+                    //     )
+                    //     .into()));
+                    // if let Some(surface) = window.wl_surface() {
+                    //     with_states(&surface, |states| {
+                    //         let mut cache = states
+                    //             .cached_state
+                    //             .get::<SurfaceCachedState>();
+                    //         cache.current().geometry = Some(local_geo);
+                    //     })
+                    // }
+                }
+            }
+
+            let seat = shell.seats.last_active().clone();
+            let output = window
+            .wl_surface()
+            .and_then(|surface| shell.visible_output_for_surface(&surface).cloned())
+            .unwrap_or_else(|| seat.focused_or_active_output());
+            match shell.fullscreen_request(&window, output.clone(), &self.common.event_loop_handle) {
+                Some(target) => {
+                    std::mem::drop(shell);
+                    Shell::set_focus(self, Some(&target), &seat, None, true);
+                }
+                None => {
+                    if let Some(pending) = shell
+                        .pending_windows
+                        .iter_mut()
+                        .find(|pending| pending.surface.x11_surface() == Some(&window))
+                    {
+                        pending.fullscreen = Some(output);
+                    }
+                }
+            }
+        }else{
+            let shell = self.common.shell.read();
+            if let Some(mapped) = shell
+                .element_for_surface(&window)
+                .filter(|mapped| !mapped.is_minimized())
+            {
+                let current_geo = if let Some(workspace) = shell.space_for(mapped) {
+                    workspace
+                        .element_geometry(mapped)
+                        .filter(|_| workspace.is_floating(&window))
+                        .map(|geo| geo.to_global(workspace.output()))
+                } else if let Some((output, set)) = shell
+                    .workspaces
+                    .sets
+                    .iter()
+                    .find(|(_, set)| set.sticky_layer.mapped().any(|m| m == mapped))
+                {
+                    Some(
+                        set.sticky_layer
+                            .element_geometry(mapped)
+                            .unwrap()
+                            .to_global(output),
+                    )
+                } else {
+                    None
+                };
+                if let Some(current_geo) = current_geo {
+                    let ssd_height = mapped.ssd_height(false).unwrap_or(0);
+                    mapped.set_geometry(Rectangle::new(
+                        current_geo.loc,
+                        (
+                            w.map(|w| w as i32).unwrap_or(current_geo.size.w),
+                            h.map(|h| h as i32 + ssd_height)
+                                .unwrap_or(current_geo.size.h),
+                        )
+                            .into(),
+                    ))
+                }
             } else {
-                let _ = window.configure(None); // ack and force old state
+                let mut current_geo = window.geometry();
+                if let Some(x) = x {
+                    current_geo.loc.x = x;
+                }
+                if let Some(y) = y {
+                    current_geo.loc.y = y;
+                }
+                if let Some(w) = w {
+                    current_geo.size.w = w as i32;
+                }
+                if let Some(h) = h {
+                    current_geo.size.h = h as i32;
+                }
+                // the window is not yet mapped. Lets give it what it wants
+                let _ = window.configure(current_geo);
             }
-        } else {
-            let mut current_geo = window.geometry();
-            if let Some(x) = x {
-                current_geo.loc.x = x;
-            }
-            if let Some(y) = y {
-                current_geo.loc.y = y;
-            }
-            if let Some(w) = w {
-                current_geo.size.w = w as i32;
-            }
-            if let Some(h) = h {
-                current_geo.size.h = h as i32;
-            }
-            // the window is not yet mapped. Lets give it what it wants
-            let _ = window.configure(current_geo);
         }
+        
+        // TODO: Fullscreen
     }
 
     fn configure_notify(
         &mut self,
         _xwm: XwmId,
         window: X11Surface,
-        _geometry: Rectangle<i32, Logical>,
+        geometry: Rectangle<i32, Logical>,
         above: Option<X11Window>,
     ) {
+        // {
+        //     let shell = self.common.shell.write();
+        //     if let Some(mapped) = shell.element_for_surface(&window).cloned() {
+        //         mapped.set_geometry(geometry.as_global());
+        //     }
+        // }
         if window.is_override_redirect() {
             let mut shell = self.common.shell.write();
+            // if let Some(size) = window.max_size() {
+            //     if let Some(mapped) = shell.element_for_surface(&window).cloned() {
+            //         mapped.set_geometry(Rectangle::from_size(size).as_global());
+            //         // if let Some((cosmic_surface, point)) = mapped.windows().find(|(cosmic_surface, point)|{
+            //         //     cosmic_surface.wl_surface().as_deref() == window.wl_surface().as_ref()
+            //         // }) {
+            //         //     cosmic_surface.0
+            //         // }
+            //     }
+            //     let _ = window.configure(Some(Rectangle::from_size(size)));
+            //     if let Some(surface) = window.wl_surface() {
+            //         with_states(&surface, |states| {
+            //             let mut cache = states
+            //                 .cached_state
+            //                 .get::<SurfaceCachedState>();
+            //             cache.current().geometry = Some(Rectangle::from_size(size));
+            //         })
+            //     }
+            // }else{
+            //     if let Some(mapped) = shell.element_for_surface(&window).cloned() {
+            //         mapped.set_geometry(geometry.as_global());
+            //         // if let Some((cosmic_surface, point)) = mapped.windows().find(|(cosmic_surface, point)|{
+            //         //     cosmic_surface.wl_surface().as_deref() == window.wl_surface().as_ref()
+            //         // }) {
+            //         //     cosmic_surface.0
+            //         // }
+            //     }
+            //     let _ = window.configure(geometry);
+            //     if let Some(surface) = window.wl_surface() {
+            //         with_states(&surface, |states| {
+            //             let mut cache = states
+            //                 .cached_state
+            //                 .get::<SurfaceCachedState>();
+            //             cache.current().geometry = Some(geometry);
+            //         })
+            //     }
+            // }
+            
+            
+
             if let Some(id) = above {
                 let or_windows = &mut shell.override_redirect_windows;
                 if let Some(own_pos) = or_windows.iter().position(|or| or == &window) {
@@ -938,7 +1108,7 @@ impl XwmHandler for State {
                 }
             }
 
-            let geo = window.geometry().as_global();
+            let geo: Rectangle<i32, Global> = window.geometry().as_global();
             for (output, overlap) in shell.outputs().cloned().map(|o| {
                 let intersection = o.geometry().intersection(geo);
                 (o, intersection)
@@ -988,6 +1158,9 @@ impl XwmHandler for State {
     }
 
     fn move_request(&mut self, _xwm: XwmId, window: X11Surface, _button: u32) {
+        if window.is_fullscreen() {
+            return;
+        }
         if let Some(wl_surface) = window.wl_surface() {
             let mut shell = self.common.shell.write();
             let seat = shell.seats.last_active().clone();
