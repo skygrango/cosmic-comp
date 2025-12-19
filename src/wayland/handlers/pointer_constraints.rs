@@ -112,11 +112,11 @@ impl PointerConstraintsHandler for State {
                     let workspace_origin = out.geometry().loc.to_f64();
 
                     pointer.set_location(Point::new(
-                        workspace_origin.x + origin.x + last_pointer.x,
-                        workspace_origin.y + origin.y + last_pointer.y,
+                        workspace_origin.x + last_pointer.x,
+                        workspace_origin.y + last_pointer.y,
                     ));
                 }
-                };
+            };
         }
     }
 }

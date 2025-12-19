@@ -50,7 +50,7 @@ use smithay::{
     },
     utils::{IsAlive, Logical, Point, Rectangle, Serial, Size},
     wayland::{
-        compositor::{SurfaceAttributes, with_states},
+        compositor::{BufferAssignment, RegionAttributes, SurfaceAttributes, with_states},
         seat::WaylandFocus,
         session_lock::LockSurface,
         shell::wlr_layer::{KeyboardInteractivity, Layer, LayerSurfaceCachedState},
@@ -1473,6 +1473,26 @@ impl Common {
         {
             let shell = self.shell.read();
 
+            // if let Some(mapped) = shell.element_for_surface(surface) {
+            //     with_states(surface, |states| {
+            //         if let Some(wl_buffer) = states.data_map.get::<RegionAttributes>().and_then(|attr|{
+            //             attr.rects
+                        
+            //             attr.buffer.as_ref()
+            //             .and_then(|buffer|{
+            //                 if let BufferAssignment::NewBuffer(wl_buffer) = buffer {
+            //                     Some(wl_buffer)
+            //                 }else{
+            //                     None
+            //                 }
+            //             })
+            //         }){
+            //             wl_buffer
+            //         };
+  
+            //     });
+            // }
+
             for seat in shell.seats.iter() {
                 if let Some(move_grab) = seat.user_data().get::<SeatMoveGrabState>() {
                     if let Some(grab_state) = move_grab.lock().unwrap().as_ref() {
@@ -2450,6 +2470,7 @@ impl Shell {
         state: Option<FullscreenRestoreState>,
         loop_handle: &LoopHandle<'static, State>,
     ) -> CosmicMapped {
+        let is_x11 = surface.0.is_x11();
         let window = CosmicMapped::from(CosmicWindow::new(
             surface,
             loop_handle.clone(),
@@ -2525,12 +2546,17 @@ impl Shell {
                     },
                 ..
             }) => {
-                workspace.floating_layer.map_internal(
+                if is_x11 {
+                    workspace.floating_layer.space.map_element(window.clone(), Point::from((0, 0)), false);
+                    workspace.floating_layer.space.refresh();
+                }else{
+                    workspace.floating_layer.map_internal(
                     window.clone(),
                     Some(geometry.loc),
                     Some(geometry.size.as_logical()),
                     Some(fullscreen_geometry),
-                );
+                    );
+                }
                 if was_maximized {
                     let mut state = window.maximized_state.lock().unwrap();
                     *state = Some(MaximizedState {
@@ -4583,7 +4609,7 @@ impl Shell {
             .iter_mut()
             .find(|(_, set)| set.sticky_layer.mapped().any(|m| m == &mapped))
         {
-            let mut from = set.sticky_layer.element_geometry(&mapped).unwrap();
+            let mut from: Rectangle<i32, Local> = set.sticky_layer.element_geometry(&mapped).unwrap();
             let mut was_maximized = false;
             window = if mapped
                 .stack_ref()
