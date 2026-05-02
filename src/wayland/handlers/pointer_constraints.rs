@@ -66,15 +66,24 @@ fn find_window<'a>(
 impl PointerConstraintsHandler for State {
     fn new_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
         // XXX region
-        if pointer
-            .current_focus()
-            .is_some_and(|x| x.wl_surface().as_deref() == Some(surface))
-        {
+        let seat = self.common.shell.read().seats.iter().find(|s| s.get_pointer().as_ref() == Some(pointer)).cloned();
+        let focused = seat.and_then(|s| s.get_keyboard()).and_then(|k| k.current_focus());
+        let is_focused = focused.is_some_and(|f| {
+            let shell = self.common.shell.read();
+            if let Some(fe) = shell.focused_element(&f) {
+                fe.has_surface(surface, smithay::desktop::WindowSurfaceType::ALL)
+            } else if let crate::shell::focus::target::KeyboardFocusTarget::Fullscreen(s) = f {
+                s.has_surface(surface, smithay::desktop::WindowSurfaceType::ALL)
+            } else {
+                f.wl_surface().as_deref() == Some(surface)
+            }
+        });
+
+        if is_focused {
             with_pointer_constraint(surface, pointer, |constraint| {
                 if let Some(constraint) = constraint {
                     constraint.activate();
                 }
-                
             });
         }
     }
