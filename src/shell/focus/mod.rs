@@ -359,14 +359,20 @@ fn update_focus_state(
             && let Some(surface) = old_target.wl_surface()
         {
             let pointer = seat.get_pointer().unwrap();
-            with_pointer_constraint(&surface, &pointer, |constraint| {
+            let hint = with_pointer_constraint(&surface, &pointer, |constraint| {
                 if let Some(constraint) = constraint.as_deref()
                     && constraint.is_active()
                     && let PointerConstraint::Locked(locked) = constraint
-                    && let Some(hint) = locked.cursor_position_hint() {
-                        apply_cursor_hint(state, &surface, &pointer, hint);
-                    }
+                    && let Some(hint) = locked.cursor_position_hint()
+                {
+                    Some(hint)
+                } else {
+                    None
+                }
             });
+            if let Some(hint) = hint {
+                apply_cursor_hint(state, &surface, &pointer, hint);
+            }
         }
 
         if should_update_cursor

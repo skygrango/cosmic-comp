@@ -96,31 +96,41 @@ pub fn apply_cursor_hint(
     pointer: &PointerHandle<State>,
     location: Point<f64, Logical>,
 ) {
-    if let Some((out, header, geometry)) = state
-        .common
-        .shell
-        .read()
-        .workspaces
-        .sets
-        .iter()
-        .find_map(|(out, set)| find_window(out, set, surface))
-    {
-        let window_size = geometry.size.to_f64();
-
-        if location.x >= 0.0
-            && location.y >= 0.0
-            && location.x <= window_size.w
-            && location.y <= window_size.h
+    let point = {
+        if let Some((out, header, geometry)) = state
+            .common
+            .shell
+            .read()
+            .workspaces
+            .sets
+            .iter()
+            .find_map(|(out, set)| find_window(out, set, surface))
         {
-            let header_offset = header.map(|h| h.to_f64()).unwrap_or_default();
-            let origin = geometry.loc.to_f64();
-            // the offset from the output (monitor position)
-            let workspace_origin = out.geometry().loc.to_f64();
-            let x = workspace_origin.x + origin.x + header_offset.x + location.x;
-            let y = workspace_origin.y + origin.y + header_offset.y + location.y;
-            pointer.set_location(Point::new(x, y));
-            crate::write_point_position(x, y);
+            let window_size = geometry.size.to_f64();
+
+            if location.x >= 0.0
+                && location.y >= 0.0
+                && location.x <= window_size.w
+                && location.y <= window_size.h
+            {
+                let header_offset = header.map(|h| h.to_f64()).unwrap_or_default();
+                let origin = geometry.loc.to_f64();
+                // the offset from the output (monitor position)
+                let workspace_origin = out.geometry().loc.to_f64();
+                let x = workspace_origin.x + origin.x + header_offset.x + location.x;
+                let y = workspace_origin.y + origin.y + header_offset.y + location.y;
+                Some(Point::new(x, y))
+            } else {
+                None
+            }
+        } else {
+            None
         }
     };
+
+    if let Some(point) = point {
+        pointer.set_location(point);
+        crate::write_point_position(point.x, point.y);
+    }
 }
 delegate_pointer_constraints!(State);
