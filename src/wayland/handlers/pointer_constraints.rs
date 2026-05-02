@@ -90,12 +90,16 @@ impl PointerConstraintsHandler for State {
 
     fn cursor_position_hint(
         &mut self,
-        _surface: &WlSurface,
-        _pointer: &PointerHandle<Self>,
-        _location: Point<f64, Logical>,
+        surface: &WlSurface,
+        pointer: &PointerHandle<Self>,
+        location: Point<f64, Logical>,
     ) {
-        // Do nothing here. The hint is stored in the constraint by Smithay.
-        // We will apply it when the constraint is deactivated.
+        // Apply the hint immediately if the constraint is active.
+        if with_pointer_constraint(surface, pointer, |constraint| {
+            constraint.is_some_and(|c| c.is_active())
+        }) {
+            apply_cursor_hint(self, surface, pointer, location);
+        }
     }
 }
 

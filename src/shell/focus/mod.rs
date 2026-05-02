@@ -376,9 +376,9 @@ fn update_focus_state(
 
                 hint
             });
-            if let Some(hint) = hint {
-                apply_cursor_hint(state, &surface, &pointer, hint);
-            }
+            // if let Some(hint) = hint {
+            //     apply_cursor_hint(state, &surface, &pointer, hint);
+            // }
         }
 
         if should_update_cursor
