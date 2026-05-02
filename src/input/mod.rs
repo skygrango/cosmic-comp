@@ -475,6 +475,37 @@ impl State {
                         (output_geometry.loc.y + output_geometry.size.h - 1) as f64,
                     );
 
+                    if pointer_confined && let Some((surface, surface_loc)) = &under {
+                        let is_legal = |pos: Point<f64, Global>, shell: &Shell| {
+                            if State::surface_under(pos, &output, shell)
+                                .and_then(|(t, _)| t.wl_surface().map(|s| s.into_owned()))
+                                != surface.wl_surface().map(|s| s.into_owned())
+                            {
+                                return false;
+                            }
+                            if let Some(region) = &confine_region {
+                                if !region
+                                    .contains((pos.as_logical() - *surface_loc).to_i32_round())
+                                {
+                                    return false;
+                                }
+                            }
+                            true
+                        };
+
+                        if !is_legal(position, &shell) {
+                            let y_only_pos = Point::new(original_position.x, position.y);
+                            let x_only_pos = Point::new(position.x, original_position.y);
+                            if is_legal(y_only_pos, &shell) {
+                                position = y_only_pos;
+                            } else if is_legal(x_only_pos, &shell) {
+                                position = x_only_pos;
+                            } else {
+                                position = original_position;
+                            }
+                        }
+                    }
+
                     let new_under = State::surface_under(position, &output, &shell)
                         .map(|(target, pos)| (target, pos.as_logical()));
 
@@ -596,52 +627,6 @@ impl State {
                                     });
                                 }
                             }
-                        }
-                    }
-
-                    // If confined, don't move pointer if it would go outside surface or region
-                    if pointer_confined && let Some((surface, surface_loc)) = &under {
-                        if new_under.as_ref().and_then(|(under, _)| under.wl_surface())
-                            != surface.wl_surface()
-                        {
-                            ptr.frame(self);
-                            return;
-                        }
-                        match surface {
-                            PointerFocusTarget::WlSurface { surface, .. } => {
-                                if under_from_surface_tree(
-                                    surface,
-                                    position.as_logical() - surface_loc.to_f64(),
-                                    (0, 0),
-                                    WindowSurfaceType::ALL,
-                                )
-                                .is_none()
-                                {
-                                    ptr.frame(self);
-                                    return;
-                                }
-                            }
-                            PointerFocusTarget::X11Surface { surface, .. } => {
-                                if surface
-                                    .surface_under(
-                                        position.as_logical() - surface_loc.to_f64(),
-                                        (0, 0),
-                                        WindowSurfaceType::ALL,
-                                    )
-                                    .is_none()
-                                {
-                                    ptr.frame(self);
-                                    return;
-                                }
-                            }
-                            _ => {}
-                        }
-                        if let Some(region) = confine_region
-                            && !region
-                                .contains((position.as_logical() - *surface_loc).to_i32_round())
-                        {
-                            ptr.frame(self);
-                            return;
                         }
                     }
 
