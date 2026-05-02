@@ -192,11 +192,12 @@ impl Shell {
         target: Option<&KeyboardFocusTarget>,
         seat: &Seat<State>,
         serial: Option<Serial>,
-        update_cursor: bool,
+        mut update_cursor: bool,
     ) {
         let focus_target = match target {
             Some(KeyboardFocusTarget::Element(mapped)) => Some(FocusTarget::Window(mapped.clone())),
             Some(KeyboardFocusTarget::Fullscreen(surface)) => {
+                update_cursor = false;
                 Some(FocusTarget::Fullscreen(surface.clone()))
             }
             _ => None,
@@ -380,6 +381,7 @@ fn update_focus_state(
                         time: 0,
                     },
                 );
+                crate::write_point_position(new_pos.x, new_pos.y);
             }
         }
 

@@ -1,16 +1,65 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-use crate::state::State;
+use crate::{
+    shell::WorkspaceSet,
+    state::State,
+    utils::prelude::{Local, OutputExt},
+};
 use smithay::{
     delegate_pointer_constraints,
     input::pointer::PointerHandle,
+    output::Output,
     reexports::wayland_server::protocol::wl_surface::WlSurface,
-    utils::{Logical, Point},
+    utils::{Logical, Point, Rectangle},
     wayland::{
         pointer_constraints::{PointerConstraintsHandler, with_pointer_constraint},
         seat::WaylandFocus,
     },
 };
+
+fn find_window<'a>(
+    out: &'a Output,
+    set: &WorkspaceSet,
+    surface: &WlSurface,
+) -> Option<(
+    &'a Output,
+    Option<Point<i32, Logical>>,
+    Rectangle<i32, Local>,
+)> {
+    set.sticky_layer
+        .mapped()
+        .find(|w| w.wl_surface().as_deref() == Some(surface))
+        .and_then(|w| {
+            set.sticky_layer
+                .element_geometry(w)
+                .map(|geom| (out, Some(w.active_window_offset()), geom))
+        })
+        .or_else(|| {
+            set.workspaces.iter().find_map(|workspace| {
+                workspace
+                    .get_fullscreen()
+                    .and_then(|fullscreen| {
+                        if fullscreen.wl_surface().as_deref() == Some(surface) {
+                            workspace
+                                .fullscreen_geometry()
+                                .map(|geom| (out, None, geom))
+                        } else {
+                            None
+                        }
+                    })
+                    .or_else(|| {
+                        workspace
+                            .mapped()
+                            .find(|w| w.wl_surface().as_deref() == Some(surface))
+                            .and_then(|w| {
+                                workspace
+                                    .element_geometry(w)
+                                    .map(|geom| (out, Some(w.active_window_offset()), geom))
+                            })
+                    })
+            })
+        })
+}
 
 impl PointerConstraintsHandler for State {
     fn new_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
@@ -20,18 +69,50 @@ impl PointerConstraintsHandler for State {
             .is_some_and(|x| x.wl_surface().as_deref() == Some(surface))
         {
             with_pointer_constraint(surface, pointer, |constraint| {
-                constraint.unwrap().activate();
+                if let Some(constraint) = constraint {
+                    constraint.activate();
+                }
+                
             });
         }
     }
 
     fn cursor_position_hint(
         &mut self,
-        _surface: &WlSurface,
-        _pointer: &PointerHandle<Self>,
-        _location: Point<f64, Logical>,
+        surface: &WlSurface,
+        pointer: &PointerHandle<Self>,
+        location: Point<f64, Logical>,
     ) {
-        // TODO
+        if with_pointer_constraint(surface, pointer, |constraint| {
+            constraint.is_some_and(|c| c.is_active())
+        }) {
+            if let Some((out, header, geometry)) = self
+                .common
+                .shell
+                .read()
+                .workspaces
+                .sets
+                .iter()
+                .find_map(|(out, set)| find_window(out, set, surface))
+            {
+                let window_size = geometry.size.to_f64();
+
+                if location.x >= 0.0
+                    && location.y >= 0.0
+                    && location.x <= window_size.w
+                    && location.y <= window_size.h
+                {
+                    let header_offset = header.map(|h| h.to_f64()).unwrap_or_default();
+                    let origin = geometry.loc.to_f64();
+                    // the offset from the output (monitor position)
+                    let workspace_origin = out.geometry().loc.to_f64();
+                    let x = workspace_origin.x + origin.x + header_offset.x + location.x;
+                    let y = workspace_origin.y + origin.y + header_offset.y + location.y;
+                    pointer.set_location(Point::new(x, y));
+                    crate::write_point_position(x, y);
+                }
+            };
+        }
     }
 }
 delegate_pointer_constraints!(State);
