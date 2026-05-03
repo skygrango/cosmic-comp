@@ -9,9 +9,10 @@ use smithay::{
     delegate_pointer_constraints,
     input::pointer::PointerHandle,
     output::Output,
-    reexports::wayland_server::protocol::wl_surface::WlSurface,
+    reexports::wayland_server::{protocol::wl_surface::WlSurface, Resource},
     utils::{Logical, Point, Rectangle},
     wayland::{
+        compositor::CompositorHandler,
         pointer_constraints::PointerConstraintsHandler,
         seat::WaylandFocus,
     },
@@ -107,8 +108,14 @@ pub fn apply_cursor_hint(
     state: &mut State,
     surface: &WlSurface,
     pointer: &PointerHandle<State>,
-    location: Point<f64, Logical>,
+    mut location: Point<f64, Logical>,
 ) {
+    if let Some(client) = surface.client() {
+        let scale = state.client_compositor_state(&client).client_scale();
+        location.x /= scale;
+        location.y /= scale;
+    }
+
     let point = {
         if let Some((out, header, geometry)) = state
             .common
