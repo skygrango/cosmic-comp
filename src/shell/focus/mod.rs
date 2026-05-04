@@ -1,8 +1,12 @@
 use crate::{
     shell::{CosmicSurface, MinimizedWindow, Shell, Trigger, element::CosmicMapped},
-    state::Common,
+    state::{Common, State},
     utils::prelude::*,
-    wayland::handlers::{xdg_shell::PopupGrabData, xwayland_keyboard_grab::XWaylandGrabSeatData},
+    wayland::handlers::{
+        pointer_constraints::{apply_cursor_hint, with_pointer_constraint},
+        xdg_shell::PopupGrabData,
+        xwayland_keyboard_grab::XWaylandGrabSeatData,
+    },
 };
 use indexmap::IndexSet;
 use smithay::{
@@ -12,6 +16,7 @@ use smithay::{
     reexports::wayland_server::{Resource, protocol::wl_surface::WlSurface},
     utils::{IsAlive, Point, SERIAL_COUNTER, Serial},
     wayland::{
+        pointer_constraints::PointerConstraint,
         seat::WaylandFocus,
         selection::{data_device::set_data_device_focus, primary_selection::set_primary_focus},
         shell::wlr_layer::{KeyboardInteractivity, Layer},
@@ -192,11 +197,12 @@ impl Shell {
         target: Option<&KeyboardFocusTarget>,
         seat: &Seat<State>,
         serial: Option<Serial>,
-        update_cursor: bool,
+        mut update_cursor: bool,
     ) {
         let focus_target = match target {
             Some(KeyboardFocusTarget::Element(mapped)) => Some(FocusTarget::Window(mapped.clone())),
             Some(KeyboardFocusTarget::Fullscreen(surface)) => {
+                update_cursor = false;
                 Some(FocusTarget::Fullscreen(surface.clone()))
             }
             _ => None,
@@ -347,6 +353,34 @@ fn update_focus_state(
 ) {
     // update keyboard focus
     if let Some(keyboard) = seat.get_keyboard() {
+        let old_focus = keyboard.current_focus();
+        if let Some(old_target) = old_focus
+            && target != Some(&old_target)
+            && let Some(surface) = old_target.wl_surface()
+        {
+            let pointer = seat.get_pointer().unwrap();
+            let hint = with_pointer_constraint(&surface, &pointer, |constraint| {
+                let hint = if let Some(constraint) = constraint.as_deref()
+                    && constraint.is_active()
+                    && let PointerConstraint::Locked(locked) = constraint
+                    && let Some(hint) = locked.cursor_position_hint()
+                {
+                    Some(hint)
+                } else {
+                    None
+                };
+
+                if let Some(constraint) = constraint {
+                    constraint.deactivate();
+                }
+
+                hint
+            });
+            // if let Some(hint) = hint {
+            //     apply_cursor_hint(state, &surface, &pointer, hint);
+            // }
+        }
+
         if should_update_cursor
             && state.common.config.cosmic_conf.cursor_follows_focus
             && target.is_some()

@@ -43,7 +43,9 @@ use smithay::{
         SwitchState, SwitchToggleEvent, TabletToolButtonEvent, TabletToolEvent,
         TabletToolProximityEvent, TabletToolTipEvent, TabletToolTipState, TouchEvent,
     },
-    desktop::{PopupKeyboardGrab, WindowSurfaceType, utils::under_from_surface_tree},
+    desktop::{
+        PopupKeyboardGrab, WindowSurfaceType, utils::under_from_surface_tree,
+    },
     input::{
         Seat,
         keyboard::{FilterResult, KeysymHandle, ModifiersState},
@@ -61,10 +63,12 @@ use smithay::{
     },
     utils::{Point, Rectangle, SERIAL_COUNTER, Serial},
     wayland::{
+        
         image_copy_capture::{BufferConstraints, CursorSessionRef},
         keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitorSeat,
         pointer_constraints::{PointerConstraint, with_pointer_constraint},
         seat::WaylandFocus,
+        
         tablet_manager::{TabletDescriptor, TabletSeatTrait},
     },
 };
@@ -159,6 +163,17 @@ impl ModifiersShortcutQueue {
 }
 
 impl State {
+    // pub fn is_pointer_locked(&self, seat: &Seat<Self>) -> bool {
+    //     let ptr = seat.get_pointer().unwrap();
+    //     ptr.current_focus()
+    //         .and_then(|f| f.wl_surface())
+    //         .map_or(false, |s| {
+    //             with_pointer_constraint(&s, &ptr, |c| {
+    //                 c.is_some_and(|c| c.is_active() && matches!(*c, PointerConstraint::Locked(_)))
+    //             })
+    //         })
+    // }
+
     #[profiling::function]
     pub fn process_input_event<B: InputBackend>(&mut self, event: InputEvent<B>)
     where
@@ -314,16 +329,37 @@ impl State {
 
                     let under = State::surface_under(position, &current_output, &shell)
                         .map(|(target, pos)| (target, pos.as_logical()));
-
+                    
                     let ptr = seat.get_pointer().unwrap();
+
+                    // Check if current focus already has an active constraint
+                    // let mut constrained_surface = None;
+                    // if let Some(focus) = ptr.current_focus() {
+                    //     if let Some(surface) = focus.wl_surface() {
+                    //         with_pointer_constraint(&surface, &ptr, |c| {
+                    //             if c.is_some_and(|c| c.is_active()) {
+                    //                 constrained_surface =
+                    //                     Some((focus.clone(), position.as_logical()));
+                    //             }
+                    //         });
+                    //     }
+                    // }
+
+                    // let under = if constrained_surface.is_some() {
+                    //     constrained_surface
+                    // } else {
+                    //     State::surface_under(position, &current_output, &shell)
+                    //         .map(|(target, pos)| (target, pos.as_logical()))
+                    // };
 
                     let mut pointer_locked = false;
                     let mut pointer_confined = false;
                     let mut confine_region = None;
-                    if let Some((surface, surface_loc)) = under
+                                        if let Some((_, surface, surface_loc)) = under
                         .as_ref()
-                        .and_then(|(target, l)| Some((target.wl_surface()?, l)))
+                        .and_then(|(target, l)| Some((target, target.wl_surface()?, l)))
                     {
+                        
                         with_pointer_constraint(&surface, &ptr, |constraint| match constraint {
                             Some(constraint) if constraint.is_active() => {
                                 // Constraint does not apply if not within region
@@ -347,6 +383,24 @@ impl State {
                             _ => {}
                         });
                     }
+
+                    
+
+                    // if pointer_locked {
+                    //     std::mem::drop(shell);
+                    //     ptr.relative_motion(
+                    //         self,
+                    //         under.clone(),
+                    //         &RelativeMotionEvent {
+                    //             delta: event.delta(),
+                    //             delta_unaccel: event.delta_unaccel(),
+                    //             utime: event.time(),
+                    //         },
+                    //     );
+                    //     ptr.frame(self);
+                    //     return;
+                    // }
+
                     let original_position = position;
                     position += event.delta().as_global();
 
@@ -366,6 +420,37 @@ impl State {
                         (output_geometry.loc.y + output_geometry.size.h - 1) as f64,
                     );
 
+                    if pointer_confined && let Some((surface, surface_loc)) = &under {
+                        let is_legal = |pos: Point<f64, Global>, shell: &Shell| {
+                            if State::surface_under(pos, &output, shell)
+                                .and_then(|(t, _)| t.wl_surface().map(|s| s.into_owned()))
+                                != surface.wl_surface().map(|s| s.into_owned())
+                            {
+                                return false;
+                            }
+                            if let Some(region) = &confine_region {
+                                if !region
+                                    .contains((pos.as_logical() - *surface_loc).to_i32_round())
+                                {
+                                    return false;
+                                }
+                            }
+                            true
+                        };
+
+                        if !is_legal(position, &shell) {
+                            let y_only_pos = Point::new(original_position.x, position.y);
+                            let x_only_pos = Point::new(position.x, original_position.y);
+                            if is_legal(y_only_pos, &shell) {
+                                position = y_only_pos;
+                            } else if is_legal(x_only_pos, &shell) {
+                                position = x_only_pos;
+                            } else {
+                                position = original_position;
+                            }
+                        }
+                    }
+
                     let new_under = State::surface_under(position, &output, &shell)
                         .map(|(target, pos)| (target, pos.as_logical()));
 
@@ -379,12 +464,10 @@ impl State {
                             utime: event.time(),
                         },
                     );
-
                     if pointer_locked {
                         ptr.frame(self);
                         return;
                     }
-
                     if ptr.is_grabbed() {
                         if seat
                             .user_data()
@@ -492,52 +575,6 @@ impl State {
                         }
                     }
 
-                    // If confined, don't move pointer if it would go outside surface or region
-                    if pointer_confined && let Some((surface, surface_loc)) = &under {
-                        if new_under.as_ref().and_then(|(under, _)| under.wl_surface())
-                            != surface.wl_surface()
-                        {
-                            ptr.frame(self);
-                            return;
-                        }
-                        match surface {
-                            PointerFocusTarget::WlSurface { surface, .. } => {
-                                if under_from_surface_tree(
-                                    surface,
-                                    position.as_logical() - surface_loc.to_f64(),
-                                    (0, 0),
-                                    WindowSurfaceType::ALL,
-                                )
-                                .is_none()
-                                {
-                                    ptr.frame(self);
-                                    return;
-                                }
-                            }
-                            PointerFocusTarget::X11Surface { surface, .. } => {
-                                if surface
-                                    .surface_under(
-                                        position.as_logical() - surface_loc.to_f64(),
-                                        (0, 0),
-                                        WindowSurfaceType::ALL,
-                                    )
-                                    .is_none()
-                                {
-                                    ptr.frame(self);
-                                    return;
-                                }
-                            }
-                            _ => {}
-                        }
-                        if let Some(region) = confine_region
-                            && !region
-                                .contains((position.as_logical() - *surface_loc).to_i32_round())
-                        {
-                            ptr.frame(self);
-                            return;
-                        }
-                    }
-
                     let serial = SERIAL_COUNTER.next_serial();
                     ptr.motion(
                         self,
@@ -554,20 +591,36 @@ impl State {
                     if let Some((under, surface_location)) = new_under
                         .and_then(|(target, loc)| Some((target.wl_surface()?.into_owned(), loc)))
                     {
-                        with_pointer_constraint(&under, &ptr, |constraint| match constraint {
-                            Some(constraint) if !constraint.is_active() => {
-                                let region = match &*constraint {
-                                    PointerConstraint::Locked(locked) => locked.region(),
-                                    PointerConstraint::Confined(confined) => confined.region(),
-                                };
-                                let point =
-                                    (ptr.current_location() - surface_location).to_i32_round();
-                                if region.is_none_or(|region| region.contains(point)) {
-                                    constraint.activate();
-                                }
+                        let focused = seat.get_keyboard().and_then(|k| k.current_focus());
+                        let is_focused = focused.is_some_and(|f| {
+                            let shell = self.common.shell.read();
+                            if let Some(fe) = shell.focused_element(&f) {
+                                fe.has_surface(&under, smithay::desktop::WindowSurfaceType::ALL)
+                            } else if let crate::shell::focus::target::KeyboardFocusTarget::Fullscreen(s) =
+                                f
+                            {
+                                s.has_surface(&under, smithay::desktop::WindowSurfaceType::ALL)
+                            } else {
+                                f.wl_surface().as_deref() == Some(&under)
                             }
-                            _ => {}
                         });
+
+                        if is_focused {
+                            with_pointer_constraint(&under, &ptr, |constraint| match constraint {
+                                Some(constraint) if !constraint.is_active() => {
+                                    let region = match &*constraint {
+                                        PointerConstraint::Locked(locked) => locked.region(),
+                                        PointerConstraint::Confined(confined) => confined.region(),
+                                    };
+                                    let point =
+                                        (ptr.current_location() - surface_location).to_i32_round();
+                                    if region.is_none_or(|region| region.contains(point)) {
+                                        constraint.activate();
+                                    }
+                                }
+                                _ => {}
+                            });
+                        }
                     }
 
                     let mut shell = self.common.shell.write();
