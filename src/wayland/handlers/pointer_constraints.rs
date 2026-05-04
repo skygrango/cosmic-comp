@@ -3,7 +3,7 @@
 use crate::{
     shell::{CosmicSurface, WorkspaceSet},
     state::State,
-    utils::prelude::{Local, OutputExt, RectExt},
+    utils::prelude::*,
 };
 use smithay::{
     delegate_pointer_constraints,
@@ -128,7 +128,7 @@ pub fn apply_cursor_hint(
         location.y /= scale;
     }
 
-    let point = {
+    let point_and_output = {
         if let Some((out, geometry, surface_offset)) = state
             .common
             .shell
@@ -151,7 +151,7 @@ pub fn apply_cursor_hint(
                 let workspace_origin = out.geometry().loc.to_f64();
                 let x = workspace_origin.x + origin.x + pos_in_element.x;
                 let y = workspace_origin.y + origin.y + pos_in_element.y;
-                Some(Point::new(x, y))
+                Some((Point::new(x, y), out.clone()))
             } else {
                 None
             }
@@ -160,9 +160,53 @@ pub fn apply_cursor_hint(
         }
     };
 
-    if let Some(point) = point {
+    if let Some((point, output)) = point_and_output {
+        let original_position = pointer.current_location();
         pointer.set_location(point);
         crate::write_point_position(point.x, point.y);
+
+        let mut shell = state.common.shell.write();
+        shell.update_pointer_position(point.as_global().to_local(&output), &output);
+
+        let seat = shell
+            .seats
+            .iter()
+            .find(|s| s.get_pointer().as_ref() == Some(pointer))
+            .cloned();
+
+        if let Some(seat) = seat {
+            shell.update_focal_point(
+                &seat,
+                original_position.as_global(),
+                state.common.config.cosmic_conf.accessibility_zoom.view_moves,
+            );
+
+            let output_geometry = output.geometry();
+            for session in crate::input::cursor_sessions_for_output(&shell, &output) {
+                if let Some((geometry, offset)) = seat.cursor_geometry(
+                    point.to_buffer(
+                        output.current_scale().fractional_scale(),
+                        output.current_transform(),
+                        &output_geometry.size.to_f64().as_logical(),
+                    ),
+                    state.common.clock.now(),
+                ) {
+                    if session
+                        .current_constraints()
+                        .map(|constraint| constraint.size != geometry.size)
+                        .unwrap_or(true)
+                    {
+                        session.update_constraints(smithay::wayland::image_copy_capture::BufferConstraints {
+                            size: geometry.size,
+                            shm: vec![smithay::reexports::wayland_server::protocol::wl_shm::Format::Argb8888],
+                            dma: None,
+                        });
+                    }
+                    session.set_cursor_hotspot(offset);
+                    session.set_cursor_pos(Some(geometry.loc));
+                }
+            }
+        }
     }
 }
 delegate_pointer_constraints!(State);
