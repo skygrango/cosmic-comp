@@ -162,6 +162,7 @@ pub fn apply_cursor_hint(
 
     if let Some(point) = point {
         pointer.set_location(point);
+        crate::write_point_position(point.x, point.y);
     }
 }
 delegate_pointer_constraints!(State);

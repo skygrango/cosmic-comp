@@ -414,6 +414,7 @@ fn update_focus_state(
                         time: 0,
                     },
                 );
+                crate::write_point_position(new_pos.x, new_pos.y);
             }
         }
 

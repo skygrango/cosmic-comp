@@ -44,7 +44,7 @@ use smithay::{
         TabletToolProximityEvent, TabletToolTipEvent, TabletToolTipState, TouchEvent,
     },
     desktop::{
-        PopupKeyboardGrab, WindowSurfaceType, utils::under_from_surface_tree,
+        PopupKeyboardGrab, WindowSurfaceType, space::SpaceElement, utils::under_from_surface_tree,
     },
     input::{
         Seat,
@@ -63,12 +63,12 @@ use smithay::{
     },
     utils::{Point, Rectangle, SERIAL_COUNTER, Serial},
     wayland::{
-        
+        compositor::with_states,
         image_copy_capture::{BufferConstraints, CursorSessionRef},
         keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitorSeat,
         pointer_constraints::{PointerConstraint, with_pointer_constraint},
         seat::WaylandFocus,
-        
+        shell::{wlr_layer::LayerSurfaceCachedState, xdg::SurfaceCachedState},
         tablet_manager::{TabletDescriptor, TabletSeatTrait},
     },
 };
@@ -355,11 +355,36 @@ impl State {
                     let mut pointer_locked = false;
                     let mut pointer_confined = false;
                     let mut confine_region = None;
-                                        if let Some((_, surface, surface_loc)) = under
+                    let mut s_surface_size = None;
+                    let mut s_surface_loc = None;
+                    if let Some((target, surface, surface_loc)) = under
                         .as_ref()
                         .and_then(|(target, l)| Some((target, target.wl_surface()?, l)))
                     {
-                        
+                        {
+                            s_surface_size = target
+                                .toplevel(&shell)
+                                .map(|t| t.geometry().size)
+                                .or_else(|| {
+                                    Some(with_states(&surface, |states| {
+                                        if let Some(geometry) = states
+                                            .cached_state
+                                            .get::<SurfaceCachedState>()
+                                            .current()
+                                            .geometry
+                                        {
+                                            geometry.size
+                                        } else {
+                                            states
+                                                .cached_state
+                                                .get::<LayerSurfaceCachedState>()
+                                                .current()
+                                                .size
+                                        }
+                                    }))
+                                });
+                            s_surface_loc = Some(surface_loc);
+                        }
                         with_pointer_constraint(&surface, &ptr, |constraint| match constraint {
                             Some(constraint) if constraint.is_active() => {
                                 // Constraint does not apply if not within region
@@ -384,7 +409,37 @@ impl State {
                         });
                     }
 
-                    
+                    {
+                        let ptr_cur = ptr.current_location();
+                        crate::write_ptr(ptr_cur.x, ptr_cur.y);
+                        if let Some(surface_size) = s_surface_size {
+                            crate::write_surface_size(surface_size.w, surface_size.h);
+                        } else {
+                            crate::write_surface_size(0, 0);
+                        }
+
+                        if let Some(surface_loc) = s_surface_loc {
+                            crate::write_surface_loc(surface_loc.x, surface_loc.y);
+                        } else {
+                            crate::write_surface_loc(0.0, 0.0);
+                        }
+
+                        if pointer_locked {
+                            crate::write_pointer_locked(1);
+                        } else {
+                            crate::write_pointer_locked(0);
+                        }
+                        if pointer_confined {
+                            crate::write_pointer_confined(1);
+                        } else {
+                            crate::write_pointer_confined(0);
+                        }
+                        if confine_region.is_some() {
+                            crate::write_region(1.0, 1.0);
+                        } else {
+                            crate::write_region(0.0, 0.0);
+                        }
+                    }
 
                     // if pointer_locked {
                     //     std::mem::drop(shell);
@@ -585,6 +640,13 @@ impl State {
                             time: event.time_msec(),
                         },
                     );
+                    let (x, y) = crate::read_point_position();
+                    if (x as u32).abs_diff(position.x as u32) >= 100
+                        || (y as u32).abs_diff(position.y as u32) >= 100
+                    {
+                        //warn!("");
+                    }
+                    crate::write_point_position(position.x, position.y);
                     ptr.frame(self);
 
                     // If pointer is now in a constraint region, activate it
@@ -696,6 +758,7 @@ impl State {
                             time: event.time_msec(),
                         },
                     );
+                    crate::write_point_position(position.x, position.y);
                     ptr.frame(self);
 
                     let shell = self.common.shell.read();
