@@ -354,6 +354,7 @@ impl State {
 
                     let mut pointer_locked = false;
                     let mut pointer_confined = false;
+                    let mut locked_region = None;
                     let mut confine_region = None;
                     let mut s_surface_size = None;
                     let mut s_surface_loc = None;
@@ -396,8 +397,9 @@ impl State {
                                     return;
                                 }
                                 match &*constraint {
-                                    PointerConstraint::Locked(_locked) => {
+                                    PointerConstraint::Locked(locked) => {
                                         pointer_locked = true;
+                                        locked_region = locked.region().cloned();
                                     }
                                     PointerConstraint::Confined(confine) => {
                                         pointer_confined = true;
@@ -435,9 +437,15 @@ impl State {
                             crate::write_pointer_confined(0);
                         }
                         if confine_region.is_some() {
-                            crate::write_region(1.0, 1.0);
+                            crate::write_confined_region(1.0, 1.0);
                         } else {
-                            crate::write_region(0.0, 0.0);
+                            crate::write_confined_region(0.0, 0.0);
+                        }
+
+                        if locked_region.is_some() {
+                            crate::write_locked_region(1.0, 1.0);
+                        } else {
+                            crate::write_locked_region(0.0, 0.0);
                         }
                     }
 
@@ -790,8 +798,8 @@ impl State {
             }
             InputEvent::PointerButton { event, .. } => {
                 use smithay::backend::input::{ButtonState, PointerButtonEvent};
-
                 //
+
                 let Some(seat) = self
                     .common
                     .shell
@@ -802,6 +810,7 @@ impl State {
                 else {
                     return;
                 };
+
                 self.common.idle_notifier_state.notify_activity(&seat);
 
                 let current_focus = seat.get_keyboard().unwrap().current_focus();

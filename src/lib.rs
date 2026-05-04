@@ -68,8 +68,10 @@ pub struct Payload {
     pub counter: AtomicU64,
     pub x: f64,
     pub y: f64,
-    pub region_x: f64,
-    pub region_y: f64,
+    pub locked_region_x: f64,
+    pub locked_region_y: f64,
+    pub confined_region_x: f64,
+    pub confined_region_y: f64,
     pub surface_x: f64,
     pub surface_y: f64,
     pub surface_width: i32,
@@ -157,12 +159,23 @@ pub fn write_point_position(x: f64, y: f64) {
 }
 
 #[inline(always)]
-pub fn write_region(x: f64, y: f64) {
+pub fn write_confined_region(x: f64, y: f64) {
     if let Some(shm) = SHM_POINT.get() {
         unsafe {
             let s = shm.0.as_ptr();
-            (*s).payload.region_x = x;
-            (*s).payload.region_y = y;
+            (*s).payload.confined_region_x = x;
+            (*s).payload.confined_region_y = y;
+        }
+    }
+}
+
+#[inline(always)]
+pub fn write_locked_region(x: f64, y: f64) {
+    if let Some(shm) = SHM_POINT.get() {
+        unsafe {
+            let s = shm.0.as_ptr();
+            (*s).payload.locked_region_x = x;
+            (*s).payload.locked_region_y = y;
         }
     }
 }
