@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use crate::{
-    shell::WorkspaceSet,
+    shell::{CosmicSurface, WorkspaceSet},
     state::State,
-    utils::prelude::{Local, OutputExt},
+    utils::prelude::{Local, OutputExt, RectExt},
 };
 use smithay::{
     delegate_pointer_constraints,
+    desktop::{layer_map_for_output, WindowSurfaceType},
     input::pointer::PointerHandle,
     output::Output,
     reexports::wayland_server::{protocol::wl_surface::WlSurface, Resource},
@@ -24,42 +25,42 @@ fn find_window<'a>(
     out: &'a Output,
     set: &WorkspaceSet,
     surface: &WlSurface,
-) -> Option<(
-    &'a Output,
-    Option<Point<i32, Logical>>,
-    Rectangle<i32, Local>,
-)> {
+) -> Option<(&'a Output, Rectangle<i32, Local>, Point<i32, Logical>)> {
     set.sticky_layer
         .mapped()
-        .find(|w| w.wl_surface().as_deref() == Some(surface))
-        .and_then(|w| {
-            set.sticky_layer
-                .element_geometry(w)
-                .map(|geom| (out, Some(w.active_window_offset()), geom))
+        .find_map(|w| {
+            w.surface_offset(surface).and_then(|offset| {
+                set.sticky_layer
+                    .element_geometry(w)
+                    .map(|geom| (out, geom, offset))
+            })
         })
         .or_else(|| {
             set.workspaces.iter().find_map(|workspace| {
                 workspace
                     .get_fullscreen()
                     .and_then(|fullscreen| {
-                        if fullscreen.wl_surface().as_deref() == Some(surface) {
+                        fullscreen.surface_offset(surface).and_then(|offset| {
                             workspace
                                 .fullscreen_geometry()
-                                .map(|geom| (out, None, geom))
-                        } else {
-                            None
-                        }
+                                .map(|geom| (out, geom, offset))
+                        })
                     })
                     .or_else(|| {
-                        workspace
-                            .mapped()
-                            .find(|w| w.wl_surface().as_deref() == Some(surface))
-                            .and_then(|w| {
+                        workspace.mapped().find_map(|w| {
+                            w.surface_offset(surface).and_then(|offset| {
                                 workspace
                                     .element_geometry(w)
-                                    .map(|geom| (out, Some(w.active_window_offset()), geom))
+                                    .map(|geom| (out, geom, offset))
                             })
+                        })
                     })
+            })
+        })
+        .or_else(|| {
+            layer_map_for_output(out).layers().find_map(|l| {
+                CosmicSurface::surface_tree_offset(l.wl_surface(), surface)
+                    .map(|offset| (out, l.geometry().as_local(), offset))
             })
         })
 }
@@ -67,16 +68,27 @@ fn find_window<'a>(
 impl PointerConstraintsHandler for State {
     fn new_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
         // XXX region
-        let seat = self.common.shell.read().seats.iter().find(|s| s.get_pointer().as_ref() == Some(pointer)).cloned();
-        let focused = seat.and_then(|s| s.get_keyboard()).and_then(|k| k.current_focus());
+        let seat = self
+            .common
+            .shell
+            .read()
+            .seats
+            .iter()
+            .find(|s| s.get_pointer().as_ref() == Some(pointer))
+            .cloned();
+        let focused = seat
+            .and_then(|s| s.get_keyboard())
+            .and_then(|k| k.current_focus());
         let is_focused = focused.is_some_and(|f| {
             let shell = self.common.shell.read();
             if let Some(fe) = shell.focused_element(&f) {
-                fe.has_surface(surface, smithay::desktop::WindowSurfaceType::ALL)
+                fe.has_surface(surface, WindowSurfaceType::ALL)
             } else if let crate::shell::focus::target::KeyboardFocusTarget::Fullscreen(s) = f {
-                s.has_surface(surface, smithay::desktop::WindowSurfaceType::ALL)
+                s.has_surface(surface, WindowSurfaceType::ALL)
+            } else if let Some(root) = f.wl_surface() {
+                CosmicSurface::surface_tree_offset(&root, surface).is_some()
             } else {
-                f.wl_surface().as_deref() == Some(surface)
+                false
             }
         });
 
@@ -117,7 +129,7 @@ pub fn apply_cursor_hint(
     }
 
     let point = {
-        if let Some((out, header, geometry)) = state
+        if let Some((out, geometry, surface_offset)) = state
             .common
             .shell
             .read()
@@ -126,19 +138,19 @@ pub fn apply_cursor_hint(
             .iter()
             .find_map(|(out, set)| find_window(out, set, surface))
         {
+            let pos_in_element = location + surface_offset.to_f64();
             let window_size = geometry.size.to_f64();
 
-            if location.x >= 0.0
-                && location.y >= 0.0
-                && location.x <= window_size.w
-                && location.y <= window_size.h
+            if pos_in_element.x >= 0.0
+                && pos_in_element.y >= 0.0
+                && pos_in_element.x <= window_size.w
+                && pos_in_element.y <= window_size.h
             {
-                let header_offset = header.map(|h| h.to_f64()).unwrap_or_default();
                 let origin = geometry.loc.to_f64();
                 // the offset from the output (monitor position)
                 let workspace_origin = out.geometry().loc.to_f64();
-                let x = workspace_origin.x + origin.x + header_offset.x + location.x;
-                let y = workspace_origin.y + origin.y + header_offset.y + location.y;
+                let x = workspace_origin.x + origin.x + pos_in_element.x;
+                let y = workspace_origin.y + origin.y + pos_in_element.y;
                 Some(Point::new(x, y))
             } else {
                 None
