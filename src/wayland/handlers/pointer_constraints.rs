@@ -143,8 +143,9 @@ pub fn apply_cursor_hint(
 
             if pos_in_element.x >= 0.0
                 && pos_in_element.y >= 0.0
-                && pos_in_element.x <= window_size.w
-                && pos_in_element.y <= window_size.h
+                // hack: reserve 1 pixel space to avoid triggering the window edge
+                && pos_in_element.x <= window_size.w - 1.
+                && pos_in_element.y <= window_size.h - 1.
             {
                 let origin = geometry.loc.to_f64();
                 // the offset from the output (monitor position)
