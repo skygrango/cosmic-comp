@@ -1279,7 +1279,6 @@ impl Workspace {
                         .surface
                         .set_geometry(previous_geometry.to_global(&self.output), 0);
                 }
-                surface.surface.send_configure();
             }
 
             for focus_stack in self.focus_stack.0.values_mut() {
