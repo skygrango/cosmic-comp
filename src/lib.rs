@@ -57,6 +57,194 @@ pub mod xwayland;
 static GLOBAL: profiling::tracy_client::ProfiledAllocator<std::alloc::System> =
     profiling::tracy_client::ProfiledAllocator::new(std::alloc::System, 10);
 
+use std::sync::OnceLock;
+use std::sync::atomic::AtomicU64;
+#[repr(C, align(64))]
+pub struct Version {
+    pub version: AtomicU64,
+}
+#[repr(C)]
+pub struct Payload {
+    pub counter: AtomicU64,
+    pub x: f64,
+    pub y: f64,
+    pub locked_region_x: f64,
+    pub locked_region_y: f64,
+    pub confined_region_x: f64,
+    pub confined_region_y: f64,
+    pub surface_x: f64,
+    pub surface_y: f64,
+    pub surface_width: i32,
+    pub surface_height: i32,
+    pub ptr_x: f64,
+    pub ptr_y: f64,
+    pub locked: u64,
+    pub confined: u64,
+}
+#[repr(C)]
+pub struct SharedMemory {
+    pub v: Version,
+    pub payload: Payload,
+}
+#[derive(Debug)]
+pub struct ShmPtr(std::ptr::NonNull<SharedMemory>);
+unsafe impl Send for ShmPtr {}
+unsafe impl Sync for ShmPtr {}
+static SHM_POINT: OnceLock<ShmPtr> = OnceLock::new();
+const SHM_NAME: &str = "/cosmic-point";
+fn init_shared_memory() {
+    unsafe {
+        let name = std::ffi::CString::new(SHM_NAME).unwrap();
+        let size = std::mem::size_of::<SharedMemory>();
+        let fd = libc::shm_open(
+            name.as_ptr(),
+            libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+            0o666,
+        );
+        let fd = if fd >= 0 {
+            // creator
+            libc::fchmod(fd, 0o666);
+            libc::ftruncate(fd, size as libc::off_t);
+            fd
+        } else {
+            let err = std::io::Error::last_os_error();
+
+            if err.raw_os_error() == Some(libc::EEXIST) {
+                let fd2 = libc::shm_open(name.as_ptr(), libc::O_RDWR, 0o666);
+                if fd2 < 0 {
+                    panic!("open existing failed");
+                }
+                fd2
+            } else {
+                panic!("shm_open failed: {}", err);
+            }
+        };
+
+        let ptr = libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        );
+        libc::close(fd);
+        if ptr == libc::MAP_FAILED {
+            error!(
+                "Failed to mmap shared memory: {}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+
+        let shm = std::ptr::NonNull::new(ptr as *mut SharedMemory).expect("mmap returned null");
+        if SHM_POINT.set(ShmPtr(shm)).is_err() {
+            warn!("SHM already initialized");
+        }
+    }
+}
+#[inline(always)]
+pub fn write_point_position(x: f64, y: f64) {
+    if let Some(shm) = SHM_POINT.get() {
+        unsafe {
+            let s = shm.0.as_ptr();
+            (*s).payload.x = x;
+            (*s).payload.y = y;
+
+            (*s).payload
+                .counter
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+#[inline(always)]
+pub fn write_confined_region(x: f64, y: f64) {
+    if let Some(shm) = SHM_POINT.get() {
+        unsafe {
+            let s = shm.0.as_ptr();
+            (*s).payload.confined_region_x = x;
+            (*s).payload.confined_region_y = y;
+        }
+    }
+}
+
+#[inline(always)]
+pub fn write_locked_region(x: f64, y: f64) {
+    if let Some(shm) = SHM_POINT.get() {
+        unsafe {
+            let s = shm.0.as_ptr();
+            (*s).payload.locked_region_x = x;
+            (*s).payload.locked_region_y = y;
+        }
+    }
+}
+
+#[inline(always)]
+pub fn write_surface_loc(x: f64, y: f64) {
+    if let Some(shm) = SHM_POINT.get() {
+        unsafe {
+            let s = shm.0.as_ptr();
+            (*s).payload.surface_x = x;
+            (*s).payload.surface_y = y;
+        }
+    }
+}
+
+#[inline(always)]
+pub fn write_surface_size(w: i32, h: i32) {
+    if let Some(shm) = SHM_POINT.get() {
+        unsafe {
+            let s = shm.0.as_ptr();
+            (*s).payload.surface_width = w;
+            (*s).payload.surface_height = h;
+        }
+    }
+}
+
+#[inline(always)]
+pub fn write_ptr(x: f64, y: f64) {
+    if let Some(shm) = SHM_POINT.get() {
+        unsafe {
+            let s = shm.0.as_ptr();
+            (*s).payload.ptr_x = x;
+            (*s).payload.ptr_y = y;
+        }
+    }
+}
+
+#[inline(always)]
+pub fn write_pointer_locked(state: u64) {
+    if let Some(shm) = SHM_POINT.get() {
+        unsafe {
+            let s = shm.0.as_ptr();
+            (*s).payload.locked = state;
+        }
+    }
+}
+
+#[inline(always)]
+pub fn write_pointer_confined(state: u64) {
+    if let Some(shm) = SHM_POINT.get() {
+        unsafe {
+            let s = shm.0.as_ptr();
+            (*s).payload.confined = state;
+        }
+    }
+}
+
+#[inline(always)]
+pub fn read_point_position() -> (f64, f64) {
+    if let Some(shm) = SHM_POINT.get() {
+        unsafe {
+            let s = shm.0.as_ptr();
+            ((*s).payload.x, (*s).payload.y)
+        }
+    } else {
+        (0.0, 0.0)
+    }
+}
+
 // called by the Xwayland source, either after starting or failing
 impl State {
     fn notify_ready(&mut self) {
@@ -111,6 +299,8 @@ impl State {
 }
 
 pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
+    init_shared_memory();
+
     let raw_args = RawArgs::from_args();
     let mut cursor = raw_args.cursor();
     let git_hash = option_env!("GIT_HASH").unwrap_or("unknown");

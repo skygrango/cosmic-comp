@@ -954,6 +954,8 @@ impl Drop for MoveGrab {
                                 time: state.common.clock.now().as_millis(),
                             },
                         );
+                        let current_location = pointer.current_location();
+                        crate::write_point_position(current_location.x, current_location.y);
                     }
                 }
                 Shell::set_focus(
