@@ -225,6 +225,7 @@ pub fn apply_cursor_hint(
     if let Some((point, output)) = point_and_output {
         let original_position = pointer.current_location();
         pointer.set_location(point);
+        crate::write_point_position(point.x, point.y);
 
         let mut shell = state.common.shell.write();
         shell.update_pointer_position(point.as_global().to_local(&output), &output);
