@@ -7,14 +7,13 @@ use crate::{
 };
 use smithay::{
     delegate_pointer_constraints,
-    desktop::{layer_map_for_output, WindowSurfaceType},
+    desktop::{WindowSurfaceType, layer_map_for_output},
     input::pointer::PointerHandle,
     output::Output,
-    reexports::wayland_server::{protocol::wl_surface::WlSurface, Resource},
+    reexports::wayland_server::{Resource, protocol::wl_surface::WlSurface},
     utils::{Logical, Point, Rectangle},
     wayland::{
-        compositor::CompositorHandler,
-        pointer_constraints::PointerConstraintsHandler,
+        compositor::CompositorHandler, pointer_constraints::PointerConstraintsHandler,
         seat::WaylandFocus,
     },
 };
@@ -67,7 +66,6 @@ fn find_window<'a>(
 
 impl PointerConstraintsHandler for State {
     fn new_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
-        // XXX region
         let seat = self
             .common
             .shell
@@ -76,26 +74,70 @@ impl PointerConstraintsHandler for State {
             .iter()
             .find(|s| s.get_pointer().as_ref() == Some(pointer))
             .cloned();
-        let focused = seat
-            .and_then(|s| s.get_keyboard())
-            .and_then(|k| k.current_focus());
-        let is_focused = focused.is_some_and(|f| {
+
+        let (is_under, is_focused, surface_location) = if let Some(seat) = seat {
+            self.common.idle_notifier_state.notify_activity(&seat);
+            let current_output = seat.active_output();
+            let position = seat.get_pointer().unwrap().current_location().as_global();
             let shell = self.common.shell.read();
-            if let Some(fe) = shell.focused_element(&f) {
-                fe.has_surface(surface, WindowSurfaceType::ALL)
-            } else if let crate::shell::focus::target::KeyboardFocusTarget::Fullscreen(s) = f {
-                s.has_surface(surface, WindowSurfaceType::ALL)
-            } else if let Some(root) = f.wl_surface() {
-                CosmicSurface::surface_tree_offset(&root, surface).is_some()
+
+            let under =
+                State::surface_under(position, &current_output, &shell).map(|(target, _)| target);
+            let is_under = if let Some(under) = under
+                && let Some(under_surface) = under.wl_surface()
+            {
+                *under_surface == *surface
+                    || CosmicSurface::surface_tree_offset(surface, &under_surface).is_some()
             } else {
                 false
-            }
-        });
+            };
 
-        if is_focused {
+            let focused = seat.get_keyboard().and_then(|k| k.current_focus());
+            let is_focused = focused.is_some_and(|f| {
+                if let Some(fe) = shell.focused_element(&f) {
+                    fe.has_surface(surface, WindowSurfaceType::ALL)
+                } else if let crate::shell::focus::target::KeyboardFocusTarget::Fullscreen(s) = f {
+                    s.has_surface(surface, WindowSurfaceType::ALL)
+                } else if let Some(root) = f.wl_surface() {
+                    CosmicSurface::surface_tree_offset(&root, surface).is_some()
+                } else {
+                    false
+                }
+            });
+            let surface_location = if is_under && is_focused {
+                shell.workspaces.sets.iter().find_map(|(out, set)| {
+                    find_window(out, set, surface).map(|(out, geometry, offset)| {
+                        let out = out.geometry().loc.to_f64();
+                        let geometry = geometry.loc.to_f64();
+                        let offset = offset.to_f64();
+                        let x = out.x + geometry.x + offset.x;
+                        let y = out.y + geometry.y + offset.y;
+                        Point::new(x, y)
+                    })
+                })
+            } else {
+                None
+            };
+
+            (is_under, is_focused, surface_location)
+        } else {
+            (false, false, None)
+        };
+
+        if is_under && is_focused {
             with_pointer_constraint(surface, pointer, |constraint| {
                 if let Some(constraint) = constraint {
-                    constraint.activate();
+                    if let Some(region) = constraint.region() {
+                        if let Some(surface_location) = surface_location {
+                            let position = pointer.current_location();
+                            let point = (position - surface_location).to_i32_round();
+                            if region.contains(point) {
+                                constraint.activate();
+                            }
+                        }
+                    } else {
+                        constraint.activate();
+                    }
                 }
             });
         }
@@ -179,7 +221,12 @@ pub fn apply_cursor_hint(
             shell.update_focal_point(
                 &seat,
                 original_position.as_global(),
-                state.common.config.cosmic_conf.accessibility_zoom.view_moves,
+                state
+                    .common
+                    .config
+                    .cosmic_conf
+                    .accessibility_zoom
+                    .view_moves,
             );
 
             let output_geometry = output.geometry();
