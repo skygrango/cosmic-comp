@@ -279,7 +279,10 @@ impl CosmicWindow {
             let mut offset = Point::from((0., 0.));
             let mut window_ui = None;
             let has_ssd = p.has_ssd(false);
-            if (has_ssd || p.has_tiled_state())
+            let is_fullscreen = p.window.is_fullscreen(false);
+
+            if !is_fullscreen
+                && (has_ssd || p.has_tiled_state())
                 && surface_type.contains(WindowSurfaceType::TOPLEVEL)
             {
                 let geo = p.window.geometry();
