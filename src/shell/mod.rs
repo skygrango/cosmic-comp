@@ -27,6 +27,7 @@ use cosmic_protocols::workspace::v2::server::zcosmic_workspace_handle_v2::Tiling
 use cosmic_settings_config::shortcuts::action::{Direction, FocusDirection, ResizeDirection};
 use cosmic_settings_config::{shortcuts, window_rules::ApplicationException};
 use keyframe::{ease, functions::EaseInOutCubic};
+use smithay::reexports::wayland_server::protocol::wl_shm::Format as ShmFormat;
 use smithay::{
     backend::{input::TouchSlot, renderer::element::RenderElementStates},
     desktop::{
@@ -48,9 +49,10 @@ use smithay::{
         wayland_protocols::ext::session_lock::v1::server::ext_session_lock_v1::ExtSessionLockV1,
         wayland_server::{Client, protocol::wl_surface::WlSurface},
     },
-    utils::{IsAlive, Logical, Point, Rectangle, Serial, Size},
+    utils::{IsAlive, Logical, Monotonic, Point, Rectangle, Serial, Size, Time},
     wayland::{
         compositor::{SurfaceAttributes, with_states},
+        image_copy_capture::BufferConstraints,
         seat::WaylandFocus,
         session_lock::LockSurface,
         shell::wlr_layer::{KeyboardInteractivity, Layer, LayerSurfaceCachedState},
@@ -64,7 +66,12 @@ use tracing::error;
 use crate::{
     backend::render::animations::spring::{Spring, SpringParams},
     config::Config,
-    utils::{prelude::*, quirks::WORKSPACE_OVERVIEW_NAMESPACE},
+    input::cursor_sessions_for_output,
+    state::State,
+    utils::{
+        prelude::{Global, *},
+        quirks::WORKSPACE_OVERVIEW_NAMESPACE,
+    },
     wayland::{
         handlers::{
             toplevel_management::minimize_rectangle, xdg_activation::ActivationContext,
@@ -2476,7 +2483,15 @@ impl Shell {
             .retain(|pending| pending.surface.alive());
     }
 
-    pub fn update_pointer_position(&mut self, location: Point<f64, Local>, output: &Output) {
+    pub fn update_pointer_position(
+        &mut self,
+        position: Point<f64, Global>,
+        output: &Output,
+        seat: &Seat<State>,
+        now: Time<Monotonic>,
+    ) {
+        let location = position.to_local(output);
+
         for (o, set) in self.workspaces.sets.iter_mut() {
             if o == output {
                 set.sticky_layer.update_pointer_position(Some(location));
@@ -2493,6 +2508,42 @@ impl Shell {
                 for workspace in &mut set.workspaces {
                     workspace.update_pointer_position(None, self.overview_mode.clone());
                 }
+            }
+        }
+
+        self.update_cursor_render_state(output, seat, position, now);
+    }
+
+    pub fn update_cursor_render_state(
+        &self,
+        output: &Output,
+        seat: &Seat<State>,
+        position: Point<f64, Global>,
+        now: Time<Monotonic>,
+    ) {
+        let local_pos = position.to_local(output).as_logical();
+
+        for session in cursor_sessions_for_output(self, output) {
+            let buffer_pos = local_pos.to_buffer(
+                output.current_scale().fractional_scale(),
+                output.current_transform(),
+                &output.geometry().size.to_f64().as_logical(),
+            );
+
+            if let Some((geometry, offset)) = seat.cursor_geometry(buffer_pos, now) {
+                if session
+                    .current_constraints()
+                    .map(|constraint| constraint.size != geometry.size)
+                    .unwrap_or(true)
+                {
+                    session.update_constraints(BufferConstraints {
+                        size: geometry.size,
+                        shm: vec![ShmFormat::Argb8888],
+                        dma: None,
+                    });
+                }
+                session.set_cursor_hotspot(offset);
+                session.set_cursor_pos(Some(geometry.loc));
             }
         }
     }

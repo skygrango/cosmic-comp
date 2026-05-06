@@ -57,11 +57,11 @@ use smithay::{
     },
     output::Output,
     reexports::{
-        input::Device as InputDevice, wayland_server::protocol::wl_shm::Format as ShmFormat,
+        input::Device as InputDevice,
     },
     utils::{Point, Rectangle, SERIAL_COUNTER, Serial},
     wayland::{
-        image_copy_capture::{BufferConstraints, CursorSessionRef},
+        image_copy_capture::CursorSessionRef,
         keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitorSeat,
         pointer_constraints::{PointerConstraint, with_pointer_constraint},
         seat::WaylandFocus,
@@ -571,7 +571,12 @@ impl State {
                     }
 
                     let mut shell = self.common.shell.write();
-                    shell.update_pointer_position(position.to_local(&output), &output);
+                    shell.update_pointer_position(
+                        position,
+                        &output,
+                        &seat,
+                        self.common.clock.now(),
+                    );
                     shell.update_focal_point(
                         &seat,
                         original_position,
@@ -583,31 +588,6 @@ impl State {
                             session.set_cursor_pos(None);
                         }
                         seat.set_active_output(&output);
-                    }
-
-                    for session in cursor_sessions_for_output(&shell, &output) {
-                        if let Some((geometry, offset)) = seat.cursor_geometry(
-                            position.as_logical().to_buffer(
-                                output.current_scale().fractional_scale(),
-                                output.current_transform(),
-                                &output_geometry.size.to_f64().as_logical(),
-                            ),
-                            self.common.clock.now(),
-                        ) {
-                            if session
-                                .current_constraints()
-                                .map(|constraint| constraint.size != geometry.size)
-                                .unwrap_or(true)
-                            {
-                                session.update_constraints(BufferConstraints {
-                                    size: geometry.size,
-                                    shm: vec![ShmFormat::Argb8888],
-                                    dma: None,
-                                });
-                            }
-                            session.set_cursor_hotspot(offset);
-                            session.set_cursor_pos(Some(geometry.loc));
-                        }
                     }
                 }
             }
@@ -645,31 +625,13 @@ impl State {
                     );
                     ptr.frame(self);
 
-                    let shell = self.common.shell.read();
-                    for session in cursor_sessions_for_output(&shell, &output) {
-                        if let Some((geometry, offset)) = seat.cursor_geometry(
-                            position.as_logical().to_buffer(
-                                output.current_scale().fractional_scale(),
-                                output.current_transform(),
-                                &geometry.size.to_f64().as_logical(),
-                            ),
-                            self.common.clock.now(),
-                        ) {
-                            if session
-                                .current_constraints()
-                                .map(|constraint| constraint.size != geometry.size)
-                                .unwrap_or(true)
-                            {
-                                session.update_constraints(BufferConstraints {
-                                    size: geometry.size,
-                                    shm: vec![ShmFormat::Argb8888],
-                                    dma: None,
-                                });
-                            }
-                            session.set_cursor_hotspot(offset);
-                            session.set_cursor_pos(Some(geometry.loc));
-                        }
-                    }
+                    let mut shell = self.common.shell.write();
+                    shell.update_pointer_position(
+                        position,
+                        &output,
+                        &seat,
+                        self.common.clock.now(),
+                    );
                 }
             }
             InputEvent::PointerButton { event, .. } => {
@@ -2304,7 +2266,7 @@ impl State {
     }
 }
 
-fn cursor_sessions_for_output<'a>(
+pub fn cursor_sessions_for_output<'a>(
     shell: &'a Shell,
     output: &'a Output,
 ) -> impl Iterator<Item = CursorSessionRef> + 'a {
