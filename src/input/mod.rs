@@ -585,30 +585,12 @@ impl State {
                         seat.set_active_output(&output);
                     }
 
-                    for session in cursor_sessions_for_output(&shell, &output) {
-                        if let Some((geometry, offset)) = seat.cursor_geometry(
-                            position.as_logical().to_buffer(
-                                output.current_scale().fractional_scale(),
-                                output.current_transform(),
-                                &output_geometry.size.to_f64().as_logical(),
-                            ),
-                            self.common.clock.now(),
-                        ) {
-                            if session
-                                .current_constraints()
-                                .map(|constraint| constraint.size != geometry.size)
-                                .unwrap_or(true)
-                            {
-                                session.update_constraints(BufferConstraints {
-                                    size: geometry.size,
-                                    shm: vec![ShmFormat::Argb8888],
-                                    dma: None,
-                                });
-                            }
-                            session.set_cursor_hotspot(offset);
-                            session.set_cursor_pos(Some(geometry.loc));
-                        }
-                    }
+                    shell.update_cursor_render_state(
+                        &output,
+                        &seat,
+                        position,
+                        self.common.clock.now(),
+                    );
                 }
             }
             InputEvent::PointerMotionAbsolute { event, .. } => {
@@ -646,30 +628,12 @@ impl State {
                     ptr.frame(self);
 
                     let shell = self.common.shell.read();
-                    for session in cursor_sessions_for_output(&shell, &output) {
-                        if let Some((geometry, offset)) = seat.cursor_geometry(
-                            position.as_logical().to_buffer(
-                                output.current_scale().fractional_scale(),
-                                output.current_transform(),
-                                &geometry.size.to_f64().as_logical(),
-                            ),
-                            self.common.clock.now(),
-                        ) {
-                            if session
-                                .current_constraints()
-                                .map(|constraint| constraint.size != geometry.size)
-                                .unwrap_or(true)
-                            {
-                                session.update_constraints(BufferConstraints {
-                                    size: geometry.size,
-                                    shm: vec![ShmFormat::Argb8888],
-                                    dma: None,
-                                });
-                            }
-                            session.set_cursor_hotspot(offset);
-                            session.set_cursor_pos(Some(geometry.loc));
-                        }
-                    }
+                    shell.update_cursor_render_state(
+                        &output,
+                        &seat,
+                        position,
+                        self.common.clock.now(),
+                    );
                 }
             }
             InputEvent::PointerButton { event, .. } => {
@@ -2304,7 +2268,7 @@ impl State {
     }
 }
 
-fn cursor_sessions_for_output<'a>(
+pub fn cursor_sessions_for_output<'a>(
     shell: &'a Shell,
     output: &'a Output,
 ) -> impl Iterator<Item = CursorSessionRef> + 'a {
