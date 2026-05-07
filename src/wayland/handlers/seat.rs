@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use crate::{
-    shell::Devices,
-    shell::focus::target::{KeyboardFocusTarget, PointerFocusTarget},
+    shell::{
+        Devices,
+        focus::target::{KeyboardFocusTarget, PointerFocusTarget},
+    },
     state::State,
     utils::prelude::SeatExt,
 };
