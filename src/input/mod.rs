@@ -534,24 +534,39 @@ impl State {
                     );
                     ptr.frame(self);
 
-                    // If pointer is now in a constraint region, activate it
+                    // If pointer is now in a constraint region and window is focused, activate it
                     if let Some((under, surface_location)) = new_under
                         .and_then(|(target, loc)| Some((target.wl_surface()?.into_owned(), loc)))
                     {
-                        with_pointer_constraint(&under, &ptr, |constraint| match constraint {
-                            Some(constraint) if !constraint.is_active() => {
-                                let region = match &*constraint {
-                                    PointerConstraint::Locked(locked) => locked.region(),
-                                    PointerConstraint::Confined(confined) => confined.region(),
-                                };
-                                let point =
-                                    (ptr.current_location() - surface_location).to_i32_round();
-                                if region.is_none_or(|region| region.contains(point)) {
-                                    constraint.activate();
-                                }
+                        let is_focused = seat.get_keyboard().and_then(|k| k.current_focus()).is_some_and(|f| {
+                            let shell = self.common.shell.read();
+                            if let Some(fe) = shell.focused_element(&f) {
+                                fe.has_surface(&under, smithay::desktop::WindowSurfaceType::ALL)
+                            } else if let crate::shell::focus::target::KeyboardFocusTarget::Fullscreen(s) =
+                                f
+                            {
+                                s.has_surface(&under, smithay::desktop::WindowSurfaceType::ALL)
+                            } else {
+                                f.wl_surface().as_deref() == Some(&under)
                             }
-                            _ => {}
                         });
+
+                        if is_focused {
+                            with_pointer_constraint(&under, &ptr, |constraint| match constraint {
+                                Some(constraint) if !constraint.is_active() => {
+                                    let region = match &*constraint {
+                                        PointerConstraint::Locked(locked) => locked.region(),
+                                        PointerConstraint::Confined(confined) => confined.region(),
+                                    };
+                                    let point =
+                                        (ptr.current_location() - surface_location).to_i32_round();
+                                    if region.is_none_or(|region| region.contains(point)) {
+                                        constraint.activate();
+                                    }
+                                }
+                                _ => {}
+                            });
+                        }
                     }
 
                     let mut shell = self.common.shell.write();
