@@ -322,9 +322,13 @@ impl State {
                     let mut confine_region = None;
                     if let Some((surface, surface_loc)) = under
                         .as_ref()
-                        .and_then(|(target, l)| Some((target.wl_surface()?, l)))
+                        .and_then(|(target, l)| Some((target.wl_surface()?.into_owned(), l)))
                     {
-                        with_pointer_constraint(&surface, &ptr, |constraint| match constraint {
+                        smithay::wayland::pointer_constraints::with_pointer_constraint_readonly::<
+                            State,
+                            _,
+                            _,
+                        >(&surface, &ptr, |constraint| match constraint {
                             Some(constraint) if constraint.is_active() => {
                                 // Constraint does not apply if not within region
                                 if !constraint.region().is_none_or(|x| {
@@ -552,19 +556,23 @@ impl State {
                         });
 
                         if is_focused {
-                            with_pointer_constraint(&under, &ptr, |constraint| match constraint {
-                                Some(constraint) if !constraint.is_active() => {
-                                    let region = match &*constraint {
-                                        PointerConstraint::Locked(locked) => locked.region(),
-                                        PointerConstraint::Confined(confined) => confined.region(),
-                                    };
-                                    let point =
-                                        (ptr.current_location() - surface_location).to_i32_round();
-                                    if region.is_none_or(|region| region.contains(point)) {
-                                        constraint.activate();
+                            with_pointer_constraint(self, &under, &ptr, |constraint| {
+                                match constraint {
+                                    Some(mut constraint) if !constraint.is_active() => {
+                                        let region = match &*constraint {
+                                            PointerConstraint::Locked(locked) => locked.region(),
+                                            PointerConstraint::Confined(confined) => {
+                                                confined.region()
+                                            }
+                                        };
+                                        let point = (ptr.current_location() - surface_location)
+                                            .to_i32_round();
+                                        if region.is_none_or(|region| region.contains(point)) {
+                                            constraint.activate();
+                                        }
                                     }
+                                    _ => {}
                                 }
-                                _ => {}
                             });
                         }
                     }

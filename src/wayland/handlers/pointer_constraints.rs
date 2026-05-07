@@ -18,13 +18,15 @@ use smithay::{
     wayland::{
         compositor::{CompositorHandler, get_parent, with_states},
         image_copy_capture::BufferConstraints,
-        pointer_constraints::PointerConstraintsHandler,
+        pointer_constraints::{PointerConstraint, PointerConstraintsHandler},
         seat::WaylandFocus,
         shell::xdg::{XDG_POPUP_ROLE, XdgPopupSurfaceData},
     },
 };
 
-pub use smithay::wayland::pointer_constraints::with_pointer_constraint;
+pub use smithay::wayland::pointer_constraints::{
+    with_pointer_constraint, with_pointer_constraint_readonly,
+};
 
 fn find_window(
     output: &Output,
@@ -113,57 +115,59 @@ impl PointerConstraintsHandler for State {
             .find(|s| s.get_pointer().as_ref() == Some(pointer))
             .cloned();
 
-        let (is_under, is_focused, surface_location) =
-            if let Some(seat) = seat {
-                self.common.idle_notifier_state.notify_activity(&seat);
-                let current_output = seat.active_output();
-                let position = seat.get_pointer().unwrap().current_location().as_global();
-                let shell = self.common.shell.read();
+        let (is_under, is_focused, surface_location) = if let Some(seat) = seat {
+            seat.set_pointer_constraint_hint(None);
+            self.common.idle_notifier_state.notify_activity(&seat);
+            let current_output = seat.active_output();
+            let position = seat.get_pointer().unwrap().current_location().as_global();
+            let shell = self.common.shell.read();
 
-                let under = State::surface_under(position, &current_output, &shell);
-                let mut surface_location = None;
-                let is_under = if let Some((target, target_loc)) = under
-                    && let Some(under_surface) = target.wl_surface()
-                {
-                    if *under_surface == *surface {
-                        surface_location = Some(target_loc);
-                        true
-                    } else {
-                        CosmicSurface::surface_tree_offset(surface, &under_surface).map_or(
-                            false,
-                            |offset| {
-                                surface_location = Some(target_loc - offset.to_f64().as_global());
-                                true
-                            },
-                        )
-                    }
+            let under = State::surface_under(position, &current_output, &shell);
+            let mut surface_location = None;
+            let is_under = if let Some((target, target_loc)) = under
+                && let Some(under_surface) = target.wl_surface()
+            {
+                if *under_surface == *surface {
+                    surface_location = Some(target_loc);
+                    true
                 } else {
-                    false
-                };
-
-                let is_focused =
-                    seat.get_keyboard()
-                        .and_then(|k| k.current_focus())
-                        .is_some_and(|f| {
-                            if let Some(fe) = shell.focused_element(&f) {
-                    fe.has_surface(surface, WindowSurfaceType::ALL)
-                } else if let crate::shell::focus::target::KeyboardFocusTarget::Fullscreen(s) = f {
-                    s.has_surface(surface, WindowSurfaceType::ALL)
-                } else if let Some(root) = f.wl_surface() {
-                    CosmicSurface::surface_tree_offset(&root, surface).is_some()
-                } else {
-                    false
+                    CosmicSurface::surface_tree_offset(surface, &under_surface).map_or(
+                        false,
+                        |offset| {
+                            surface_location = Some(target_loc - offset.to_f64().as_global());
+                            true
+                        },
+                    )
                 }
-                        });
-
-                (is_under, is_focused, surface_location)
             } else {
-                (false, false, None)
+                false
             };
 
-        if is_under && is_focused {
-            with_pointer_constraint(surface, pointer, |constraint| {
-                if let Some(constraint) = constraint {
+            let is_focused = seat
+                .get_keyboard()
+                .and_then(|k| k.current_focus())
+                .is_some_and(|f| {
+                    if let Some(fe) = shell.focused_element(&f) {
+                        fe.has_surface(surface, WindowSurfaceType::ALL)
+                    } else if let crate::shell::focus::target::KeyboardFocusTarget::Fullscreen(s) =
+                        f
+                    {
+                        s.has_surface(surface, WindowSurfaceType::ALL)
+                    } else if let Some(root) = f.wl_surface() {
+                        CosmicSurface::surface_tree_offset(&root, surface).is_some()
+                    } else {
+                        false
+                    }
+                });
+
+            (is_under, is_focused, surface_location)
+        } else {
+            (false, false, None)
+        };
+
+        if is_focused && is_under {
+            with_pointer_constraint(self, surface, pointer, |constraint| {
+                if let Some(mut constraint) = constraint {
                     if let Some(region) = constraint.region() {
                         if let Some(surface_location) = surface_location
                             && let position = pointer.current_location()
@@ -171,8 +175,6 @@ impl PointerConstraintsHandler for State {
                             && region.contains(point)
                         {
                             constraint.activate();
-                        } else {
-                            constraint.deactivate();
                         }
                     } else {
                         constraint.activate();
@@ -188,13 +190,45 @@ impl PointerConstraintsHandler for State {
         pointer: &PointerHandle<Self>,
         location: Point<f64, Logical>,
     ) {
-        // Apply the hint immediately if the constraint is active.
-        if with_pointer_constraint(surface, pointer, |constraint| {
+        if with_pointer_constraint_readonly::<State, _, _>(surface, pointer, |constraint| {
             constraint.is_some_and(|c| c.is_active())
         }) {
-            apply_cursor_hint(self, surface, pointer, location);
+            let seat = self
+                .common
+                .shell
+                .read()
+                .seats
+                .iter()
+                .find(|s| s.get_pointer().as_ref() == Some(pointer))
+                .cloned();
+
+            if let Some(seat) = seat {
+                seat.set_pointer_constraint_hint(Some((surface.clone(), location)));
+            }
         }
     }
+
+    fn deactivated(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
+        let seat = self
+            .common
+            .shell
+            .read()
+            .seats
+            .iter()
+            .find(|s| s.get_pointer().as_ref() == Some(pointer))
+            .cloned();
+
+        if let Some(seat) = seat {
+            if let Some((hint_surface, hint_location)) = seat.pointer_constraint_hint() {
+                if hint_surface == *surface {
+                    apply_cursor_hint(self, surface, pointer, hint_location);
+                    seat.set_pointer_constraint_hint(None);
+                }
+            }
+        }
+    }
+
+    fn activated(&mut self, _surface: &WlSurface, _pointer: &PointerHandle<Self>) {}
 }
 
 pub fn apply_cursor_hint(
@@ -230,7 +264,7 @@ pub fn apply_cursor_hint(
                     return false;
                 }
 
-                with_pointer_constraint(surface, pointer, |constraint| {
+                with_pointer_constraint_readonly::<State, _, _>(surface, pointer, |constraint| {
                     if let Some(constraint) = constraint {
                         if let Some(region) = constraint.region() {
                             let point_in_surface = (p - surface_offset.to_f64()).to_i32_round();

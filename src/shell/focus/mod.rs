@@ -357,7 +357,8 @@ fn update_focus_state(
             && let Some(surface) = old_target.wl_surface()
         {
             let pointer = seat.get_pointer().unwrap();
-            with_pointer_constraint(&surface, &pointer, |constraint| {
+
+            with_pointer_constraint(state, &surface, &pointer, |constraint| {
                 if let Some(constraint) = constraint {
                     constraint.deactivate();
                 }
