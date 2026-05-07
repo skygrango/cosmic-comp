@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
+use crate::wayland::handlers::pointer_constraints::with_pointer_constraint;
 use crate::{
     backend::render::ElementFilter,
     config::{
@@ -35,6 +36,7 @@ use calloop::{
 use cosmic_comp_config::{NumlockState, workspace::WorkspaceLayout};
 use cosmic_settings_config::shortcuts;
 use cosmic_settings_config::shortcuts::action::{Direction, ResizeDirection};
+use smithay::wayland::pointer_constraints::PointerConstraint;
 use smithay::{
     backend::input::{
         AbsolutePositionEvent, Axis, AxisSource, Device, DeviceCapability, GestureBeginEvent,
@@ -63,7 +65,6 @@ use smithay::{
     wayland::{
         image_copy_capture::{BufferConstraints, CursorSessionRef},
         keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitorSeat,
-        pointer_constraints::{PointerConstraint, with_pointer_constraint},
         seat::WaylandFocus,
         tablet_manager::{TabletDescriptor, TabletSeatTrait},
     },
@@ -366,6 +367,38 @@ impl State {
                         (output_geometry.loc.y + output_geometry.size.h - 1) as f64,
                     );
 
+                    // If confined, help user to update valid coordinates can improve user experience
+                    if pointer_confined && let Some((surface, surface_loc)) = &under {
+                        let is_legal = |pos: Point<f64, Global>, shell: &Shell| {
+                            if State::surface_under(pos, &output, shell)
+                                .and_then(|(t, _)| t.wl_surface().map(|s| s.into_owned()))
+                                != surface.wl_surface().map(|s| s.into_owned())
+                            {
+                                return false;
+                            }
+                            if let Some(region) = &confine_region {
+                                if !region
+                                    .contains((pos.as_logical() - *surface_loc).to_i32_round())
+                                {
+                                    return false;
+                                }
+                            }
+                            true
+                        };
+
+                        if !is_legal(position, &shell) {
+                            let y_only_pos = Point::new(original_position.x, position.y);
+                            let x_only_pos = Point::new(position.x, original_position.y);
+                            if is_legal(y_only_pos, &shell) {
+                                position = y_only_pos;
+                            } else if is_legal(x_only_pos, &shell) {
+                                position = x_only_pos;
+                            } else {
+                                position = original_position;
+                            }
+                        }
+                    }
+
                     let new_under = State::surface_under(position, &output, &shell)
                         .map(|(target, pos)| (target, pos.as_logical()));
 
@@ -492,52 +525,6 @@ impl State {
                         }
                     }
 
-                    // If confined, don't move pointer if it would go outside surface or region
-                    if pointer_confined && let Some((surface, surface_loc)) = &under {
-                        if new_under.as_ref().and_then(|(under, _)| under.wl_surface())
-                            != surface.wl_surface()
-                        {
-                            ptr.frame(self);
-                            return;
-                        }
-                        match surface {
-                            PointerFocusTarget::WlSurface { surface, .. } => {
-                                if under_from_surface_tree(
-                                    surface,
-                                    position.as_logical() - surface_loc.to_f64(),
-                                    (0, 0),
-                                    WindowSurfaceType::ALL,
-                                )
-                                .is_none()
-                                {
-                                    ptr.frame(self);
-                                    return;
-                                }
-                            }
-                            PointerFocusTarget::X11Surface { surface, .. } => {
-                                if surface
-                                    .surface_under(
-                                        position.as_logical() - surface_loc.to_f64(),
-                                        (0, 0),
-                                        WindowSurfaceType::ALL,
-                                    )
-                                    .is_none()
-                                {
-                                    ptr.frame(self);
-                                    return;
-                                }
-                            }
-                            _ => {}
-                        }
-                        if let Some(region) = confine_region
-                            && !region
-                                .contains((position.as_logical() - *surface_loc).to_i32_round())
-                        {
-                            ptr.frame(self);
-                            return;
-                        }
-                    }
-
                     let serial = SERIAL_COUNTER.next_serial();
                     ptr.motion(
                         self,
@@ -550,24 +537,34 @@ impl State {
                     );
                     ptr.frame(self);
 
-                    // If pointer is now in a constraint region, activate it
+                    // If pointer is now in a constraint region and window is in focused, activate it
                     if let Some((under, surface_location)) = new_under
                         .and_then(|(target, loc)| Some((target.wl_surface()?.into_owned(), loc)))
                     {
-                        with_pointer_constraint(&under, &ptr, |constraint| match constraint {
-                            Some(constraint) if !constraint.is_active() => {
-                                let region = match &*constraint {
-                                    PointerConstraint::Locked(locked) => locked.region(),
-                                    PointerConstraint::Confined(confined) => confined.region(),
-                                };
-                                let point =
-                                    (ptr.current_location() - surface_location).to_i32_round();
-                                if region.is_none_or(|region| region.contains(point)) {
-                                    constraint.activate();
+                        let shell = self.common.shell.read();
+                        let is_focused = seat
+                            .get_keyboard()
+                            .and_then(|k| k.current_focus())
+                            .is_some_and(|f| f.has_surface(&shell, &under));
+
+                        if is_focused {
+                            with_pointer_constraint(&under, &ptr, |constraint| match constraint {
+                                Some(constraint) if !constraint.is_active() => {
+                                    let region = match &*constraint {
+                                            smithay::wayland::pointer_constraints::PointerConstraint::Locked(locked) => locked.region(),
+                                            smithay::wayland::pointer_constraints::PointerConstraint::Confined(confined) => {
+                                                confined.region()
+                                            }
+                                        };
+                                    let point =
+                                        (ptr.current_location() - surface_location).to_i32_round();
+                                    if region.is_none_or(|region| region.contains(point)) {
+                                        constraint.activate();
+                                    }
                                 }
-                            }
-                            _ => {}
-                        });
+                                _ => {}
+                            });
+                        }
                     }
 
                     let mut shell = self.common.shell.write();
@@ -2304,7 +2301,7 @@ impl State {
     }
 }
 
-fn cursor_sessions_for_output<'a>(
+pub fn cursor_sessions_for_output<'a>(
     shell: &'a Shell,
     output: &'a Output,
 ) -> impl Iterator<Item = CursorSessionRef> + 'a {
