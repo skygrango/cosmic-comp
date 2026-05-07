@@ -2304,7 +2304,7 @@ impl State {
     }
 }
 
-fn cursor_sessions_for_output<'a>(
+pub fn cursor_sessions_for_output<'a>(
     shell: &'a Shell,
     output: &'a Output,
 ) -> impl Iterator<Item = CursorSessionRef> + 'a {
