@@ -187,11 +187,24 @@ pub fn apply_cursor_hint(
             let window_size = geometry.size.to_f64();
 
             let is_legal = |p: Point<f64, Logical>| {
-                p.x >= 0.0
+                let in_window = p.x >= 0.0
                     && p.y >= 0.0
                     // hack: prevent the cursor from touching the edge of the window
                     && p.x <= window_size.w - 1.
-                    && p.y <= window_size.h - 1.
+                    && p.y <= window_size.h - 1.;
+                if !in_window {
+                    return false;
+                }
+
+                with_pointer_constraint(surface, pointer, |constraint| {
+                    if let Some(constraint) = constraint {
+                        if let Some(region) = constraint.region() {
+                            let point_in_surface = (p - surface_offset.to_f64()).to_i32_round();
+                            return region.contains(point_in_surface);
+                        }
+                    }
+                    true
+                })
             };
 
             if !is_legal(pos_in_element) {
