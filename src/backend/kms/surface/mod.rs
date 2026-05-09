@@ -8,7 +8,10 @@ use crate::{
         init_shaders, output_elements,
     },
     config::ScreenFilter,
-    shell::Shell,
+    shell::{
+        Shell,
+        focus::{FocusTarget, target::KeyboardFocusTarget},
+    },
     state::SurfaceDmabufFeedback,
     utils::prelude::*,
     wayland::handlers::{
@@ -1025,13 +1028,35 @@ impl SurfaceThreadState {
             let output = self.mirroring.as_ref().unwrap_or(&self.output);
             if let Some((_, workspace)) = shell.workspaces.active(output) {
                 if let Some(fullscreen_surface) = workspace.get_fullscreen() {
+                    let seat = shell.seats.last_active();
+                    let is_active_workspace = seat.focused_output().as_ref() == Some(output);
+                    let focus_stack = workspace.focus_stack.get(seat);
+                    let last_focused = focus_stack.last();
+                    let focus_stack_is_valid_fullscreen = last_focused.is_some_and(|t| match t {
+                        FocusTarget::Fullscreen(s) => s == fullscreen_surface,
+                        _ => false,
+                    });
+                    let overview_is_open = crate::utils::quirks::workspace_overview_is_open(output);
+
+                    let has_focused_fullscreen = if is_active_workspace {
+                        let current_focus = seat.get_keyboard().and_then(|k| k.current_focus());
+                        matches!(current_focus, Some(KeyboardFocusTarget::Fullscreen(_)))
+                            || (current_focus.is_none()
+                                && (focus_stack_is_valid_fullscreen)
+                                && !overview_is_open)
+                    } else {
+                        focus_stack_is_valid_fullscreen && !overview_is_open
+                    };
+
                     const _30_FPS: Duration = Duration::from_nanos(1_000_000_000 / 30);
-                    (
-                        true,
+                    let drives_refresh_rate =
                         fullscreen_surface.wl_surface().is_some_and(|surface| {
                             recursive_frame_time_estimation(&self.clock, &surface)
                                 .is_some_and(|dur| dur <= _30_FPS)
-                        }),
+                        });
+                    (
+                        has_focused_fullscreen,
+                        drives_refresh_rate,
                         animations_going,
                     )
                 } else {
