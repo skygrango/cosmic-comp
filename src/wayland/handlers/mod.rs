@@ -28,6 +28,7 @@ pub mod output_power;
 pub mod overlap_notify;
 pub mod pointer_constraints;
 pub mod pointer_gestures;
+pub mod pointer_warp;
 pub mod presentation;
 pub mod primary_selection;
 pub mod relative_pointer;
