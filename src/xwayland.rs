@@ -35,7 +35,8 @@ use smithay::{
     input::{keyboard::ModifiersState, pointer::CursorIcon},
     reexports::{wayland_server::Client, x11rb::protocol::xproto::Window as X11Window},
     utils::{
-        Buffer as BufferCoords, Logical, Point, Rectangle, SERIAL_COUNTER, Serial, Size, Transform,
+        Buffer as BufferCoords, IsAlive as _, Logical, Point, Rectangle, SERIAL_COUNTER, Serial,
+        Size, Transform,
     },
     wayland::{
         selection::{
@@ -177,7 +178,8 @@ impl State {
                     data.common.update_xwayland_primary_output();
                 }
                 XWaylandEvent::Error => {
-                    data.common.xwayland_reset_eavesdropping(SERIAL_COUNTER.next_serial());
+                    data.common
+                        .xwayland_reset_eavesdropping(SERIAL_COUNTER.next_serial());
                     if let Some(mut xwayland_state) = data.common.xwayland_state.take() {
                         xwayland_state.xwm = None;
                     }
@@ -186,8 +188,12 @@ impl State {
                     let mut shell = data.common.shell.write();
                     shell.xwayland_keyboard_grab = None;
                     shell.override_redirect_windows.retain(|or| or.alive());
-                    shell.pending_windows.retain(|pending| pending.surface.alive());
-                    shell.pending_activations.retain(|key, _| !matches!(key, crate::shell::ActivationKey::X11(_)));
+                    shell
+                        .pending_windows
+                        .retain(|pending| pending.surface.alive());
+                    shell
+                        .pending_activations
+                        .retain(|key, _| !matches!(key, crate::shell::ActivationKey::X11(_)));
                     // The main mapped surfaces will be cleaned up by routine `alive()` checks in `refresh()`,
                     // but we ensure the shell drops dead X11 surfaces directly here.
                     std::mem::drop(shell);
