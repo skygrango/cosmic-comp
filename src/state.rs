@@ -87,6 +87,7 @@ use smithay::{
         output::OutputManagerState,
         pointer_constraints::PointerConstraintsState,
         pointer_gestures::PointerGesturesState,
+        pointer_warp::PointerWarpManager,
         presentation::PresentationState,
         seat::WaylandFocus,
         security_context::{SecurityContext, SecurityContextState},
@@ -672,6 +673,7 @@ impl State {
         XWaylandKeyboardGrabState::new::<Self>(dh);
         let xwayland_shell_state = XWaylandShellState::new::<Self>(dh);
         PointerConstraintsState::new::<Self>(dh);
+        PointerWarpManager::new::<Self>(dh);
         PointerGesturesState::new::<Self>(dh);
         TabletManagerState::new::<Self>(dh);
         SecurityContextState::new::<Self, _>(dh, client_has_no_security_context);
