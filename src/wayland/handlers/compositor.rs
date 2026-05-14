@@ -11,6 +11,7 @@ use smithay::{
     reexports::wayland_server::{Client, Resource, protocol::wl_surface::WlSurface},
     utils::{Clock, Logical, Monotonic, SERIAL_COUNTER, Size, Time},
     wayland::{
+        commit_timing::CommitTimerStateUserData,
         compositor::{
             BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
             SurfaceAttributes, SurfaceData, TraversalAction, add_blocker, add_post_commit_hook,
@@ -18,6 +19,7 @@ use smithay::{
         },
         dmabuf::get_dmabuf,
         drm_syncobj::DrmSyncobjCachedState,
+        fifo::FifoCachedState,
         seat::WaylandFocus,
         shell::{
             wlr_layer::LayerSurfaceAttributes,
@@ -172,6 +174,30 @@ impl CompositorHandler for State {
 
     fn new_surface(&mut self, surface: &WlSurface) {
         add_pre_commit_hook::<Self, _>(surface, move |state, _dh, surface| {
+            let mut schedule_render = false;
+            with_states(surface, |states| {
+                let mut state_cache = states.cached_state.get::<FifoCachedState>();
+                let fifo_pending = state_cache.pending();
+                if fifo_pending.wait_barrier || fifo_pending.set_barrier {
+                    schedule_render = true;
+                }
+                if let Some(commit_timing) = states.data_map.get::<CommitTimerStateUserData>() {
+                    if commit_timing.borrow().timestamp.is_some() {
+                        schedule_render = true;
+                    }
+                }
+            });
+
+            if schedule_render {
+                let shell = state.common.shell.read();
+                if let Some(output) = shell.visible_output_for_surface(surface) {
+                    state.backend.schedule_render(output);
+                } else {
+                    let output = shell.seats.last_active().active_output();
+                    state.backend.schedule_render(&output);
+                }
+            }
+
             let mut acquire_point = None;
             let maybe_dmabuf = with_states(surface, |surface_data| {
                 acquire_point = surface_data

@@ -3,11 +3,12 @@ use std::{collections::VecDeque, num::NonZeroU64, time::Duration};
 use smithay::{
     backend::drm::DrmNode,
     utils::{Clock, Monotonic, Time},
+    wayland::commit_timing::Timestamp,
 };
 use tracing::{debug, error};
 
 const BASE_SAFETY_MARGIN: Duration = Duration::from_millis(3);
-const SAMPLE_TIME_WINDOW: usize = 5;
+const SAMPLE_TIME_WINDOW: usize = 10;
 
 pub struct Timings {
     refresh_interval_ns: Option<NonZeroU64>,
@@ -230,6 +231,19 @@ impl Timings {
             .unwrap_or(Duration::ZERO)
     }
 
+    pub fn max_submittime(&self, window: usize) -> Option<Duration> {
+        if self.previous_frames.len() < window || window == 0 {
+            return None;
+        }
+
+        self.previous_frames
+            .iter()
+            .rev()
+            .take(window)
+            .map(|f| f.submit_time())
+            .max()
+    }
+
     pub fn avg_submittime(&self, window: usize) -> Option<Duration> {
         if self.previous_frames.len() < window || window == 0 {
             return None;
@@ -386,6 +400,7 @@ impl Timings {
         };
 
         let margin = avg_submittime + BASE_SAFETY_MARGIN;
+
         estimated_presentation_time.saturating_sub(margin)
     }
 }
