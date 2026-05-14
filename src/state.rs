@@ -73,9 +73,11 @@ use smithay::{
     utils::{Clock, Monotonic, Point},
     wayland::{
         alpha_modifier::AlphaModifierState,
+        commit_timing::CommitTimingManagerState,
         compositor::{CompositorClientState, CompositorState, SurfaceData},
         cursor_shape::CursorShapeManagerState,
         dmabuf::{DmabufFeedback, DmabufGlobal, DmabufState},
+        fifo::FifoManagerState,
         fixes::FixesState,
         fractional_scale::{FractionalScaleManagerState, with_fractional_scale},
         idle_inhibit::IdleInhibitManagerState,
@@ -254,6 +256,8 @@ pub struct Common {
     pub data_device_state: DataDeviceState,
     pub dmabuf_state: DmabufState,
     pub fractional_scale_state: FractionalScaleManagerState,
+    pub commit_timing_manager_state: CommitTimingManagerState,
+    pub fifo_manager_state: FifoManagerState,
     pub keyboard_shortcuts_inhibit_state: KeyboardShortcutsInhibitState,
     pub output_state: OutputManagerState,
     pub output_configuration_state: OutputConfigurationState<State>,
@@ -643,6 +647,8 @@ impl State {
         let data_device_state = DataDeviceState::new::<Self>(dh);
         let dmabuf_state = DmabufState::new();
         let fractional_scale_state = FractionalScaleManagerState::new::<State>(dh);
+        let commit_timing_manager_state = CommitTimingManagerState::new::<State>(dh);
+        let fifo_manager_state = FifoManagerState::new::<State>(dh);
         let keyboard_shortcuts_inhibit_state = KeyboardShortcutsInhibitState::new::<Self>(dh);
         let output_state = OutputManagerState::new_with_xdg_output::<Self>(dh);
         let output_configuration_state =
@@ -763,6 +769,8 @@ impl State {
                 data_device_state,
                 dmabuf_state,
                 fractional_scale_state,
+                commit_timing_manager_state,
+                fifo_manager_state,
                 idle_notifier_state,
                 idle_inhibit_manager_state,
                 idle_inhibiting_surfaces,

@@ -3,6 +3,7 @@
 pub mod a11y;
 pub mod alpha_modifier;
 pub mod buffer;
+pub mod commit_timing;
 pub mod compositor;
 pub mod corner_radius;
 pub mod data_control;
@@ -12,6 +13,7 @@ pub mod dmabuf;
 pub mod drm;
 pub mod drm_lease;
 pub mod drm_syncobj;
+pub mod fifo;
 pub mod fixes;
 pub mod foreign_toplevel_list;
 pub mod fractional_scale;

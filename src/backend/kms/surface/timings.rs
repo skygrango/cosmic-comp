@@ -3,14 +3,16 @@ use std::{collections::VecDeque, num::NonZeroU64, time::Duration};
 use smithay::{
     backend::drm::DrmNode,
     utils::{Clock, Monotonic, Time},
+    wayland::commit_timing::Timestamp,
 };
 use tracing::{debug, error};
 
 const BASE_SAFETY_MARGIN: Duration = Duration::from_millis(3);
-const SAMPLE_TIME_WINDOW: usize = 5;
+const SAMPLE_TIME_WINDOW: usize = 10;
 
 pub struct Timings {
     refresh_interval_ns: Option<NonZeroU64>,
+    commit_bias: Duration,
     min_refresh_interval_ns: Option<NonZeroU64>,
     vrr: bool,
     vendor: Option<u32>,
@@ -84,6 +86,7 @@ impl Timings {
 
         Self {
             refresh_interval_ns,
+            commit_bias: Duration::ZERO,
             min_refresh_interval_ns,
             vrr,
             vendor,
@@ -230,6 +233,19 @@ impl Timings {
             .unwrap_or(Duration::ZERO)
     }
 
+    pub fn max_submittime(&self, window: usize) -> Option<Duration> {
+        if self.previous_frames.len() < window || window == 0 {
+            return None;
+        }
+
+        self.previous_frames
+            .iter()
+            .rev()
+            .take(window)
+            .map(|f| f.submit_time())
+            .max()
+    }
+
     pub fn avg_submittime(&self, window: usize) -> Option<Duration> {
         if self.previous_frames.len() < window || window == 0 {
             return None;
@@ -363,7 +379,11 @@ impl Timings {
         now >= deadline
     }
 
-    pub fn next_render_time(&self, clock: &Clock<Monotonic>) -> Duration {
+    pub fn next_render_time(
+        &mut self,
+        clock: &Clock<Monotonic>,
+        next_deadline: Option<Timestamp>,
+    ) -> Duration {
         let Some(refresh_interval) = self.refresh_interval_ns else {
             return Duration::ZERO; // we don't know what to expect, so render immediately.
         };
@@ -381,11 +401,34 @@ impl Timings {
             return Duration::ZERO;
         }
 
-        let Some(avg_submittime) = self.avg_submittime(SAMPLE_TIME_WINDOW) else {
-            return estimated_presentation_time.saturating_sub(baseline + BASE_SAFETY_MARGIN);
+        if let Some(next_deadline) = next_deadline {
+            let commit_time = Time::elapsed(&clock.now(), next_deadline.into());
+            let error_ns = commit_time
+                .saturating_sub(estimated_presentation_time)
+                .as_nanos() as f64;
+            // Heavily dampen the bias to prevent PID oscillation jitter
+            let bias_ns = self.commit_bias.as_nanos() as f64;
+            let new_bias_ns = 0.01 * error_ns + 0.99 * bias_ns;
+            self.commit_bias = Duration::from_nanos(new_bias_ns as u64);
+        } else {
+        //     const DECAY: f64 = 0.995;
+        //     let bias_ns = self.commit_bias.as_nanos() as f64;
+        //     let new_bias_ns = bias_ns * DECAY;
+        //     if new_bias_ns < 1_000.0 {
+        //         // < 1 microsecond
+        //         self.commit_bias = Duration::ZERO;
+        //     } else {
+        //         self.commit_bias = Duration::from_nanos(new_bias_ns as u64);
+        //     }
+        }
+
+        let Some(avg_submittime) = self.avg_submittime(SAMPLE_TIME_WINDOW) else{
+            return estimated_presentation_time
+                .saturating_sub(baseline + BASE_SAFETY_MARGIN + self.commit_bias);
         };
 
-        let margin = avg_submittime + BASE_SAFETY_MARGIN;
+        let margin = avg_submittime + BASE_SAFETY_MARGIN;//+ self.commit_bias;
+
         estimated_presentation_time.saturating_sub(margin)
     }
 }
