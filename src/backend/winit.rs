@@ -16,6 +16,7 @@ use smithay::{
         renderer::{
             ImportDma,
             damage::{OutputDamageTracker, RenderOutputResult},
+            element::RenderElementStates,
             glow::GlowRenderer,
         },
         winit::{self, WinitEvent, WinitGraphicsBackend, WinitVirtualDevice},
@@ -28,8 +29,10 @@ use smithay::{
         wayland_server::DisplayHandle,
         winit::platform::pump_events::PumpStatus,
     },
-    utils::Transform,
-    wayland::{dmabuf::DmabufFeedbackBuilder, presentation::Refresh},
+    utils::{Physical, Rectangle, Transform},
+    wayland::{
+        compositor::CompositorHandler, dmabuf::DmabufFeedbackBuilder, presentation::Refresh,
+    },
 };
 use std::{borrow::BorrowMut, cell::RefCell, time::Duration};
 use tracing::{error, info, warn};
@@ -47,12 +50,13 @@ pub struct WinitState {
 
 impl WinitState {
     #[profiling::function]
-    pub fn render_output(&mut self, state: &mut Common) -> Result<()> {
+    pub fn render_output(&mut self, state: &mut Common) -> Result<(bool, RenderElementStates)> {
         let age = self.backend.buffer_age().unwrap_or(0);
         let (renderer, mut fb) = self
             .backend
             .bind()
             .with_context(|| "Failed to bind buffer")?;
+
         match render::render_output(
             None,
             renderer,
@@ -71,35 +75,12 @@ impl WinitState {
                 self.backend
                     .submit(damage.map(|x| x.as_slice()))
                     .with_context(|| "Failed to submit buffer for display")?;
-                state.send_frames(&self.output, None);
-                state.update_primary_output(&self.output, &states);
-                state.send_dmabuf_feedback(&self.output, &states, |_| None);
-                if damage.is_some() {
-                    let mut output_presentation_feedback = state
-                        .shell
-                        .read()
-                        .take_presentation_feedback(&self.output, &states);
-                    output_presentation_feedback.presented(
-                        state.clock.now(),
-                        self.output
-                            .current_mode()
-                            .map(|mode| {
-                                Refresh::Fixed(Duration::from_secs_f64(
-                                    1_000.0 / mode.refresh as f64,
-                                ))
-                            })
-                            .unwrap_or(Refresh::Unknown),
-                        0,
-                        wp_presentation_feedback::Kind::Vsync,
-                    );
-                }
+                return Ok((damage.is_some(), states));
             }
             Err(err) => {
                 anyhow::bail!("Rendering failed: {}", err);
             }
         };
-
-        Ok(())
     }
 
     pub fn all_outputs(&self) -> Vec<Output> {
@@ -183,9 +164,46 @@ pub fn init_backend(
         event_loop
             .handle()
             .insert_source(render_source, move |_, _, state| {
-                if let Err(err) = state.backend.winit().render_output(&mut state.common) {
-                    error!(?err, "Failed to render frame.");
-                    render_ping.ping();
+                match state.backend.winit().render_output(&mut state.common) {
+                    Ok((damage, render_states)) => {
+                        let output = state.backend.winit().output.clone();
+                        state.signal_fifos(&output);
+                        let winit_state = state.backend.winit();
+                        state.common.send_frames(&winit_state.output, None);
+                        state
+                            .common
+                            .update_primary_output(&winit_state.output, &render_states);
+                        state.common.send_dmabuf_feedback(
+                            &winit_state.output,
+                            &render_states,
+                            |_| None,
+                        );
+                        if damage {
+                            let mut output_presentation_feedback = state
+                                .common
+                                .shell
+                                .read()
+                                .take_presentation_feedback(&winit_state.output, &render_states);
+                            output_presentation_feedback.presented(
+                                state.common.clock.now(),
+                                winit_state
+                                    .output
+                                    .current_mode()
+                                    .map(|mode| {
+                                        Refresh::Fixed(Duration::from_secs_f64(
+                                            1_000.0 / mode.refresh as f64,
+                                        ))
+                                    })
+                                    .unwrap_or(Refresh::Unknown),
+                                0,
+                                wp_presentation_feedback::Kind::Vsync,
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        error!(?err, "Failed to render frame.");
+                        render_ping.ping();
+                    }
                 }
                 profiling::finish_frame!();
             })
