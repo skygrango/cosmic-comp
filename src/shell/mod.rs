@@ -1681,6 +1681,7 @@ impl Shell {
         if let Some(session_lock) = self.session_lock.as_ref() {
             if let Some(lock_surface) = session_lock.surfaces.get(output) {
                 f(OutputSurface::Surface(lock_surface.wl_surface()));
+                return;
             }
         }
 
@@ -1720,17 +1721,27 @@ impl Shell {
                 }
             });
 
-        for workspace in self.workspaces.spaces_for_output(output) {
+        if let Some((_, workspace)) = self.workspaces.active(output) {
             if let Some(window) = workspace.get_fullscreen() {
+                let seat = self.seats.last_active();
+                let has_focus = seat
+                    .get_keyboard()
+                    .and_then(|k| k.current_focus())
+                    .map(|focus| {
+                        focus
+                            .wl_surface()
+                            .is_some_and(|s| window.wl_surface().as_ref() == Some(&s))
+                    })
+                    .unwrap_or(false);
+
                 f(OutputSurface::Window(&window));
+                if has_focus {
+                    return;
+                }
             }
+
             workspace.mapped().for_each(|mapped| {
                 for (window, _) in mapped.windows() {
-                    f(OutputSurface::Window(&window));
-                }
-            });
-            workspace.minimized_windows.iter().for_each(|m| {
-                for window in m.windows() {
                     f(OutputSurface::Window(&window));
                 }
             });

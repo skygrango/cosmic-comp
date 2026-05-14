@@ -710,7 +710,7 @@ impl SurfaceThreadState {
         self.timings.set_refresh_interval(Some(interval));
 
         const SAFETY_MARGIN: u32 = 2; // Magic two frames margin taken from kwin to not trigger low-framerate-compensation
-        let min_min_refresh_interval = Duration::from_secs_f64(1. / 30.); // 30Hz
+        let min_min_refresh_interval = Duration::from_secs_f64(1. / 48.); // 30Hz
         self.timings.set_min_refresh_interval(Some(
             min_hz
                 .map(|min| Duration::from_secs_f64(1. / (min + SAFETY_MARGIN) as f64))
@@ -1050,7 +1050,7 @@ impl SurfaceThreadState {
                         focus_stack_is_valid_fullscreen && !overview_is_open
                     };
 
-                    const _30_FPS: Duration = Duration::from_nanos(1_000_000_000 / 30);
+                    const _30_FPS: Duration = Duration::from_nanos(1_000_000_000 / 48);
                     let drives_refresh_rate =
                         fullscreen_surface.wl_surface().is_some_and(|surface| {
                             recursive_frame_time_estimation(&self.clock, &surface)
