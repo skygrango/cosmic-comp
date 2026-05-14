@@ -53,6 +53,12 @@ impl WinitState {
             .backend
             .bind()
             .with_context(|| "Failed to bind buffer")?;
+
+        state
+            .shell
+            .read()
+            .signal_commit_timing(&self.output, state.clock.now());
+
         match render::render_output(
             None,
             renderer,
@@ -74,6 +80,7 @@ impl WinitState {
                 state.send_frames(&self.output, None);
                 state.update_primary_output(&self.output, &states);
                 state.send_dmabuf_feedback(&self.output, &states, |_| None);
+                state.shell.read().signal_fifos(&self.output);
                 if damage.is_some() {
                     let mut output_presentation_feedback = state
                         .shell

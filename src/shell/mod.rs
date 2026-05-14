@@ -1651,7 +1651,146 @@ impl Common {
     }
 }
 
+pub enum OutputSurface<'a> {
+    Window(&'a CosmicSurface),
+    Layer(&'a LayerSurface),
+    Surface(&'a WlSurface),
+}
+
+impl<'a> OutputSurface<'a> {
+    pub fn with_surfaces<F>(&self, processor: F)
+    where
+        F: FnMut(&WlSurface, &smithay::wayland::compositor::SurfaceData),
+    {
+        match self {
+            OutputSurface::Window(w) => w.with_surfaces(processor),
+            OutputSurface::Layer(l) => l.with_surfaces(processor),
+            OutputSurface::Surface(s) => {
+                smithay::desktop::utils::with_surfaces_surface_tree(s, processor)
+            }
+        }
+    }
+}
+
 impl Shell {
+    pub fn for_each_surface_on_output(
+        &self,
+        output: &Output,
+        mut f: impl FnMut(OutputSurface<'_>),
+    ) {
+        if let Some(session_lock) = self.session_lock.as_ref() {
+            if let Some(lock_surface) = session_lock.surfaces.get(output) {
+                f(OutputSurface::Surface(lock_surface.wl_surface()));
+            }
+        }
+
+        for seat in self
+            .seats
+            .iter()
+            .filter(|seat| &seat.active_output() == output)
+        {
+            let cursor_status = seat.cursor_image_status();
+
+            if let CursorImageStatus::Surface(wl_surface) = cursor_status {
+                f(OutputSurface::Surface(&wl_surface));
+            }
+
+            if let Some(move_grab) = seat.user_data().get::<SeatMoveGrabState>() {
+                if let Some(grab_state) = move_grab.lock().unwrap().as_ref() {
+                    for (window, _) in grab_state.element().windows() {
+                        f(OutputSurface::Window(&window));
+                    }
+                }
+            }
+
+            if let Some(icon) = get_dnd_icon(seat) {
+                f(OutputSurface::Surface(&icon.surface));
+            }
+        }
+
+        self.workspaces
+            .sets
+            .get(output)
+            .unwrap()
+            .sticky_layer
+            .mapped()
+            .for_each(|mapped| {
+                for (window, _) in mapped.windows() {
+                    f(OutputSurface::Window(&window));
+                }
+            });
+
+        for workspace in self.workspaces.spaces_for_output(output) {
+            if let Some(window) = workspace.get_fullscreen() {
+                f(OutputSurface::Window(&window));
+            }
+            workspace.mapped().for_each(|mapped| {
+                for (window, _) in mapped.windows() {
+                    f(OutputSurface::Window(&window));
+                }
+            });
+            workspace.minimized_windows.iter().for_each(|m| {
+                for window in m.windows() {
+                    f(OutputSurface::Window(&window));
+                }
+            });
+        }
+
+        let map = smithay::desktop::layer_map_for_output(output);
+        for layer_surface in map.layers() {
+            f(OutputSurface::Layer(layer_surface));
+        }
+
+        self.override_redirect_windows.iter().for_each(|or| {
+            let or_geo = or.geometry().as_global();
+            let max_intersect_output = self
+                .outputs()
+                .filter_map(|o| Some((o, o.geometry().intersection(or_geo)?)))
+                .max_by_key(|(_, intersection)| intersection.size.w * intersection.size.h)
+                .map(|(o, _)| o);
+            if max_intersect_output == Some(output) {
+                if let Some(wl_surface) = or.wl_surface() {
+                    f(OutputSurface::Surface(&wl_surface));
+                }
+            }
+        });
+    }
+
+    pub fn signal_commit_timing(
+        &self,
+        output: &Output,
+        until: smithay::utils::Time<smithay::utils::Monotonic>,
+    ) {
+        self.for_each_surface_on_output(output, |surface| {
+            surface.with_surfaces(|_, states| {
+                if let Some(mut commit_timer) = states
+                    .data_map
+                    .get::<smithay::wayland::commit_timing::CommitTimerBarrierStateUserData>()
+                    .map(|c| c.lock().unwrap())
+                {
+                    commit_timer.signal_until(until);
+                }
+            });
+        });
+    }
+
+    pub fn signal_fifos(&self, output: &Output) {
+        self.for_each_surface_on_output(output, |surface| {
+            surface.with_surfaces(|_, states| {
+                let fifo_barrier = states
+                    .cached_state
+                    .get::<smithay::wayland::fifo::FifoBarrierCachedState>()
+                    .current()
+                    .barrier
+                    .take();
+
+                if let Some(fifo_barrier) = fifo_barrier {
+                    fifo_barrier.signal();
+                }
+            });
+        });
+    }
+
     pub fn new(config: &Config) -> Self {
         let theme = cosmic::theme::system_preference();
 

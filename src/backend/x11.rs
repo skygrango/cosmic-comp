@@ -221,6 +221,12 @@ impl Surface {
         let mut fb = renderer
             .bind(&mut buffer)
             .with_context(|| "Failed to bind dmabuf")?;
+
+        state
+            .shell
+            .read()
+            .signal_commit_timing(&self.output, state.clock.now());
+
         match render::render_output(
             None,
             renderer,
@@ -241,6 +247,7 @@ impl Surface {
                 state.send_frames(&self.output, None);
                 state.update_primary_output(&self.output, &states);
                 state.send_dmabuf_feedback(&self.output, &states, |_| None);
+                state.shell.read().signal_fifos(&self.output);
                 if damage.is_some() {
                     let mut output_presentation_feedback = state
                         .shell
