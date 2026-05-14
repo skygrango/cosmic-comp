@@ -1760,7 +1760,8 @@ impl Shell {
         &self,
         output: &Output,
         until: smithay::utils::Time<smithay::utils::Monotonic>,
-    ) {
+    ) -> Option<smithay::wayland::commit_timing::Timestamp> {
+        let mut next_deadline = None;
         self.for_each_surface_on_output(output, |surface| {
             surface.with_surfaces(|_, states| {
                 if let Some(mut commit_timer) = states
@@ -1769,9 +1770,13 @@ impl Shell {
                     .map(|c| c.lock().unwrap())
                 {
                     commit_timer.signal_until(until);
+                    if let Some(deadline) = commit_timer.next_deadline() {
+                        next_deadline = Some(next_deadline.map_or(deadline, |min| std::cmp::min(min, deadline)));
+                    }
                 }
             });
         });
+        next_deadline
     }
 
     pub fn signal_fifos(&self, output: &Output) {
