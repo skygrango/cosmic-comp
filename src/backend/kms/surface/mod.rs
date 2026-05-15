@@ -77,7 +77,7 @@ use smithay::{
         },
         wayland_server::protocol::wl_surface::WlSurface,
     },
-    utils::{Clock, Monotonic, Physical, Point, Rectangle, Transform},
+    utils::{Clock, Monotonic, Physical, Point, Rectangle, Time, Transform},
     wayland::{
         dmabuf::{DmabufFeedbackBuilder, get_dmabuf},
         image_copy_capture::{
@@ -949,10 +949,10 @@ impl SurfaceThreadState {
             .read()
             .signal_commit_timing(&self.output, self.clock.now() + estimated_presentation);
 
-        if let Some(deadline) = next_deadline {
-            let now = self.clock.now();
-            let duration = smithay::utils::Time::elapsed(&now, deadline.into());
-            render_start = duration;
+        if let Some(deadline) = next_deadline
+            && !render_start.is_zero()
+        {
+            render_start = Time::elapsed(&self.clock.now(), deadline.into());
         }
 
         let timer = if render_start.is_zero() {
