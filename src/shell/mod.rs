@@ -48,7 +48,7 @@ use smithay::{
         wayland_protocols::ext::session_lock::v1::server::ext_session_lock_v1::ExtSessionLockV1,
         wayland_server::{Client, protocol::wl_surface::WlSurface},
     },
-    utils::{IsAlive, Logical, Point, Rectangle, Serial, Size},
+    utils::{IsAlive, Logical, Monotonic, Point, Rectangle, Serial, Size, Time},
     wayland::{
         compositor::{SurfaceAttributes, get_parent, with_states},
         seat::WaylandFocus,
@@ -1770,7 +1770,7 @@ impl Shell {
     pub fn signal_commit_timing(
         &self,
         output: &Output,
-        until: smithay::utils::Time<smithay::utils::Monotonic>,
+        until: Time<Monotonic>,
     ) -> Option<smithay::wayland::commit_timing::Timestamp> {
         let mut next_deadline = None;
         self.for_each_surface_on_output(output, |surface| {
@@ -1782,7 +1782,9 @@ impl Shell {
                 {
                     commit_timer.signal_until(until);
                     if let Some(deadline) = commit_timer.next_deadline() {
-                        next_deadline = Some(next_deadline.map_or(deadline, |min| std::cmp::min(min, deadline)));
+                        next_deadline = Some(
+                            next_deadline.map_or(deadline, |min| std::cmp::min(min, deadline)),
+                        );
                     }
                 }
             });

@@ -142,7 +142,6 @@ pub struct SurfaceThreadState {
     compositor: Option<GbmDrmOutput>,
 
     state: QueueState,
-    commit_timer: Option<RegistrationToken>,
     timings: Timings,
     frame_callback_seq: usize,
     thread_sender: Sender<SurfaceCommand>,
@@ -542,7 +541,6 @@ fn surface_thread(
         vrr_mode: AdaptiveSync::Disabled,
 
         state: QueueState::Idle,
-        commit_timer: None,
         timings: Timings::new(None, None, false, target_node),
         frame_callback_seq: 0,
         thread_sender,
@@ -944,7 +942,18 @@ impl SurfaceThreadState {
         }
 
         let estimated_presentation = self.timings.next_presentation_time(&self.clock);
-        let render_start = self.timings.next_render_time(&self.clock);
+        let mut render_start = self.timings.next_render_time(&self.clock);
+
+        let next_deadline = self
+            .shell
+            .read()
+            .signal_commit_timing(&self.output, self.clock.now() + estimated_presentation);
+
+        if let Some(deadline) = next_deadline {
+            let now = self.clock.now();
+            let duration = smithay::utils::Time::elapsed(&now, deadline.into());
+            render_start = render_start.min(duration);
+        }
 
         let timer = if render_start.is_zero() {
             trace!("Running late for frame.");
@@ -1056,6 +1065,7 @@ impl SurfaceThreadState {
                             recursive_frame_time_estimation(&self.clock, &surface)
                                 .is_some_and(|dur| dur <= _30_FPS)
                         });
+
                     (
                         has_focused_fullscreen,
                         drives_refresh_rate,
@@ -1080,29 +1090,9 @@ impl SurfaceThreadState {
             vrr = has_active_fullscreen;
         }
 
-        let next_deadline = {
-            let shell = self.shell.read();
-            shell.signal_commit_timing(&self.output, self.clock.now() + estimated_presentation)
-        };
-
-        if let Some(token) = self.commit_timer.take() {
-            self.loop_handle.remove(token);
-        }
-
-        if let Some(deadline) = next_deadline {
-            let now = self.clock.now();
-            let deadline_time: smithay::utils::Time<smithay::utils::Monotonic> = deadline.into();
-            let duration = smithay::utils::Time::elapsed(&now, deadline_time);
-            if !duration.is_zero() {
-                let timer = Timer::from_duration(duration);
-                let token = self.loop_handle.insert_source(timer, move |_, _, state| {
-                    state.commit_timer = None;
-                    state.queue_redraw(false);
-                    TimeoutAction::Drop
-                }).unwrap();
-                self.commit_timer = Some(token);
-            }
-        }
+        self.shell
+            .read()
+            .signal_commit_timing(&self.output, self.clock.now());
 
         let mut elements = output_elements(
             Some(&render_node),
