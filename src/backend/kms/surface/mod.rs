@@ -952,7 +952,7 @@ impl SurfaceThreadState {
         if let Some(deadline) = next_deadline {
             let now = self.clock.now();
             let duration = smithay::utils::Time::elapsed(&now, deadline.into());
-            render_start = render_start.min(duration);
+            render_start = duration;
         }
 
         let timer = if render_start.is_zero() {
