@@ -42,7 +42,7 @@ impl Frame {
         self.render_duration_elements + self.render_duration_draw
     }
 
-    fn submit_time(&self) -> Duration {
+    pub fn submit_time(&self) -> Duration {
         Time::elapsed(&self.render_start, self.presentation_submitted)
     }
 
