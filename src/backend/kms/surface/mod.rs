@@ -1056,14 +1056,18 @@ impl SurfaceThreadState {
                 );
                 self.state = QueueState::Queued;
             }
-            QueueState::WaitingForEstimatedVBlank => {
-                self.state = QueueState::WaitingForEstimatedVBlankAndQueued;
-            }
-            QueueState::Queued if force => {
+            QueueState::Queued | QueueState::WaitingForEstimatedVBlank if force => {
+                 self.vblank_manager.arm(
+                    Some(VBlankScheduleTime {
+                        target_vblank: estimated_presentation,
+                        scheduled_wakeup_point: render_start,
+                    }),
+                    force,
+                );
                 self.state = QueueState::Queued;
             }
             QueueState::WaitingForEstimatedVBlankAndQueued if force => {
-                self.state = QueueState::WaitingForEstimatedVBlankAndQueued;
+                self.state = QueueState::Queued;
             }
             _ => unreachable!(),
         }
@@ -2046,18 +2050,6 @@ fn postprocess_elements<'a>(
             output
                 .geometry()
                 .size
-                .as_logical()
-                .to_physical_precise_round(output.current_scale().fractional_scale()),
-        ),
-        Rectangle::new(Point::from((0, 0)), postprocess_state.output_config.size),
-        ConstrainScaleBehavior::Fit,
-        ConstrainAlign::CENTER,
-        postprocess_state.output_config.fractional_scale,
-    )
-    .map(CosmicElement::<GlMultiRenderer>::Postprocess)
-    .collect::<Vec<_>>()
-}
-         .size
                 .as_logical()
                 .to_physical_precise_round(output.current_scale().fractional_scale()),
         ),
