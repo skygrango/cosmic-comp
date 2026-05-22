@@ -38,15 +38,15 @@ pub struct Frame {
 }
 
 impl Frame {
-    fn render_time(&self) -> Duration {
+    pub fn render_time(&self) -> Duration {
         self.render_duration_elements + self.render_duration_draw
     }
 
-    fn submit_time(&self) -> Duration {
+    pub fn submit_time(&self) -> Duration {
         Time::elapsed(&self.render_start, self.presentation_submitted)
     }
 
-    fn frame_time(&self) -> Duration {
+    pub fn frame_time(&self) -> Duration {
         Time::elapsed(&self.render_start, self.presentation_presented)
     }
 }
@@ -123,9 +123,9 @@ impl Timings {
         self.vrr
     }
 
-    pub fn start_render(&mut self, clock: &Clock<Monotonic>) {
+    pub fn start_render(&mut self, clock: &Clock<Monotonic>, render_start: Option<Time<Monotonic>>) {
         self.pending_frame = Some(PendingFrame {
-            render_start: clock.now(),
+            render_start: render_start.unwrap_or_else(|| clock.now()),
             render_duration_elements: None,
             render_duration_draw: None,
             presentation_submitted: None,

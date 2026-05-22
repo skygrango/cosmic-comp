@@ -876,7 +876,10 @@ impl KmsGuard<'_> {
 
             // reconfigure existing
             for (crtc, surface) in device.inner.surfaces.iter_mut() {
-                let output_config = CompOutputConfig(surface.output.config());
+                let (output_config, target_rate) = {
+                    let config = CompOutputConfig(surface.output.config());
+                    (config.0.clone(), config.0.vrr_refresh_rate)
+                };
 
                 let drm = &mut device.drm;
                 let conn = surface.connector;
@@ -887,12 +890,14 @@ impl KmsGuard<'_> {
                     // match the size
                     .filter(|mode| {
                         let (x, y) = mode.size();
-                        Size::from((x as i32, y as i32)) == output_config.mode_size()
+                        let target_size: Size<i32, smithay::utils::Physical> =
+                            output_config.mode.0.into();
+                        Size::from((x as i32, y as i32)) == target_size
                     })
                     // and then select the closest refresh rate (e.g. to match 59.98 as 60)
                     .min_by_key(|mode| {
                         let refresh_rate = drm_helpers::calculate_refresh_rate(**mode);
-                        (output_config.0.mode.1.unwrap() as i32 - refresh_rate as i32).abs()
+                        (output_config.mode.1.unwrap() as i32 - refresh_rate as i32).abs()
                     })
                     .ok_or(anyhow::anyhow!("Unable to find matching mode"))?;
 
@@ -966,7 +971,7 @@ impl KmsGuard<'_> {
                             compositor
                         };
 
-                        if let Some(bpc) = output_config.0.max_bpc
+                        if let Some(bpc) = output_config.max_bpc
                             && let Err(err) = drm_helpers::set_max_bpc(drm.device(), conn, bpc)
                         {
                             warn!(
@@ -977,7 +982,7 @@ impl KmsGuard<'_> {
                             );
                         }
 
-                        let vrr = output_config.0.vrr;
+                        let vrr = output_config.vrr;
                         std::mem::drop(output_config);
 
                         let compositor_ref = drm.compositors().get(crtc).unwrap().lock().unwrap();
@@ -1011,16 +1016,15 @@ impl KmsGuard<'_> {
                             Some(VrrSupport::NotSupported) => false,
                             _ => true,
                         } {
-                            surface.use_adaptive_sync(vrr);
+                            surface.use_adaptive_sync(vrr, target_rate);
                             surface.output.set_adaptive_sync(vrr);
                         } else {
-                            surface.use_adaptive_sync(AdaptiveSync::Disabled);
+                            surface.use_adaptive_sync(AdaptiveSync::Disabled, None);
                             surface.output.config_mut().vrr = AdaptiveSync::Disabled;
                             surface.output.set_adaptive_sync(AdaptiveSync::Disabled);
                         }
-                    } else {
-                        let vrr = output_config.0.vrr;
-                        std::mem::drop(output_config);
+                        } else {
+                        let vrr = output_config.vrr;
                         if vrr != surface.output.adaptive_sync() {
                             if match surface.output.adaptive_sync_support() {
                                 Some(VrrSupport::RequiresModeset)
@@ -1034,10 +1038,9 @@ impl KmsGuard<'_> {
                                 anyhow::bail!("Requested VRR mode unsupported");
                             }
 
-                            surface.use_adaptive_sync(vrr);
+                            surface.use_adaptive_sync(vrr, target_rate);
                             surface.output.set_adaptive_sync(vrr);
                         }
-
                         let mut renderer = self
                             .api
                             .single_renderer(&device.inner.render_node)
