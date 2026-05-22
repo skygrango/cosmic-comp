@@ -1,8 +1,11 @@
+use smithay::utils::{Clock, Monotonic};
 use std::{
-    sync::{Arc, Mutex, Condvar, atomic::{AtomicBool, AtomicU64, Ordering}},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     thread,
 };
-use smithay::utils::{Clock, Monotonic};
 
 // Default constants based on gamescope
 const STARTING_VBLANK_DRAW_TIME: u64 = 3_000_000; // 3ms
@@ -30,7 +33,7 @@ struct SharedState {
     mutex: Mutex<SharedInner>,
 
     // Tunables and state
-    last_vblank: AtomicU64, // nanos
+    last_vblank: AtomicU64,    // nanos
     last_draw_time: AtomicU64, // nanos
     currently_compositing: AtomicBool,
 }
@@ -118,7 +121,9 @@ impl VBlankManager {
     }
 
     pub fn update_compositing(&self, compositing: bool) {
-        self.shared.currently_compositing.store(compositing, Ordering::Relaxed);
+        self.shared
+            .currently_compositing
+            .store(compositing, Ordering::Relaxed);
     }
 
     pub fn arm(&self, schedule: Option<VBlankScheduleTime>, preemptive: bool) {
@@ -160,7 +165,8 @@ impl VBlankManager {
             }
 
             let refresh_interval = inner.refresh_cycle_ns;
-            let new_rolling_draw_time = new_rolling_draw_time.min(refresh_interval.saturating_sub(red_zone));
+            let new_rolling_draw_time =
+                new_rolling_draw_time.min(refresh_interval.saturating_sub(red_zone));
 
             if !inner.preemptive {
                 inner.rolling_max_draw_time = new_rolling_draw_time;
@@ -198,7 +204,10 @@ impl VBlankManager {
         }
     }
 
-    fn nudge_thread(shared: Arc<SharedState>, sender: calloop::channel::Sender<VBlankScheduleTime>) {
+    fn nudge_thread(
+        shared: Arc<SharedState>,
+        sender: calloop::channel::Sender<VBlankScheduleTime>,
+    ) {
         unsafe {
             let min_priority = libc::sched_get_priority_min(libc::SCHED_RR);
             let sp = libc::sched_param {

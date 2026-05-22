@@ -878,7 +878,11 @@ impl KmsGuard<'_> {
             for (crtc, surface) in device.inner.surfaces.iter_mut() {
                 let (output_config, vrr, target_rate) = {
                     let output_config = CompOutputConfig(surface.output.config());
-                    (output_config.0.clone(), output_config.0.vrr, output_config.0.vrr_refresh_rate)
+                    (
+                        output_config.0.clone(),
+                        output_config.0.vrr,
+                        output_config.0.vrr_refresh_rate,
+                    )
                 };
 
                 let drm = &mut device.drm;
@@ -890,7 +894,8 @@ impl KmsGuard<'_> {
                     // match the size
                     .filter(|mode| {
                         let (x, y) = mode.size();
-                        let target_size: Size<i32, smithay::utils::Physical> = output_config.mode.0.into();
+                        let target_size: Size<i32, smithay::utils::Physical> =
+                            output_config.mode.0.into();
                         Size::from((x as i32, y as i32)) == target_size
                     })
                     // and then select the closest refresh rate (e.g. to match 59.98 as 60)

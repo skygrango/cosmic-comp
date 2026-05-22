@@ -598,24 +598,30 @@ fn surface_thread(
         sequence_delta_plot_name,
     };
 
-    event_loop.handle().insert_source(vblank_receiver, |event, _, state: &mut SurfaceThreadState| match event {
-        calloop::channel::Event::Msg(schedule) => {
-            if !matches!(
-                state.state,
-                QueueState::Queued
-                    | QueueState::WaitingForEstimatedVBlank
-                    | QueueState::WaitingForEstimatedVBlankAndQueued
-            ) {
-                return;
-            }
-            let estimated_presentation = schedule.target_vblank;
-            if let Err(err) = state.redraw(estimated_presentation) {
-                let name = state.output.name();
-                error!("Error drawing frame for {}: {}", name, err);
-            }
-        }
-        calloop::channel::Event::Closed => {}
-    }).unwrap();
+    event_loop
+        .handle()
+        .insert_source(
+            vblank_receiver,
+            |event, _, state: &mut SurfaceThreadState| match event {
+                calloop::channel::Event::Msg(schedule) => {
+                    if !matches!(
+                        state.state,
+                        QueueState::Queued
+                            | QueueState::WaitingForEstimatedVBlank
+                            | QueueState::WaitingForEstimatedVBlankAndQueued
+                    ) {
+                        return;
+                    }
+                    let estimated_presentation = schedule.target_vblank;
+                    if let Err(err) = state.redraw(estimated_presentation) {
+                        let name = state.output.name();
+                        error!("Error drawing frame for {}: {}", name, err);
+                    }
+                }
+                calloop::channel::Event::Closed => {}
+            },
+        )
+        .unwrap();
 
     let signal = event_loop.get_signal();
     event_loop
@@ -679,13 +685,11 @@ fn surface_thread(
                     }
                     match std::mem::replace(&mut state.state, QueueState::Idle) {
                         QueueState::Idle => {}
-                        QueueState::Queued
-                        | QueueState::WaitingForEstimatedVBlank=> {
-                        }
+                        QueueState::Queued | QueueState::WaitingForEstimatedVBlank => {}
                         QueueState::WaitingForVBlank { .. } => {
                             state.timings.discard_current_frame()
                         }
-                        QueueState::WaitingForEstimatedVBlankAndQueued=> {
+                        QueueState::WaitingForEstimatedVBlankAndQueued => {
                             // state.loop_handle.remove(estimated_vblank);
                             // state.loop_handle.remove(queued_render);
                         }
@@ -725,12 +729,9 @@ impl SurfaceThreadState {
 
         match std::mem::replace(&mut self.state, QueueState::Idle) {
             QueueState::Idle => {}
-            QueueState::Queued | QueueState::WaitingForEstimatedVBlank=> {
-            }
+            QueueState::Queued | QueueState::WaitingForEstimatedVBlank => {}
             QueueState::WaitingForVBlank { .. } => self.timings.discard_current_frame(),
-            QueueState::WaitingForEstimatedVBlankAndQueued {
-            } => {
-            }
+            QueueState::WaitingForEstimatedVBlankAndQueued {} => {}
         };
 
         let _ = tx.send(());
@@ -751,10 +752,11 @@ impl SurfaceThreadState {
         self.min_vrr = min_hz;
         let interval =
             Duration::from_secs_f64(1_000. / drm_helpers::calculate_refresh_rate(mode) as f64);
-        
+
         self.timings.set_refresh_interval(Some(interval));
         self.vblank_manager.set_suspend(false);
-        self.vblank_manager.update_refresh_cycle(interval.as_nanos() as u64, false);
+        self.vblank_manager
+            .update_refresh_cycle(interval.as_nanos() as u64, false);
 
         const SAFETY_MARGIN: u32 = 2; // Magic two frames margin taken from kwin to not trigger low-framerate-compensation
         let min_vrr = self.min_vrr.unwrap_or(30);
@@ -809,10 +811,8 @@ impl SurfaceThreadState {
         ) {
             match mem::replace(&mut self.state, QueueState::Idle) {
                 QueueState::WaitingForVBlank { .. } | QueueState::Idle => unreachable!(),
-                QueueState::Queued | QueueState::WaitingForEstimatedVBlank => {
-                }
-                QueueState::WaitingForEstimatedVBlankAndQueued  => {
-                }
+                QueueState::Queued | QueueState::WaitingForEstimatedVBlank => {}
+                QueueState::WaitingForEstimatedVBlankAndQueued => {}
             }
         }
         if matches!(self.state, QueueState::Idle) {
@@ -915,10 +915,10 @@ impl SurfaceThreadState {
                 Some(tp) => {
                     let tp_dur: Duration = tp.into();
                     tp_dur.as_nanos() as u64
-                },
+                }
                 None => now_dur.as_nanos() as u64,
             };
-            self.vblank_manager.mark_vblank(presentation_ns, false);
+            self.vblank_manager.mark_vblank(presentation_ns, true);
 
             if let Some(frame) = self.timings.previous_frames.back() {
                 let draw_time = frame.submit_time().as_nanos() as u64;
@@ -1045,9 +1045,15 @@ impl SurfaceThreadState {
         //     })
         //     .expect("Failed to schedule render");
 
-
         match &self.state {
             QueueState::Idle => {
+                self.vblank_manager.arm(
+                    Some(VBlankScheduleTime {
+                        target_vblank: estimated_presentation,
+                        scheduled_wakeup_point: render_start,
+                    }),
+                    force,
+                );
                 self.state = QueueState::Queued;
             }
             QueueState::WaitingForEstimatedVBlank => {
@@ -1434,8 +1440,7 @@ impl SurfaceThreadState {
                                 QueueState::Queued => (),
                                 QueueState::WaitingForVBlank { .. } => unreachable!(),
                                 QueueState::WaitingForEstimatedVBlank
-                                | QueueState::WaitingForEstimatedVBlankAndQueued => {
-                                }
+                                | QueueState::WaitingForEstimatedVBlankAndQueued => {}
                             };
                         }
 
@@ -1522,14 +1527,13 @@ impl SurfaceThreadState {
 
         trace!("queueing estimated vblank timer to fire in {duration:?}");
 
-        let timer = Timer::from_duration(duration);
-        let token = self
-            .loop_handle
-            .insert_source(timer, move |_, _, data| {
-                data.on_estimated_vblank(force);
-                TimeoutAction::Drop
-            })
-            .unwrap();
+        self.vblank_manager.arm(
+            Some(VBlankScheduleTime {
+                target_vblank: target_presentation_time,
+                scheduled_wakeup_point: target_presentation_time - duration,
+            }),
+            force,
+        );
         self.state = QueueState::WaitingForEstimatedVBlank;
     }
 
@@ -2042,6 +2046,18 @@ fn postprocess_elements<'a>(
             output
                 .geometry()
                 .size
+                .as_logical()
+                .to_physical_precise_round(output.current_scale().fractional_scale()),
+        ),
+        Rectangle::new(Point::from((0, 0)), postprocess_state.output_config.size),
+        ConstrainScaleBehavior::Fit,
+        ConstrainAlign::CENTER,
+        postprocess_state.output_config.fractional_scale,
+    )
+    .map(CosmicElement::<GlMultiRenderer>::Postprocess)
+    .collect::<Vec<_>>()
+}
+         .size
                 .as_logical()
                 .to_physical_precise_round(output.current_scale().fractional_scale()),
         ),
