@@ -44,6 +44,7 @@ struct SharedInner {
     vblank_draw_buffer_red_zone: u64,
     vblank_draw_time_min_compositing: u64,
     vblank_rate_of_decay_percentage: u64,
+    suspend: bool,
 }
 
 impl VBlankManager {
@@ -66,6 +67,7 @@ impl VBlankManager {
                 vblank_draw_buffer_red_zone: DEFAULT_VBLANK_RED_ZONE,
                 vblank_draw_time_min_compositing: DEFAULT_VBLANK_DRAW_TIME_MIN_COMPOSITING,
                 vblank_rate_of_decay_percentage: DEFAULT_VBLANK_RATE_OF_DECAY_PERCENTAGE,
+                suspend: false,
             }),
             last_vblank: AtomicU64::new(now.as_nanos() as u64),
             last_draw_time: AtomicU64::new(STARTING_VBLANK_DRAW_TIME),
@@ -92,6 +94,11 @@ impl VBlankManager {
         let mut inner = self.shared.mutex.lock().unwrap();
         inner.refresh_cycle_ns = cycle_ns;
         inner.vrr_active = vrr_active;
+    }
+
+    pub fn set_suspend(&self, suspend: bool) {
+        let mut inner = self.shared.mutex.lock().unwrap();
+        inner.suspend = suspend;
     }
 
     pub fn set_vrr(&self, vrr_active: bool) {
