@@ -42,6 +42,8 @@ pub struct OutputConfig {
     pub mode: ((i32, i32), Option<u32>),
     #[serde(default = "default_sync")]
     pub vrr: AdaptiveSync,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vrr_refresh_rate: Option<f64>,
     pub scale: f64,
     pub transform: TransformDef,
     pub position: (u32, u32),
@@ -58,6 +60,7 @@ impl Default for OutputConfig {
         OutputConfig {
             mode: ((0, 0), None),
             vrr: AdaptiveSync::Enabled,
+            vrr_refresh_rate: None,
             scale: 1.0,
             transform: TransformDef::Normal,
             position: (0, 0),
