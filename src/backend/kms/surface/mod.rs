@@ -643,6 +643,7 @@ fn surface_thread(
                 let _ = sync.send(());
             }
             Event::Msg(ThreadCommand::VBlank(metadata)) => {
+                tracing::info!("SurfaceThread received VBlank command");
                 state.on_vblank(metadata);
             }
             Event::Msg(ThreadCommand::ScheduleRender) => {
@@ -653,10 +654,22 @@ fn surface_thread(
                 state.queue_redraw(false);
             }
             Event::Msg(ThreadCommand::CommitDone(result)) => {
+                tracing::info!("SurfaceThread received CommitDone command: {:?}", result);
+                let mut submission_failed = false;
                 if let Some(compositor) = state.compositor.as_ref() {
                     let mut compositor = compositor.lock();
                     if let Err(err) = compositor.submit_with_result(result) {
-                        error!("Failed to finalize submission: {}", err);
+                        tracing::error!("Failed to finalize submission: {}", err);
+                        submission_failed = true;
+                    }
+                }
+                if submission_failed {
+                    // If submission failed, the kernel won't emit a VBlank event for this frame.
+                    // We must transition out of WaitingForVBlank to prevent a frame freeze.
+                    if matches!(state.state, QueueState::WaitingForVBlank { .. }) {
+                        tracing::warn!("Recovering from submission failure, resetting state to Idle and scheduling render");
+                        let _ = std::mem::replace(&mut state.state, QueueState::Idle);
+                        state.queue_redraw(false);
                     }
                 }
             }
@@ -1451,7 +1464,7 @@ impl SurfaceThreadState {
                 }
 
                 let submission = compositor
-                    .prepare_submission()
+                    .prepare_submission(feedback)
                     .map_err(|err| err.unwrap_err())?
                     .expect("No frame to submit");
 
@@ -1459,7 +1472,7 @@ impl SurfaceThreadState {
                     crtc: self.crtc,
                     submission: Some(submission),
                     fence,
-                    feedback,
+                    feedback: None, // We don't need to send feedback over KmsFrame anymore, it's stored in DrmCompositor's queued_frame now
                 }));
 
                 std::mem::drop(compositor);

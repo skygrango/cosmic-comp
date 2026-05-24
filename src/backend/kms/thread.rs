@@ -114,6 +114,7 @@ fn kms_thread_main(
     handle.insert_source(notifier, move |event, metadata, state: &mut KmsThreadState| {
         match event {
             DrmEvent::VBlank(crtc) => {
+                tracing::info!("KMS Thread received VBlank for CRTC {:?}", crtc);
                 if let Some(sender) = state.vblank_senders.get(&crtc) {
                     let _ = sender.send(ThreadCommand::VBlank(metadata.take()));
                 }
@@ -132,25 +133,34 @@ fn kms_thread_main(
                 let crtc = frame.crtc;
                 let submission = frame.submission.take().unwrap();
                 
+                tracing::info!("KMS Thread received Commit for CRTC {:?}", crtc);
+                
                 if let Some(fence) = frame.fence {
-                    let mut submission_opt = Some(submission);
+                    let submission_rc = std::rc::Rc::new(std::cell::RefCell::new(Some(submission)));
+                    let submission_clone = submission_rc.clone();
+                    tracing::info!("KMS Thread waiting for fence for CRTC {:?}", crtc);
                     let res = loop_handle.insert_source(Generic::new(fence, Interest::READ, Mode::Level), move |_, _, state| {
-                        let result = submission_opt.take().unwrap().execute();
+                        tracing::info!("KMS Thread fence signaled for CRTC {:?}", crtc);
+                        let result = submission_clone.borrow_mut().take().unwrap().execute();
                         if let Some(sender) = state.vblank_senders.get(&crtc) {
+                            tracing::info!("KMS Thread sending CommitDone for CRTC {:?}", crtc);
                             let _ = sender.send(ThreadCommand::CommitDone(result));
                         }
                         Ok(PostAction::Remove)
                     });
                     if let Err(err) = res {
                         error!("Failed to insert fence source into KMS event loop: {}. Falling back to immediate commit.", err);
-                        // Access the submission from the error metadata or just recover it.
-                        // Actually, if insert_source fails, submission_opt is still here but we can't get it easily.
-                        // But wait, if it fails, the closure was NOT moved?
-                        // Let's just avoid this complex error path for now as it's very unlikely.
+                        let result = submission_rc.borrow_mut().take().unwrap().execute();
+                        if let Some(sender) = state.vblank_senders.get(&crtc) {
+                            tracing::info!("KMS Thread sending CommitDone (immediate fallback) for CRTC {:?}", crtc);
+                            let _ = sender.send(ThreadCommand::CommitDone(result));
+                        }
                     }
                 } else {
+                    tracing::info!("KMS Thread executing immediately (no fence) for CRTC {:?}", crtc);
                     let result = submission.execute();
                     if let Some(sender) = state.vblank_senders.get(&crtc) {
+                        tracing::info!("KMS Thread sending CommitDone (immediate) for CRTC {:?}", crtc);
                         let _ = sender.send(ThreadCommand::CommitDone(result));
                     }
                 }
