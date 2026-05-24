@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: GPL-3.0-only
-
 use crate::{
     backend::render::{
         CLEAR_COLOR, CursorMode, GlMultiError, GlMultiRenderer, PostprocessOutputConfig,
@@ -16,6 +15,7 @@ use crate::{
         image_copy_capture::{FrameHolder, PendingImageCopyData, SessionData, submit_buffer},
     },
 };
+use libc;
 
 use anyhow::{Context, Result};
 use calloop::channel::Channel;
@@ -72,10 +72,11 @@ use smithay::{
             linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_v1,
             presentation_time::server::wp_presentation_feedback,
         },
-        wayland_server::protocol::wl_surface::WlSurface,
+        wayland_server::{Client, protocol::wl_surface::WlSurface},
     },
-    utils::{Clock, Monotonic, Physical, Point, Rectangle, Transform},
+    utils::{Clock, Monotonic, Physical, Point, Rectangle, Time, Transform},
     wayland::{
+        compositor::CompositorHandler,
         dmabuf::{DmabufFeedbackBuilder, get_dmabuf},
         image_copy_capture::{
             CaptureFailureReason, Frame as ScreencopyFrame, SessionRef as ScreencopySessionRef,
@@ -86,6 +87,7 @@ use smithay::{
     },
 };
 use tracing::{error, info, trace, warn};
+use wayland_backend::server::ClientId;
 
 use std::{
     borrow::{Borrow, BorrowMut},
@@ -227,6 +229,7 @@ pub enum ThreadCommand {
 pub enum SurfaceCommand {
     SendFrames(usize),
     RenderStates(RenderElementStates),
+    ClientBlockerCleared(HashMap<ClientId, Client>),
 }
 
 #[derive(Debug, Default)]
@@ -283,6 +286,7 @@ impl Surface {
                     if output_clone.mirroring().is_some() {
                         return;
                     }
+
                     state.common.send_frames(&output_clone, Some(sequence));
                 }
                 Event::Msg(SurfaceCommand::RenderStates(states)) => {
@@ -328,6 +332,15 @@ impl Surface {
                                 Some(feedback)
                             }
                         });
+                    state.signal_fifos(&output_clone);
+                }
+                Event::Msg(SurfaceCommand::ClientBlockerCleared(clients)) => {
+                    let dh = state.common.display_handle.clone();
+                    for (_client_id, client) in clients {
+                        state
+                            .client_compositor_state(&client)
+                            .blocker_cleared(state, &dh);
+                    }
                 }
                 Event::Closed => {}
             })
@@ -500,6 +513,20 @@ fn surface_thread(
     thread_receiver: Channel<ThreadCommand>,
     startup_done: Arc<AtomicBool>,
 ) -> Result<()> {
+    unsafe {
+        let min_priority = libc::sched_get_priority_min(libc::SCHED_RR);
+        let sp = libc::sched_param {
+            sched_priority: min_priority,
+        };
+        if libc::pthread_setschedparam(
+            libc::pthread_self(),
+            libc::SCHED_RR | libc::SCHED_RESET_ON_FORK,
+            &sp,
+        ) != 0
+        {
+            tracing::warn!("Failed to gain real time thread priority (Check CAP_SYS_NICE)");
+        }
+    }
     let name = output.name();
     profiling::register_thread!(&format!("Surface Thread {}", name));
 
@@ -541,7 +568,6 @@ fn surface_thread(
         timings: Timings::new(None, None, false, target_node),
         frame_callback_seq: 0,
         thread_sender,
-
         output,
         mirroring: None,
         screen_filter,
@@ -550,6 +576,7 @@ fn surface_thread(
         shell,
         loop_handle: event_loop.handle(),
         clock: Clock::new(),
+
         #[cfg(feature = "debug")]
         egui,
 
@@ -913,7 +940,7 @@ impl SurfaceThreadState {
         self.send_frame_callbacks();
     }
 
-    fn queue_redraw(&mut self, force: bool) {
+    fn queue_redraw(&mut self, mut force: bool) {
         let Some(_compositor) = self.compositor.as_mut() else {
             return;
         };
@@ -939,7 +966,26 @@ impl SurfaceThreadState {
         }
 
         let estimated_presentation = self.timings.next_presentation_time(&self.clock);
-        let render_start = self.timings.next_render_time(&self.clock);
+
+        let (next_deadline, clients) = self
+            .shell
+            .read()
+            .signal_commit_timing(&self.output, self.clock.now() + estimated_presentation);
+        if clients.len() > 0 {
+            let _ = self
+                .thread_sender
+                .send(SurfaceCommand::ClientBlockerCleared(clients));
+        }
+
+        let mut render_start = self.timings.next_render_time(&self.clock);
+        if let Some(next_deadline) = next_deadline {
+            let next_deadline = Time::elapsed(&self.clock.now(), next_deadline.into());
+            // wait for client
+            if render_start.as_nanos() < next_deadline.as_nanos() {
+                render_start = next_deadline;
+                force = true;
+            }
+        }
 
         let timer = if render_start.is_zero() {
             trace!("Running late for frame.");
@@ -1032,6 +1078,7 @@ impl SurfaceThreadState {
                             recursive_frame_time_estimation(&self.clock, &surface)
                                 .is_some_and(|dur| dur <= _30_FPS)
                         }),
+
                         animations_going,
                     )
                 } else {
