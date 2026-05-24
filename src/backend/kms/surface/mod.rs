@@ -234,6 +234,7 @@ pub enum ThreadCommand {
     AllowFrameFlags(bool, FrameFlags),
     End,
     DpmsOff,
+    CommitDone(Result<(), smithay::backend::drm::DrmError>),
 }
 
 #[derive(Debug)]
@@ -650,6 +651,14 @@ fn surface_thread(
                 }
 
                 state.queue_redraw(false);
+            }
+            Event::Msg(ThreadCommand::CommitDone(result)) => {
+                if let Some(compositor) = state.compositor.as_ref() {
+                    let mut compositor = compositor.lock();
+                    if let Err(err) = compositor.submit_with_result(result) {
+                        error!("Failed to finalize submission: {}", err);
+                    }
+                }
             }
             Event::Msg(ThreadCommand::UpdateMirroring(mirroring_output)) => {
                 state.update_mirroring(mirroring_output);
@@ -1441,11 +1450,19 @@ impl SurfaceThreadState {
                     elem.sync.wait()?;
                 }
 
+                let submission = compositor
+                    .prepare_submission()
+                    .map_err(|err| err.unwrap_err())?
+                    .expect("No frame to submit");
+
                 let _ = self.kms_thread_sender.send(KmsMessage::Commit(KmsFrame {
                     crtc: self.crtc,
+                    submission: Some(submission),
                     fence,
                     feedback,
                 }));
+
+                std::mem::drop(compositor);
 
                 self.timings.submitted_for_presentation(&self.clock);
 

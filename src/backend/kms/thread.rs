@@ -6,7 +6,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use anyhow::Result;
-use smithay::backend::drm::{DrmDeviceFd, DrmDeviceNotifier, DrmEvent};
+use smithay::backend::drm::{DrmDeviceFd, DrmDeviceNotifier, DrmEvent, compositor::DrmSubmission};
 use smithay::reexports::calloop::{EventLoop, channel::{Sender, Channel, Event}, Interest, Mode, PostAction, generic::Generic};
 use smithay::reexports::drm::control::crtc;
 use tracing::{error, warn};
@@ -16,6 +16,7 @@ use super::surface::{Feedback, GbmDrmOutput, ThreadCommand};
 /// Frame data for a KMS commit
 pub struct KmsFrame {
     pub crtc: crtc::Handle,
+    pub submission: Option<DrmSubmission>,
     pub fence: Option<OwnedFd>,
     pub feedback: Option<Feedback>,
 }
@@ -125,17 +126,15 @@ fn kms_thread_main(
     let loop_handle = handle.clone();
     handle.insert_source(receiver, move |event, _, state: &mut KmsThreadState| {
         match event {
-            Event::Msg(KmsMessage::Commit(frame)) => {
+            Event::Msg(KmsMessage::Commit(mut frame)) => {
                 let crtc = frame.crtc;
-                let mut feedback = frame.feedback;
+                let mut submission = frame.submission.take();
                 
                 if let Some(fence) = frame.fence {
                     let res = loop_handle.insert_source(Generic::new(fence, Interest::READ, Mode::Level), move |_, _, state| {
-                        if let Some(compositor) = state.compositors.get(&crtc) {
-                            let mut compositor = compositor.lock();
-                            if let Err(err) = compositor.queue_frame(feedback.take()) {
-                                error!("Failed to queue frame in KMS thread after fence: {}", err);
-                            }
+                        let result = submission.take().unwrap().execute();
+                        if let Some(sender) = state.vblank_senders.get(&crtc) {
+                            let _ = sender.send(ThreadCommand::CommitDone(result));
                         }
                         Ok(PostAction::Remove)
                     });
@@ -143,11 +142,9 @@ fn kms_thread_main(
                         error!("Failed to insert fence source into KMS event loop: {}", err);
                     }
                 } else {
-                    if let Some(compositor) = state.compositors.get(&crtc) {
-                        let mut compositor = compositor.lock();
-                        if let Err(err) = compositor.queue_frame(feedback) {
-                            error!("Failed to queue frame in KMS thread: {}", err);
-                        }
+                    let result = submission.take().unwrap().execute();
+                    if let Some(sender) = state.vblank_senders.get(&crtc) {
+                        let _ = sender.send(ThreadCommand::CommitDone(result));
                     }
                 }
             }
