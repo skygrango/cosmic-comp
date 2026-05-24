@@ -221,6 +221,7 @@ impl Surface {
         let mut fb = renderer
             .bind(&mut buffer)
             .with_context(|| "Failed to bind dmabuf")?;
+
         match render::render_output(
             None,
             renderer,
