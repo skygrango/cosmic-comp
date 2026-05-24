@@ -18,8 +18,9 @@ use crate::{
         image_copy_capture::{FrameHolder, PendingImageCopyData, SessionData, submit_buffer},
     },
 };
+use parking_lot::Mutex;
+use crate::backend::kms::thread::KmsFrame;
 use libc;
-
 use anyhow::{Context, Result};
 use calloop::channel::Channel;
 use cosmic_comp_config::output::comp::AdaptiveSync;
@@ -33,7 +34,7 @@ use smithay::{
         drm::{
             DrmDeviceFd, DrmEventMetadata, DrmEventTime, DrmNode, VrrSupport,
             compositor::{
-                BlitFrameResultError, FrameError, FrameFlags, PrimaryPlaneElement,
+                BlitFrameResultError, FrameFlags, PrimaryPlaneElement,
                 RenderFrameResult,
             },
             exporter::gbm::GbmFramebufferExporter,
@@ -108,7 +109,7 @@ use std::{
 mod timings;
 pub use self::timings::Timings;
 
-use super::{drm_helpers, render::gles::GbmGlowBackend};
+use super::{drm_helpers, render::gles::GbmGlowBackend, thread::KmsMessage};
 
 #[cfg(feature = "debug")]
 use smithay_egui::EguiState;
@@ -141,7 +142,7 @@ pub struct SurfaceThreadState {
     active: Arc<AtomicBool>,
     vrr_mode: AdaptiveSync,
     frame_flags: FrameFlags,
-    compositor: Option<GbmDrmOutput>,
+    compositor: Option<Arc<Mutex<GbmDrmOutput>>>,
 
     state: QueueState,
     timings: Timings,
@@ -173,16 +174,21 @@ pub struct SurfaceThreadState {
     /// Plot name for the presentation misprediction plot.
     presentation_misprediction_plot_name: tracy_client::PlotName,
     sequence_delta_plot_name: tracy_client::PlotName,
+
+    kms_thread_sender: Sender<KmsMessage>,
+    crtc: crtc::Handle,
 }
+
+pub type Feedback = (
+    OutputPresentationFeedback,
+    Receiver<PendingImageCopyData>,
+    Duration,
+);
 
 pub type GbmDrmOutput = DrmOutput<
     GbmAllocator<DrmDeviceFd>,
     GbmFramebufferExporter<DrmDeviceFd>,
-    Option<(
-        OutputPresentationFeedback,
-        Receiver<PendingImageCopyData>,
-        Duration,
-    )>,
+    Option<Feedback>,
     DrmDeviceFd,
 >;
 
@@ -207,7 +213,7 @@ pub enum QueueState {
 pub enum ThreadCommand {
     Suspend(SyncSender<()>),
     Resume {
-        compositor: GbmDrmOutput,
+        compositor: Arc<Mutex<GbmDrmOutput>>,
     },
     NodeAdded {
         node: DrmNode,
@@ -257,6 +263,7 @@ impl Surface {
         screen_filter: ScreenFilter,
         shell: Arc<parking_lot::RwLock<Shell>>,
         startup_done: Arc<AtomicBool>,
+        kms_thread_sender: Sender<KmsMessage>,
     ) -> Result<Self> {
         let (tx, rx) = channel::<ThreadCommand>();
         let (tx2, rx2) = channel::<SurfaceCommand>();
@@ -264,12 +271,14 @@ impl Surface {
 
         let active_clone = active.clone();
         let output_clone = output.clone();
+        let kms_vblank_tx = tx.clone();
 
         let thread = std::thread::Builder::new()
             .name(format!("surface-{}", output.name()))
             .spawn(move || {
                 if let Err(err) = surface_thread(
                     output_clone,
+                    crtc,
                     primary_node,
                     target_node,
                     shell,
@@ -278,6 +287,8 @@ impl Surface {
                     tx2,
                     rx,
                     startup_done,
+                    kms_thread_sender,
+                    kms_vblank_tx,
                 ) {
                     error!("Surface thread crashed: {}", err);
                 }
@@ -450,7 +461,7 @@ impl Surface {
 
     pub fn resume(
         &mut self,
-        compositor: GbmDrmOutput,
+        compositor: Arc<Mutex<GbmDrmOutput>>,
         primary_plane_formats: FormatSet,
         overlay_plane_formats: Option<FormatSet>,
     ) {
@@ -509,6 +520,7 @@ impl Drop for Surface {
 
 fn surface_thread(
     output: Output,
+    crtc: crtc::Handle,
     primary_node: Arc<RwLock<Option<DrmNode>>>,
     target_node: DrmNode,
     shell: Arc<parking_lot::RwLock<Shell>>,
@@ -517,6 +529,8 @@ fn surface_thread(
     thread_sender: Sender<SurfaceCommand>,
     thread_receiver: Channel<ThreadCommand>,
     startup_done: Arc<AtomicBool>,
+    kms_thread_sender: Sender<KmsMessage>,
+    kms_vblank_tx: Sender<ThreadCommand>,
 ) -> Result<()> {
     unsafe {
         let min_priority = libc::sched_get_priority_min(libc::SCHED_RR);
@@ -591,7 +605,18 @@ fn surface_thread(
         time_since_presentation_plot_name,
         presentation_misprediction_plot_name,
         sequence_delta_plot_name,
+
+        kms_thread_sender,
+        crtc,
     };
+
+    state
+        .kms_thread_sender
+        .send(KmsMessage::RegisterVBlankSender(
+            crtc,
+            kms_vblank_tx,
+        ))
+        .map_err(|_| anyhow::anyhow!("Failed to register vblank sender"))?;
 
     let signal = event_loop.get_signal();
     event_loop
@@ -633,7 +658,8 @@ fn surface_thread(
                 state.update_screen_filter(filter_config);
             }
             Event::Msg(ThreadCommand::AdaptiveSyncAvailable(result)) => {
-                if let Some(compositor) = state.compositor.as_mut() {
+                if let Some(compositor) = state.compositor.as_ref() {
+                    let compositor = compositor.lock();
                     let _ = result.send(
                         compositor
                             .with_compositor(|c| {
@@ -649,7 +675,8 @@ fn surface_thread(
                 state.vrr_mode = vrr;
             }
             Event::Msg(ThreadCommand::DpmsOff) => {
-                if let Some(compositor) = state.compositor.as_mut() {
+                if let Some(compositor) = state.compositor.as_ref() {
+                    let compositor = compositor.lock();
                     if let Err(err) = compositor.with_compositor(|c| c.clear()) {
                         error!("Failed to set DPMS off: {:?}", err);
                     }
@@ -720,8 +747,8 @@ impl SurfaceThreadState {
         let _ = tx.send(());
     }
 
-    fn resume(&mut self, compositor: GbmDrmOutput) {
-        let (mode, min_hz) = compositor.with_compositor(|c| {
+    fn resume(&mut self, compositor: Arc<Mutex<GbmDrmOutput>>) {
+        let (mode, min_hz) = compositor.lock().with_compositor(|c| {
             (
                 c.surface().pending_mode(),
                 drm_helpers::get_minimum_refresh_rate(
@@ -732,6 +759,13 @@ impl SurfaceThreadState {
                 .flatten(),
             )
         });
+
+        self.kms_thread_sender
+            .send(KmsMessage::RegisterCompositor(
+                self.crtc,
+                compositor.clone(),
+            ))
+            .expect("Failed to register compositor with KMS thread");
         self.min_vrr = min_hz;
         let interval =
             Duration::from_secs_f64(1_000. / drm_helpers::calculate_refresh_rate(mode) as f64);
@@ -779,9 +813,10 @@ impl SurfaceThreadState {
 
     #[profiling::function]
     fn on_vblank(&mut self, metadata: Option<DrmEventMetadata>) {
-        let Some(compositor) = self.compositor.as_mut() else {
+        let Some(compositor) = self.compositor.clone() else {
             return;
         };
+        let compositor = compositor.lock();
 
         // handle edge-cases right after resume
         if !matches!(
@@ -877,7 +912,7 @@ impl SurfaceThreadState {
                     if self
                         .compositor
                         .as_ref()
-                        .is_some_and(|comp| comp.with_compositor(|c| c.vrr_enabled())) =>
+                        .is_some_and(|comp| comp.lock().with_compositor(|c| c.vrr_enabled())) =>
                 {
                     Refresh::Variable(rate)
                 }
@@ -948,7 +983,7 @@ impl SurfaceThreadState {
     }
 
     fn queue_redraw(&mut self, mut force: bool) {
-        let Some(_compositor) = self.compositor.as_mut() else {
+        let Some(_compositor) = self.compositor.as_ref() else {
             return;
         };
 
@@ -1044,9 +1079,10 @@ impl SurfaceThreadState {
 
     #[profiling::function]
     fn redraw(&mut self, estimated_presentation: Duration) -> Result<()> {
-        let Some(compositor) = self.compositor.as_mut() else {
+        let Some(compositor) = self.compositor.clone() else {
             return Ok(());
         };
+        let mut compositor = compositor.lock();
 
         let render_node = render_node_for_output(
             self.mirroring.as_ref().unwrap_or(&self.output),
@@ -1391,85 +1427,77 @@ impl SurfaceThreadState {
                     None
                 };
 
-                if frame_result.needs_sync()
+                let fence = if let PrimaryPlaneElement::Swapchain(elem) = &frame_result.primary_element
+                {
+                    elem.sync.export()
+                } else {
+                    None
+                };
+
+                if fence.is_none()
+                    && frame_result.needs_sync()
                     && let PrimaryPlaneElement::Swapchain(elem) = &frame_result.primary_element
                 {
                     elem.sync.wait()?;
                 }
 
-                match compositor.queue_frame(feedback) {
-                    x @ Ok(()) | x @ Err(FrameError::EmptyFrame) => {
-                        self.timings.submitted_for_presentation(&self.clock);
+                let _ = self.kms_thread_sender.send(KmsMessage::Commit(KmsFrame {
+                    crtc: self.crtc,
+                    fence,
+                    feedback,
+                }));
 
-                        // Update `state` after `queue_frame`, before any early return from errors
-                        if x.is_ok() {
-                            let new_state = QueueState::WaitingForVBlank {
-                                redraw_needed: false,
-                            };
-                            match mem::replace(&mut self.state, new_state) {
-                                QueueState::Idle => unreachable!(),
-                                QueueState::Queued(_) => (),
-                                QueueState::WaitingForVBlank { .. } => unreachable!(),
-                                QueueState::WaitingForEstimatedVBlank(estimated_vblank)
-                                | QueueState::WaitingForEstimatedVBlankAndQueued {
-                                    estimated_vblank,
-                                    ..
-                                } => {
-                                    self.loop_handle.remove(estimated_vblank);
-                                }
-                            };
-                        }
+                self.timings.submitted_for_presentation(&self.clock);
 
-                        let now = self.clock.now();
-                        for (session, frame, res) in frames {
-                            if let Err(err) = send_screencopy_result(
-                                &mut renderer,
-                                &self.output,
-                                &mut pre_postprocess_data,
-                                &tx,
-                                &frame_result,
-                                &elements,
-                                (&session, frame, res),
-                                now.into(),
-                            ) {
-                                tracing::warn!(?err, "Failed to screencopy");
-                            }
-                        }
-
-                        if self.mirroring.is_none() {
-                            // If postprocessing, use states from first render
-                            let states = pre_postprocess_data.states.unwrap_or(frame_result.states);
-                            self.send_dmabuf_feedback(states);
-                        }
-
-                        if x.is_ok() {
-                            if self.mirroring.is_none() {
-                                self.frame_callback_seq = self.frame_callback_seq.wrapping_add(1);
-                                self.send_frame_callbacks();
-                            }
-                        } else {
-                            // we don't expect a vblank
-                            let _ = self.vblank_frame.take();
-
-                            self.queue_estimated_vblank(
-                                estimated_presentation,
-                                // Make sure we redraw to reevaluate, if we intentionally missed content
-                                additional_frame_flags
-                                    .contains(FrameFlags::SKIP_CURSOR_ONLY_UPDATES),
-                            );
-                        }
-                    }
-                    Err(err) => {
-                        for (_session, frame, _) in frames {
-                            frame.fail(CaptureFailureReason::Unknown);
-                        }
-                        return Err(err).with_context(|| "Failed to submit result for display");
+                let new_state = QueueState::WaitingForVBlank {
+                    redraw_needed: false,
+                };
+                match mem::replace(&mut self.state, new_state) {
+                    QueueState::Idle => unreachable!(),
+                    QueueState::Queued(_) => (),
+                    QueueState::WaitingForVBlank { .. } => unreachable!(),
+                    QueueState::WaitingForEstimatedVBlank(estimated_vblank)
+                    | QueueState::WaitingForEstimatedVBlankAndQueued {
+                        estimated_vblank,
+                        ..
+                    } => {
+                        self.loop_handle.remove(estimated_vblank);
                     }
                 };
+
+                let now = self.clock.now();
+                for (session, frame, res) in frames {
+                    if let Err(err) = send_screencopy_result(
+                        &mut renderer,
+                        &self.output,
+                        &mut pre_postprocess_data,
+                        &tx,
+                        &frame_result,
+                        &elements,
+                        (&session, frame, res),
+                        now.into(),
+                    ) {
+                        tracing::warn!(?err, "Failed to screencopy");
+                    }
+                }
+
+                if self.mirroring.is_none() {
+                    // If postprocessing, use states from first render
+                    let states = pre_postprocess_data.states.unwrap_or(frame_result.states);
+                    self.send_dmabuf_feedback(states);
+                }
+
+                if self.mirroring.is_none() {
+                    self.frame_callback_seq = self.frame_callback_seq.wrapping_add(1);
+                    self.send_frame_callbacks();
+                }
             }
             Err(err) => {
+                for (_session, frame, _) in frames {
+                    frame.fail(CaptureFailureReason::Unknown);
+                }
                 compositor.reset_buffers();
-                anyhow::bail!("Rendering failed: {}", err);
+                return Err(err).with_context(|| "Failed to submit result for display");
             }
         }
 

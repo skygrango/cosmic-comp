@@ -50,11 +50,14 @@ use std::{
     sync::{Arc, RwLock, atomic::AtomicBool},
 };
 
+use parking_lot::Mutex;
+
 mod device;
 mod drm_helpers;
 pub mod render;
 mod socket;
 mod surface;
+mod thread;
 use device::*;
 pub(crate) use surface::Surface;
 pub use surface::Timings;
@@ -1019,11 +1022,12 @@ impl KmsGuard<'_> {
                             .iter()
                             .flat_map(|p| p.formats.iter().cloned())
                             .collect::<FormatSet>();
-                        surface.resume(
-                            compositor,
-                            primary_formats,
-                            Some(overlay_formats).filter(|f| !f.indexset().is_empty()),
-                        );
+                            let compositor = Arc::new(Mutex::new(compositor));
+                            surface.resume(
+                                compositor,
+                                primary_formats,
+                                Some(overlay_formats).filter(|f| !f.indexset().is_empty()),
+                            );
 
                         surface.output.set_adaptive_sync_support(vrr_support);
                         if match vrr_support {

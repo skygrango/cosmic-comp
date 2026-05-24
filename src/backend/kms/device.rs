@@ -21,7 +21,7 @@ use smithay::{
             gbm::{GbmAllocator, GbmDevice},
         },
         drm::{
-            DrmDevice, DrmDeviceFd, DrmEvent, DrmNode, NodeType,
+            DrmDevice, DrmDeviceFd, DrmNode, NodeType,
             compositor::{FrameError, FrameFlags},
             exporter::gbm::GbmFramebufferExporter,
             output::{DrmOutputManager, LockedDrmOutputManager},
@@ -59,7 +59,7 @@ use std::{
     time::Duration,
 };
 
-use super::{drm_helpers, socket::Socket, surface::Surface};
+use super::{drm_helpers, socket::Socket, surface::Surface, thread::KmsThread};
 
 #[derive(Debug)]
 pub struct EGLInternals {
@@ -136,6 +136,7 @@ pub struct InnerDevice {
     pub leasing_global: Option<DrmLeaseState>,
     pub active_leases: Vec<DrmLease>,
     pub active_clients: HashSet<ClientId>,
+    pub kms_thread: KmsThread,
 }
 
 impl fmt::Debug for InnerDevice {
@@ -522,6 +523,7 @@ impl State {
                                     self.common.config.dynamic_conf.screen_filter().clone(),
                                     self.common.shell.clone(),
                                     self.common.startup_done.clone(),
+                                    new_device.inner.kms_thread.sender(),
                                 ) {
                                     Ok(data) => {
                                         new_device.inner.surfaces.insert(crtc, data);
@@ -713,7 +715,7 @@ impl Device {
         let dev_node = DrmNode::from_dev_id(dev)?;
         let supports_atomic = drm.is_atomic();
 
-        let gbm = GbmDevice::new(fd)
+        let gbm = GbmDevice::new(fd.clone())
             .with_context(|| format!("Failed to initialize GBM device for {}", path.display()))?;
         let (render_node, render_formats, texture_formats, is_software) = {
             let egl = init_egl(&gbm)?;
@@ -735,24 +737,8 @@ impl Device {
             )
         };
 
-        let token = common
-            .event_loop_handle
-            .insert_source(
-                notifier,
-                move |event, metadata, state: &mut State| match event {
-                    DrmEvent::VBlank(crtc) => {
-                        if let Some(device) = state.backend.kms().drm_devices.get_mut(&dev_node)
-                            && let Some(surface) = device.inner.surfaces.get_mut(&crtc)
-                        {
-                            surface.on_vblank(metadata.take());
-                        }
-                    }
-                    DrmEvent::Error(err) => {
-                        warn!(?err, "Failed to read events of device {:?}.", dev);
-                    }
-                },
-            )
-            .with_context(|| format!("Failed to add drm device to event loop: {}", dev))?;
+        let kms_thread = KmsThread::spawn(fd.clone(), notifier)
+            .with_context(|| format!("Failed to spawn KMS thread for: {}", path.display()))?;
 
         let ReusableDevice {
             leasing_global,
@@ -829,11 +815,12 @@ impl Device {
                 leasing_global,
                 active_leases: Vec::new(),
                 active_clients,
+                kms_thread,
             },
 
             supports_atomic,
             texture_formats,
-            event_token: Some(token),
+            event_token: None,
             socket,
         })
     }
@@ -1101,6 +1088,7 @@ impl InnerDevice {
                     screen_filter,
                     shell,
                     startup_done,
+                    self.kms_thread.sender(),
                 ) {
                     Ok(data) => {
                         self.surfaces.insert(crtc, data);
