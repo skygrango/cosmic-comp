@@ -60,9 +60,11 @@ mod drm_helpers;
 pub mod render;
 mod socket;
 mod surface;
+mod thread;
 use device::*;
 pub(crate) use surface::Surface;
 pub use surface::Timings;
+pub use thread::{KmsMessage, start_kms_thread};
 
 use super::render::{CLEAR_COLOR, CursorMode, output_elements};
 
@@ -920,6 +922,7 @@ impl KmsGuard<'_> {
                         screen_filter.clone(),
                         shell.clone(),
                         startup_done.clone(),
+                        device.kms_thread.clone(),
                     )?;
                     if output.mirroring().is_none() {
                         w += output.geometry().size.w as u32;
