@@ -21,7 +21,7 @@ use smithay::{
             gbm::{GbmAllocator, GbmDevice},
         },
         drm::{
-            DrmDevice, DrmDeviceFd, DrmEvent, DrmNode, NodeType,
+            DrmDevice, DrmDeviceFd, DrmNode, NodeType,
             compositor::{FrameError, FrameFlags},
             exporter::gbm::GbmFramebufferExporter,
             output::{DrmOutputManager, LockedDrmOutputManager},
@@ -59,7 +59,14 @@ use std::{
     time::Duration,
 };
 
-use super::{drm_helpers, socket::Socket, surface::Surface};
+use smithay::reexports::calloop::channel::Sender;
+
+use super::{
+    drm_helpers,
+    socket::Socket,
+    surface::Surface,
+    thread::{KmsMessage, start_kms_thread},
+};
 
 #[derive(Debug)]
 pub struct EGLInternals {
@@ -95,6 +102,7 @@ pub type GbmDrmOutputManager = DrmOutputManager<
 pub struct Device {
     pub inner: InnerDevice,
     pub drm: GbmDrmOutputManager,
+    pub kms_thread: Sender<KmsMessage>,
 
     supports_atomic: bool,
     pub texture_formats: FormatSet,
@@ -120,6 +128,7 @@ struct OldDeviceState {
 pub struct LockedDevice<'a> {
     pub inner: &'a mut InnerDevice,
     pub drm: LockedGbmDrmOutputManager<'a>,
+    pub kms_thread: &'a mut Sender<KmsMessage>,
 }
 
 pub struct InnerDevice {
@@ -263,6 +272,7 @@ impl State {
                     self.common.config.dynamic_conf.screen_filter().clone(),
                     self.common.shell.clone(),
                     self.common.startup_done.clone(),
+                    device.kms_thread.clone(),
                 ) {
                     Ok((output, should_expose)) => {
                         if should_expose {
@@ -350,6 +360,7 @@ impl State {
                         self.common.config.dynamic_conf.screen_filter().clone(),
                         self.common.shell.clone(),
                         self.common.startup_done.clone(),
+                        device.kms_thread.clone(),
                     ) {
                         Ok((output, should_expose)) => {
                             if should_expose {
@@ -522,6 +533,7 @@ impl State {
                                     self.common.config.dynamic_conf.screen_filter().clone(),
                                     self.common.shell.clone(),
                                     self.common.startup_done.clone(),
+                                    &new_device.kms_thread,
                                 ) {
                                     Ok(data) => {
                                         new_device.inner.surfaces.insert(crtc, data);
@@ -557,6 +569,7 @@ impl State {
                             self.common.config.dynamic_conf.screen_filter().clone(),
                             self.common.shell.clone(),
                             self.common.startup_done.clone(),
+                            new_device.kms_thread.clone(),
                         ) {
                             Ok((output, should_expose)) => {
                                 if should_expose {
@@ -735,24 +748,7 @@ impl Device {
             )
         };
 
-        let token = common
-            .event_loop_handle
-            .insert_source(
-                notifier,
-                move |event, metadata, state: &mut State| match event {
-                    DrmEvent::VBlank(crtc) => {
-                        if let Some(device) = state.backend.kms().drm_devices.get_mut(&dev_node)
-                            && let Some(surface) = device.inner.surfaces.get_mut(&crtc)
-                        {
-                            surface.on_vblank(metadata.take());
-                        }
-                    }
-                    DrmEvent::Error(err) => {
-                        warn!(?err, "Failed to read events of device {:?}.", dev);
-                    }
-                },
-            )
-            .with_context(|| format!("Failed to add drm device to event loop: {}", dev))?;
+        let kms_thread = start_kms_thread(notifier);
 
         let ReusableDevice {
             leasing_global,
@@ -831,9 +827,10 @@ impl Device {
                 active_clients,
             },
 
+            kms_thread,
             supports_atomic,
             texture_formats,
-            event_token: Some(token),
+            event_token: None,
             socket,
         })
     }
@@ -889,6 +886,7 @@ impl Device {
         LockedDevice {
             inner: &mut self.inner,
             drm: self.drm.lock(),
+            kms_thread: &mut self.kms_thread,
         }
     }
 
@@ -1038,6 +1036,7 @@ impl InnerDevice {
         screen_filter: ScreenFilter,
         shell: Arc<parking_lot::RwLock<Shell>>,
         startup_done: Arc<AtomicBool>,
+        device_kms_thread: Sender<KmsMessage>,
     ) -> Result<(Output, bool)> {
         let output = self
             .outputs
@@ -1101,6 +1100,7 @@ impl InnerDevice {
                     screen_filter,
                     shell,
                     startup_done,
+                    &device_kms_thread,
                 ) {
                     Ok(data) => {
                         self.surfaces.insert(crtc, data);
