@@ -106,7 +106,7 @@ use std::{
 mod timings;
 pub use self::timings::Timings;
 
-use super::{drm_helpers, render::gles::GbmGlowBackend};
+use super::{drm_helpers, render::gles::GbmGlowBackend, thread::KmsMessage};
 
 #[cfg(feature = "debug")]
 use smithay_egui::EguiState;
@@ -127,6 +127,8 @@ pub struct Surface {
     thread_command: Sender<ThreadCommand>,
     thread_token: RegistrationToken,
     thread: Option<JoinHandle<()>>,
+
+    kms_thread: Sender<KmsMessage>,
 
     dpms: bool,
 }
@@ -258,10 +260,13 @@ impl Surface {
         screen_filter: ScreenFilter,
         shell: Arc<parking_lot::RwLock<Shell>>,
         startup_done: Arc<AtomicBool>,
+        kms_thread: &Sender<KmsMessage>,
     ) -> Result<Self> {
         let (tx, rx) = channel::<ThreadCommand>();
         let (tx2, rx2) = channel::<SurfaceCommand>();
         let active = Arc::new(AtomicBool::new(false));
+
+        let _ = kms_thread.send(KmsMessage::RegisterSurface(crtc, tx.clone()));
 
         let active_clone = active.clone();
         let output_clone = output.clone();
@@ -365,6 +370,7 @@ impl Surface {
             thread_command: tx,
             thread_token,
             thread: Some(thread),
+            kms_thread: kms_thread.clone(),
             dpms: true,
         })
     }
@@ -500,6 +506,9 @@ impl Surface {
 
 impl Drop for Surface {
     fn drop(&mut self) {
+        let _ = self
+            .kms_thread
+            .send(KmsMessage::UnregisterSurface(self.crtc));
         let _ = self.thread_command.send(ThreadCommand::End);
         self.loop_handle.remove(self.thread_token);
         if let Some(thread) = self.thread.take() {
