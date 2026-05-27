@@ -771,7 +771,7 @@ impl State {
 
         let session_lock_layer_state =
             SessionLockLayerState::new::<State, _>(dh, client_not_sandboxed);
-        
+
         let commit_timing_manager_state = CommitTimingManagerState::unmanaged::<State>(dh);
 
         let fifo_manager_state = FifoManagerState::unmanaged::<State>(dh);
