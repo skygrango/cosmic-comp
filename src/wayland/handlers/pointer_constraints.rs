@@ -116,7 +116,8 @@ impl PointerConstraintsHandler for State {
                 .cloned();
 
             if let Some(seat) = seat {
-                seat.set_pointer_constraint_hint(Some((surface.clone(), location)));
+                // seat.set_pointer_constraint_hint(Some((surface.clone(), location)));
+                self.apply_cursor_hint(surface, pointer, location);
             }
         }
     }

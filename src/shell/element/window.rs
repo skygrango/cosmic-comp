@@ -17,6 +17,7 @@ use crate::{
         iced::{IcedElement, Program},
         prelude::*,
     },
+    wayland::handlers::seat,
 };
 use calloop::LoopHandle;
 use cosmic::iced::{Color, Task};
@@ -25,39 +26,30 @@ use smithay::{
     backend::{
         input::KeyState,
         renderer::{
-            ImportAll, ImportMem, Renderer,
             element::{
-                AsRenderElements, Element, Id as RendererId, Kind, RenderElement,
-                UnderlyingStorage, memory::MemoryRenderBufferRenderElement,
-                surface::WaylandSurfaceRenderElement,
-            },
-            gles::element::PixelShaderElement,
-            glow::GlowRenderer,
-            utils::{CommitCounter, DamageSet, OpaqueRegions},
+                memory::MemoryRenderBufferRenderElement, surface::WaylandSurfaceRenderElement, AsRenderElements, Element, Id as RendererId, Kind, RenderElement, UnderlyingStorage
+            }, gles::element::PixelShaderElement, glow::GlowRenderer, utils::{CommitCounter, DamageSet, OpaqueRegions}, ImportAll, ImportMem, Renderer
         },
     },
-    desktop::{WindowSurfaceType, space::SpaceElement},
+    desktop::{space::SpaceElement, WindowSurfaceType},
     input::{
-        Seat,
-        keyboard::{KeyboardTarget, KeysymHandle, ModifiersState},
-        pointer::{
+        keyboard::{KeyboardTarget, KeysymHandle, ModifiersState}, pointer::{
             AxisFrame, ButtonEvent, CursorIcon, CursorImageStatus, GestureHoldBeginEvent,
             GestureHoldEndEvent, GesturePinchBeginEvent, GesturePinchEndEvent,
             GesturePinchUpdateEvent, GestureSwipeBeginEvent, GestureSwipeEndEvent,
-            GestureSwipeUpdateEvent, MotionEvent, PointerTarget, RelativeMotionEvent,
-        },
-        touch::{
+            GestureSwipeUpdateEvent, MotionEvent, PointerHandle, PointerTarget,
+            RelativeMotionEvent,
+        }, touch::{
             DownEvent, MotionEvent as TouchMotionEvent, OrientationEvent, ShapeEvent, TouchTarget,
             UpEvent,
-        },
+        }, Seat
     },
     output::Output,
     reexports::wayland_server::protocol::wl_surface::WlSurface,
     utils::{
-        Buffer, IsAlive, Logical, Physical, Point, Rectangle, Scale, Serial, Size, Transform,
-        user_data::UserDataMap,
+        user_data::UserDataMap, Buffer, IsAlive, Logical, Physical, Point, Rectangle, Scale, Serial, Size, Transform
     },
-    wayland::seat::WaylandFocus,
+    wayland::{pointer_constraints::with_pointer_constraint, seat::WaylandFocus},
 };
 use std::{
     borrow::Cow,
@@ -274,39 +266,54 @@ impl CosmicWindow {
         &self,
         mut relative_pos: Point<f64, Logical>,
         surface_type: WindowSurfaceType,
+        seat: Option<&Seat<State>>,
     ) -> Option<(PointerFocusTarget, Point<f64, Logical>)> {
+        let has_constraint = if let Some(seat) = seat
+            && let Some(pointer) = seat.get_pointer()
+            && let Some(surface) = self.wl_surface()
+            && with_pointer_constraint(&surface, &pointer, |constraint| {
+                constraint.is_none() || constraint.is_some_and(|c| !c.is_active())
+            })
+            {
+                true
+            }
+            else{
+                false
+            };
+
         self.0.with_program(|p| {
             let mut offset = Point::from((0., 0.));
             let mut window_ui = None;
             let has_ssd = p.has_ssd(false);
-            if (has_ssd || p.has_tiled_state())
-                && surface_type.contains(WindowSurfaceType::TOPLEVEL)
-            {
-                let geo = p.window.geometry();
-
-                let point_i32 = relative_pos.to_i32_round::<i32>();
-                let ssd_height = if has_ssd { SSD_HEIGHT } else { 0 };
-
-                if (point_i32.x - geo.loc.x >= -RESIZE_BORDER && point_i32.x - geo.loc.x < 0)
-                    || (point_i32.y - geo.loc.y >= -RESIZE_BORDER && point_i32.y - geo.loc.y < 0)
-                    || (point_i32.x - geo.loc.x >= geo.size.w
-                        && point_i32.x - geo.loc.x < geo.size.w + RESIZE_BORDER)
-                    || (point_i32.y - geo.loc.y >= geo.size.h + ssd_height
-                        && point_i32.y - geo.loc.y < geo.size.h + ssd_height + RESIZE_BORDER)
+            
+                if (!has_constraint && (has_ssd || p.has_tiled_state()))
+                    && surface_type.contains(WindowSurfaceType::TOPLEVEL)
                 {
-                    window_ui = Some((
-                        PointerFocusTarget::WindowUI(self.clone()),
-                        Point::from((0., 0.)),
-                    ));
-                }
+                    let geo = p.window.geometry();
 
-                if has_ssd && (point_i32.y - geo.loc.y < SSD_HEIGHT) {
-                    window_ui = Some((
-                        PointerFocusTarget::WindowUI(self.clone()),
-                        Point::from((0., 0.)),
-                    ));
+                    let point_i32 = relative_pos.to_i32_round::<i32>();
+                    let ssd_height = if has_ssd { SSD_HEIGHT } else { 0 };
+
+                    if (point_i32.x - geo.loc.x >= -RESIZE_BORDER && point_i32.x - geo.loc.x < 0)
+                        || (point_i32.y - geo.loc.y >= -RESIZE_BORDER && point_i32.y - geo.loc.y < 0)
+                        || (point_i32.x - geo.loc.x >= geo.size.w
+                            && point_i32.x - geo.loc.x < geo.size.w + RESIZE_BORDER)
+                        || (point_i32.y - geo.loc.y >= geo.size.h + ssd_height
+                            && point_i32.y - geo.loc.y < geo.size.h + ssd_height + RESIZE_BORDER)
+                    {
+                        window_ui = Some((
+                            PointerFocusTarget::WindowUI(self.clone()),
+                            Point::from((0., 0.)),
+                        ));
+                    }
+
+                    if has_ssd && (point_i32.y - geo.loc.y < SSD_HEIGHT) {
+                        window_ui = Some((
+                            PointerFocusTarget::WindowUI(self.clone()),
+                            Point::from((0., 0.)),
+                        ));
+                    }
                 }
-            }
 
             if has_ssd {
                 relative_pos.y -= SSD_HEIGHT as f64;
@@ -877,7 +884,8 @@ impl SpaceElement for CosmicWindow {
         })
     }
     fn is_in_input_region(&self, point: &Point<f64, Logical>) -> bool {
-        self.focus_under(*point, WindowSurfaceType::ALL).is_some()
+        self.focus_under(*point, WindowSurfaceType::ALL, None)
+            .is_some()
     }
     fn set_activate(&self, activated: bool) {
         if self

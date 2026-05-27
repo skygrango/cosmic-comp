@@ -1,7 +1,8 @@
 use crate::{
     shell::focus::target::PointerFocusTarget,
     wayland::{
-        handlers::compositor::frame_time_filter_fn, protocols::corner_radius::CacheableCorners,
+        handlers::{compositor::frame_time_filter_fn, seat},
+        protocols::corner_radius::CacheableCorners,
     },
 };
 use std::{
