@@ -212,8 +212,9 @@ impl IsAlive for MinimizedWindow {
     fn alive(&self) -> bool {
         match self {
             MinimizedWindow::Fullscreen { surface, .. } => surface.alive(),
-            MinimizedWindow::Floating { window, .. }
-            | MinimizedWindow::Tiling { window, .. } => window.alive(),
+            MinimizedWindow::Floating { window, .. } | MinimizedWindow::Tiling { window, .. } => {
+                window.alive()
+            }
         }
     }
 }
