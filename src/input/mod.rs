@@ -2384,10 +2384,8 @@ impl State {
                 let window_size = geometry.size.to_f64();
 
                 let is_legal = |p: Point<f64, Logical>| {
-                    let in_window = p.x >= 0.0
-                        && p.y >= 0.0
-                        && p.x < window_size.w
-                        && p.y < window_size.h;
+                    let in_window =
+                        p.x >= 0.0 && p.y >= 0.0 && p.x < window_size.w && p.y < window_size.h;
                     if !in_window {
                         return false;
                     }

@@ -17,7 +17,6 @@ use crate::{
         iced::{IcedElement, Program},
         prelude::*,
     },
-    wayland::handlers::seat,
 };
 use calloop::LoopHandle;
 use cosmic::iced::{Color, Task};
@@ -45,8 +44,7 @@ use smithay::{
             AxisFrame, ButtonEvent, CursorIcon, CursorImageStatus, GestureHoldBeginEvent,
             GestureHoldEndEvent, GesturePinchBeginEvent, GesturePinchEndEvent,
             GesturePinchUpdateEvent, GestureSwipeBeginEvent, GestureSwipeEndEvent,
-            GestureSwipeUpdateEvent, MotionEvent, PointerHandle, PointerTarget,
-            RelativeMotionEvent,
+            GestureSwipeUpdateEvent, MotionEvent, PointerTarget, RelativeMotionEvent,
         },
         touch::{
             DownEvent, MotionEvent as TouchMotionEvent, OrientationEvent, ShapeEvent, TouchTarget,
