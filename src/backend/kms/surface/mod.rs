@@ -12,7 +12,9 @@ use crate::{
     state::{SurfaceDmabufFeedback, SurfaceFrameThrottlingState},
     utils::prelude::*,
     wayland::handlers::{
-        compositor::{client_compositor_state, recursive_frame_time_estimation},
+        compositor::{
+            FULLSCREEN_IMMEDIATE_RENDER, client_compositor_state, recursive_frame_time_estimation,
+        },
         image_copy_capture::{
             FrameHolder, PendingImageCopyData, SessionData, SessionHolder, submit_buffer,
         },
@@ -62,9 +64,12 @@ use smithay::{
             sync::SyncPoint,
             utils::with_renderer_surface_state,
         },
-    }, desktop::utils::{
+    },
+    desktop::utils::{
         OutputPresentationFeedback, send_frames_surface_tree, surface_primary_scanout_output,
-    }, output::{Output, OutputNoMode}, reexports::{
+    },
+    output::{Output, OutputNoMode},
+    reexports::{
         calloop::{
             EventLoop, LoopHandle, RegistrationToken,
             channel::{Event, Sender, channel},
@@ -76,7 +81,9 @@ use smithay::{
             presentation_time::server::wp_presentation_feedback,
         },
         wayland_server::{Client, DisplayHandle, Resource, protocol::wl_surface::WlSurface},
-    }, utils::{Clock, IsAlive, Monotonic, Physical, Point, Rectangle, Time, Transform}, wayland::{
+    },
+    utils::{Clock, IsAlive, Monotonic, Physical, Point, Rectangle, Time, Transform},
+    wayland::{
         commit_timing::CommitTimerBarrierStateUserData,
         compositor::{CompositorHandler, SurfaceData},
         dmabuf::{DmabufFeedbackBuilder, get_dmabuf},
@@ -98,7 +105,7 @@ use std::{
     collections::{HashMap, HashSet, hash_map},
     mem,
     sync::{
-        Arc, RwLock,
+        Arc, LazyLock, RwLock,
         atomic::{AtomicBool, Ordering},
         mpsc::{Receiver, SyncSender},
     },
@@ -110,6 +117,10 @@ mod timings;
 pub use self::timings::Timings;
 
 use super::{drm_helpers, render::gles::GbmGlowBackend, thread::KmsMessage};
+
+static FULLSCREEN_SKIP_OTHER_SURFACE: LazyLock<bool> = LazyLock::new(|| {
+    crate::utils::env::bool_var("COSMIC_FULLSCREEN_SKIP_OTHER_SURFACE").unwrap_or(true)
+});
 
 #[cfg(feature = "debug")]
 use smithay_egui::EguiState;
@@ -199,7 +210,10 @@ pub enum QueueState {
     /// A redraw is queued.
     Queued(RegistrationToken),
     /// We submitted a frame to the KMS and waiting for it to be presented.
-    WaitingForVBlank { redraw_needed: bool },
+    WaitingForVBlank {
+        redraw_needed: bool,
+        immediate_draw: bool,
+    },
     /// We did not submit anything to KMS and made a timer to fire at the estimated VBlank.
     WaitingForEstimatedVBlank(RegistrationToken),
     /// A redraw is queued on top of the above.
@@ -228,7 +242,7 @@ pub enum ThreadCommand {
     UpdateMirroring(Option<Output>),
     UpdateScreenFilter(ScreenFilter),
     VBlank(Option<DrmEventMetadata>),
-    ScheduleRender,
+    ScheduleRender(bool),
     AdaptiveSyncAvailable(SyncSender<Result<VrrSupport>>),
     UseAdaptiveSync(AdaptiveSync),
     UpdateVrrTargetRate(u32),
@@ -414,9 +428,11 @@ impl Surface {
         let _ = self.thread_command.send(ThreadCommand::VBlank(metadata));
     }
 
-    pub fn schedule_render(&self) {
+    pub fn schedule_render(&self, immediate_draw: bool) {
         if self.dpms {
-            let _ = self.thread_command.send(ThreadCommand::ScheduleRender);
+            let _ = self
+                .thread_command
+                .send(ThreadCommand::ScheduleRender(immediate_draw));
         }
     }
 
@@ -489,7 +505,7 @@ impl Surface {
         if self.dpms != on {
             self.dpms = on;
             if on {
-                self.schedule_render();
+                self.schedule_render(false);
             } else {
                 let _ = self.thread_command.send(ThreadCommand::DpmsOff);
             }
@@ -652,12 +668,12 @@ fn surface_thread(
             Event::Msg(ThreadCommand::VBlank(metadata)) => {
                 state.on_vblank(metadata);
             }
-            Event::Msg(ThreadCommand::ScheduleRender) => {
+            Event::Msg(ThreadCommand::ScheduleRender(immediate_draw)) => {
                 if !startup_done.load(Ordering::SeqCst) {
                     return;
                 }
 
-                state.queue_redraw(false);
+                state.queue_redraw(false, immediate_draw);
             }
             Event::Msg(ThreadCommand::UpdateMirroring(mirroring_output)) => {
                 state.update_mirroring(mirroring_output);
@@ -1002,10 +1018,14 @@ impl SurfaceThreadState {
             }
         }
 
-        let redraw_needed = match mem::replace(&mut self.state, QueueState::Idle) {
+        let (redraw_needed, immediate_draw) = match mem::replace(&mut self.state, QueueState::Idle)
+        {
             QueueState::Idle => unreachable!(),
             QueueState::Queued(_) => unreachable!(),
-            QueueState::WaitingForVBlank { redraw_needed } => redraw_needed,
+            QueueState::WaitingForVBlank {
+                redraw_needed,
+                immediate_draw,
+            } => (redraw_needed, immediate_draw),
             QueueState::WaitingForEstimatedVBlank(_) => unreachable!(),
             QueueState::WaitingForEstimatedVBlankAndQueued { .. } => unreachable!(),
         };
@@ -1016,7 +1036,7 @@ impl SurfaceThreadState {
                 .non_continuous_frame(self.vblank_frame_name);
             self.vblank_frame = Some(vblank_frame);
 
-            self.queue_redraw(false);
+            self.queue_redraw(false, immediate_draw);
         }
         self.send_frame_callbacks();
     }
@@ -1038,21 +1058,35 @@ impl SurfaceThreadState {
         self.frame_callback_seq = self.frame_callback_seq.wrapping_add(1);
 
         if force || self.shell.read().animations_going() {
-            self.queue_redraw(false);
+            self.queue_redraw(false, false);
         }
         self.send_frame_callbacks();
     }
 
-    fn queue_redraw(&mut self, mut force: bool) {
+    fn queue_redraw(&mut self, mut force: bool, immediate: bool) {
         let Some(_compositor) = self.compositor.as_mut() else {
             return;
         };
 
-        if let QueueState::WaitingForVBlank { .. } = &self.state {
+        let is_fullscreen_skip_other = *FULLSCREEN_IMMEDIATE_RENDER
+            && *FULLSCREEN_SKIP_OTHER_SURFACE
+            && self.timings.vrr()
+            && self.output.is_foreground_fullscreen_occupied().is_some()
+            && !force
+            && !immediate;
+
+        if self.timings.vrr() && immediate {
+            force = true;
+        }
+
+        if let QueueState::WaitingForVBlank { immediate_draw, .. } = &self.state {
             // We're waiting for VBlank, request a redraw afterwards.
-            self.state = QueueState::WaitingForVBlank {
-                redraw_needed: true,
-            };
+            if !immediate_draw {
+                self.state = QueueState::WaitingForVBlank {
+                    redraw_needed: true,
+                    immediate_draw: immediate,
+                };
+            }
             return;
         }
 
@@ -1068,24 +1102,43 @@ impl SurfaceThreadState {
             };
         }
 
-        let estimated_presentation = self.timings.next_presentation_time(&self.clock);
+        // let estimated_presentation = self.timings.next_presentation_time(&self.clock);
 
-        // let next_deadline = signal_commit_timing(
-        //     &self.shell,
-        //     &self.output,
-        //     self.clock.now() + estimated_presentation,
-        //     &self.display_handle,
-        // );
+        // // let next_deadline = signal_commit_timing(
+        // //     &self.shell,
+        // //     &self.output,
+        // //     self.clock.now() + estimated_presentation,
+        // //     &self.display_handle,
+        // // );
 
-        let render_start = self.timings.next_render_time(&self.clock);
-        // if let Some(next_deadline) = next_deadline {
-        //     let next_deadline = Time::elapsed(&self.clock.now(), next_deadline.into());
-        //     // wait for client
-        //     if render_start.as_nanos() < next_deadline.as_nanos() {
-        //         render_start = next_deadline;
-        //         force = true;
-        //     }
-        // }
+        // let render_start = self.timings.next_render_time(&self.clock);
+        // // if let Some(next_deadline) = next_deadline {
+        // //     let next_deadline = Time::elapsed(&self.clock.now(), next_deadline.into());
+        // //     // wait for client
+        // //     if render_start.as_nanos() < next_deadline.as_nanos() {
+        // //         render_start = next_deadline;
+        // //         force = true;
+        // //     }
+        // // }
+        let mut estimated_presentation = self.timings.next_presentation_time(&self.clock);
+        let origin_render_start = self.timings.next_render_time(&self.clock);
+        let render_start = if is_fullscreen_skip_other {
+            // To prevent the fullscreen surface from unexpectedly stopping updates, register a fallback redraw request.
+            // If the fullscreen surface commits an update within the min_vrr interval, it will replace this fallback request.
+            let min_vrr = self
+                .min_vrr_frame_time
+                .unwrap_or(Duration::from_nanos(1_000_000_000 / 30));
+            estimated_presentation = estimated_presentation
+                .saturating_sub(origin_render_start)
+                .saturating_add(min_vrr);
+            min_vrr
+        } else if self.timings.vrr() && immediate {
+            // estimated_presentation = estimated_presentation.saturating_sub(origin_render_start);
+            // Duration::ZERO
+            origin_render_start
+        } else {
+            origin_render_start
+        };
 
         let timer = if render_start.is_zero() {
             trace!("Running late for frame.");
@@ -1101,7 +1154,7 @@ impl SurfaceThreadState {
                 if let Err(err) = state.redraw(estimated_presentation) {
                     let name = state.output.name();
                     warn!(?name, "Failed to submit rendering: {:?}", err);
-                    state.queue_redraw(true);
+                    state.queue_redraw(true, false);
                 }
                 TimeoutAction::Drop
             })
@@ -1174,19 +1227,16 @@ impl SurfaceThreadState {
             let animations_going = shell.animations_going();
             let output = self.mirroring.as_ref().unwrap_or(&self.output);
             if let Some(fullscreen_surface) = output.is_foreground_fullscreen_occupied()
-                && fullscreen_surface.alive() {
+                && fullscreen_surface.alive()
+            {
                 let min_vrr_frame_time = self
                     .min_vrr_frame_time
                     .unwrap_or(Duration::from_nanos(1_000_000_000 / 30));
                 let drives_refresh_rate = fullscreen_surface.wl_surface().is_some_and(|surface| {
-                        recursive_frame_time_estimation(&self.clock, &surface)
-                            .is_some_and(|dur| dur <= min_vrr_frame_time)
-                    });
-                (
-                    true,
-                    drives_refresh_rate,
-                    animations_going,
-                )
+                    recursive_frame_time_estimation(&self.clock, &surface)
+                        .is_some_and(|dur| dur <= min_vrr_frame_time)
+                });
+                (true, drives_refresh_rate, animations_going)
             } else {
                 (false, false, animations_going)
             }
@@ -1481,9 +1531,9 @@ impl SurfaceThreadState {
 
                         // Update `state` after `queue_frame`, before any early return from errors
                         if x.is_ok() {
-
                             let new_state = QueueState::WaitingForVBlank {
                                 redraw_needed: false,
+                                immediate_draw: false,
                             };
                             match mem::replace(&mut self.state, new_state) {
                                 QueueState::Idle => unreachable!(),
