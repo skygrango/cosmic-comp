@@ -15,6 +15,7 @@ use crate::{
         image_copy_capture::{FrameHolder, PendingImageCopyData, SessionData, submit_buffer},
     },
 };
+use cosmic::widget::canvas::fill::Rule::NonZero;
 use libc;
 
 use anyhow::{Context, Result};
@@ -137,6 +138,7 @@ pub struct SurfaceThreadState {
     target_node: DrmNode,
     active: Arc<AtomicBool>,
     vrr_mode: AdaptiveSync,
+    vrr_target_rate: u32,
     frame_flags: FrameFlags,
     compositor: Option<GbmDrmOutput>,
 
@@ -223,6 +225,7 @@ pub enum ThreadCommand {
     ScheduleRender,
     AdaptiveSyncAvailable(SyncSender<Result<VrrSupport>>),
     UseAdaptiveSync(AdaptiveSync),
+    UpdateVrrTargetRate(u32),
     AllowFrameFlags(bool, FrameFlags),
     End,
     DpmsOff,
@@ -434,6 +437,12 @@ impl Surface {
             .send(ThreadCommand::UseAdaptiveSync(vrr));
     }
 
+    pub fn set_vrr_target_rate(&mut self, rate: u32) {
+        let _ = self
+            .thread_command
+            .send(ThreadCommand::UpdateVrrTargetRate(rate));
+    }
+
     pub fn allow_frame_flags(&mut self, flag: bool, flags: FrameFlags) {
         let _ = self
             .thread_command
@@ -566,6 +575,10 @@ fn surface_thread(
         compositor: None,
         frame_flags: FrameFlags::DEFAULT,
         vrr_mode: AdaptiveSync::Disabled,
+        vrr_target_rate: output
+            .current_mode()
+            .map(|m| m.refresh as u32)
+            .unwrap_or(60000),
 
         state: QueueState::Idle,
         timings: Timings::new(None, None, false, target_node),
@@ -648,6 +661,42 @@ fn surface_thread(
             }
             Event::Msg(ThreadCommand::UseAdaptiveSync(vrr)) => {
                 state.vrr_mode = vrr;
+            }
+            Event::Msg(ThreadCommand::UpdateVrrTargetRate(rate)) => {
+                state.vrr_target_rate = rate;
+                // if let Some(compositor) = state.compositor.as_mut() {
+                //     let mode = compositor.with_compositor(|c| {
+                //         c.surface().current_mode()
+                //     });
+                //     if let Some(refresh_interval_ns) = state.timings.origin_refresh_interval_ns {
+                //         use std::num::NonZero;
+                //         //state.timings.vrr_target_rate_internal_ns = NonZero::<u64>::new((refresh_interval_ns.get() as f64 * (mode.vrefresh() as f64 / ( rate / 1000 ) as f64)) as u64);
+
+                //         //state.timings.set_vrr_target_rate_interval(Some(Duration::from_secs_f64((1. / mode.vrefresh() as f64) * (mode.vrefresh() / ( rate / 1000 ) )as f64)));
+                //         if state.timings.vrr() {
+                //             state.timings.refresh_interval_ns = state.timings.vrr_target_rate_internal_ns;
+                //             state.timings.previous_frames.clear();
+                //         }
+                //     }
+                // }
+                // if let Some(mode) = state.output.current_mode()
+                // && let Some(refresh_interval_ns) = state.timings.origin_refresh_interval_ns {
+                //     use std::num::NonZero;
+                //         state.timings.vrr_target_rate_internal_ns = NonZero::<u64>::new((refresh_interval_ns.get() as f64 * (rate as f64 / mode.refresh as f64)) as u64);
+                //         if state.timings.vrr() {
+                //             state.timings.refresh_interval_ns = state.timings.vrr_target_rate_internal_ns;
+                //             state.timings.previous_frames.clear();
+                //         }
+                // }
+                state
+                    .timings
+                    .set_vrr_target_rate_interval(Some(Duration::from_secs_f64(
+                        1000. / rate as f64,
+                    )));
+                if state.timings.vrr() {
+                    state.timings.refresh_interval_ns = state.timings.vrr_target_rate_internal_ns;
+                    state.timings.previous_frames.clear();
+                }
             }
             Event::Msg(ThreadCommand::DpmsOff) => {
                 if let Some(compositor) = state.compositor.as_mut() {
@@ -804,11 +853,36 @@ impl SurfaceThreadState {
                 }
             }
         }
+
         if matches!(self.state, QueueState::Idle) {
             return;
         }
 
         let now = self.clock.now();
+
+        // if self.timings.vrr() {
+        //    if let Some(last_presentation_time) = self
+        //     .timings
+        //     .previous_frames
+        //     .back()
+        //     .map(|frame| frame.presentation_presented){
+        //         let last_presentation_time: Duration = last_presentation_time.into();
+        //         let now: Duration = now.into();
+        //         let since = now.saturating_sub(last_presentation_time);
+        //         let diff = self.timings.refresh_interval().saturating_sub(since);
+        //         if diff > Duration::from_millis(1) {
+        //             let timer = Timer::from_duration(diff.saturating_sub(Duration::from_millis(1)));
+        //             let _token = self
+        //             .loop_handle
+        //             .insert_source(timer, move |_time, _, state| {
+        //                 state.on_vblank(metadata);
+        //                 TimeoutAction::Drop
+        //             })
+        //             .expect("Failed to schedule on_vblank");
+        //         }
+        //     }
+        // }
+
         let presentation_time = match metadata.as_ref().map(|data| &data.time) {
             Some(DrmEventTime::Monotonic(tp)) => Some(*tp),
             _ => None,
