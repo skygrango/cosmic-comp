@@ -6,11 +6,13 @@ use smithay::{
 };
 use tracing::{debug, error};
 
-const BASE_SAFETY_MARGIN: Duration = Duration::from_millis(3);
+const BASE_SAFETY_MARGIN: Duration = Duration::from_millis(2);
 const SAMPLE_TIME_WINDOW: usize = 5;
 
 pub struct Timings {
-    refresh_interval_ns: Option<NonZeroU64>,
+    pub refresh_interval_ns: Option<NonZeroU64>,
+    pub origin_refresh_interval_ns: Option<NonZeroU64>,
+    pub vrr_target_rate_internal_ns: Option<NonZeroU64>,
     min_refresh_interval_ns: Option<NonZeroU64>,
     vrr: bool,
     vendor: Option<u32>,
@@ -84,7 +86,9 @@ impl Timings {
 
         Self {
             refresh_interval_ns,
+            origin_refresh_interval_ns: refresh_interval_ns,
             min_refresh_interval_ns,
+            vrr_target_rate_internal_ns: refresh_interval_ns,
             vrr,
             vendor,
 
@@ -104,8 +108,19 @@ impl Timings {
         self.refresh_interval_ns = interval
             .map(|duration| duration.subsec_nanos() as u64)
             .and_then(NonZeroU64::new);
+        self.origin_refresh_interval_ns = self.refresh_interval_ns;
 
         self.previous_frames.clear();
+    }
+
+    pub fn set_vrr_target_rate_interval(&mut self, interval: Option<Duration>) {
+        self.vrr_target_rate_internal_ns = interval
+            .map(|duration| duration.subsec_nanos() as u64)
+            .and_then(NonZeroU64::new);
+
+        if self.vrr {
+            self.refresh_interval_ns = self.vrr_target_rate_internal_ns;
+        }
     }
 
     pub fn set_min_refresh_interval(&mut self, min_interval: Option<Duration>) {
@@ -115,6 +130,13 @@ impl Timings {
     }
 
     pub fn set_vrr(&mut self, vrr: bool) {
+        if self.vrr != vrr {
+            if vrr {
+                self.refresh_interval_ns = self.vrr_target_rate_internal_ns;
+            } else {
+                self.refresh_interval_ns = self.origin_refresh_interval_ns;
+            }
+        }
         self.vrr = vrr;
     }
 
@@ -230,6 +252,41 @@ impl Timings {
             .unwrap_or(Duration::ZERO)
     }
 
+    pub fn sample_rendertime(&self, window: usize) -> Option<Duration> {
+        if self.previous_frames.len() < window || window == 0 {
+            return None;
+        }
+        let Some(sum_rendertime) = self
+            .previous_frames
+            .iter()
+            .rev()
+            .take(window)
+            .map(|f| f.render_time())
+            .try_fold(Duration::ZERO, |acc, x| acc.checked_add(x))
+        else {
+            return None;
+        };
+
+        Some(
+            sum_rendertime
+                .checked_div(window as u32)
+                .unwrap_or(Duration::ZERO),
+        )
+    }
+
+    pub fn max_submittime(&self, window: usize) -> Option<Duration> {
+        if self.previous_frames.len() < window || window == 0 {
+            return None;
+        }
+
+        self.previous_frames
+            .iter()
+            .rev()
+            .take(window)
+            .map(|f| f.submit_time())
+            .max()
+    }
+
     pub fn avg_submittime(&self, window: usize) -> Option<Duration> {
         if self.previous_frames.len() < window || window == 0 {
             return None;
@@ -280,7 +337,7 @@ impl Timings {
     }
 
     pub fn next_presentation_time(&self, clock: &Clock<Monotonic>) -> Duration {
-        let mut now = clock.now().into();
+        let mut now: Duration = clock.now().into();
 
         let Some(refresh_interval_ns) = self.refresh_interval_ns else {
             return Duration::ZERO;
@@ -294,33 +351,36 @@ impl Timings {
         };
         let refresh_interval_ns = refresh_interval_ns.get();
 
-        if now <= last_presentation_time {
-            // Got an early VBlank.
-            let orig_now = now;
-            now += Duration::from_nanos(refresh_interval_ns);
+        if self.vrr {
+            let earliest_presentation =
+                last_presentation_time + Duration::from_nanos(refresh_interval_ns);
+            // let mut temp: Duration = now.clone();
+            // while temp <= last_presentation_time {
+            //     temp += Duration::from_nanos(refresh_interval_ns);
+            //     earliest_presentation += Duration::from_nanos(refresh_interval_ns);
+            // }
 
-            if now < last_presentation_time {
-                // Not sure when this can happen.
-                error!(
-                    now = ?orig_now,
-                    ?last_presentation_time,
-                    "got a 2+ early VBlank, {:?} until presentation",
-                    last_presentation_time - now,
-                );
-                now = last_presentation_time + Duration::from_nanos(refresh_interval_ns);
-            }
-        }
-
-        let since_last = now - last_presentation_time;
-        let since_last_ns =
-            since_last.as_secs() * 1_000_000_000 + u64::from(since_last.subsec_nanos());
-        let to_next_ns = (since_last_ns / refresh_interval_ns + 1) * refresh_interval_ns;
-
-        // If VRR is enabled and more than one frame passed since last presentation, assume that we
-        // can present immediately.
-        if self.vrr && to_next_ns > refresh_interval_ns {
-            Duration::ZERO
+            earliest_presentation.saturating_sub(now)
         } else {
+            if now <= last_presentation_time {
+                // Got an early VBlank.
+                let orig_now = now;
+                now += Duration::from_nanos(refresh_interval_ns);
+
+                if now < last_presentation_time {
+                    // Not sure when this can happen.
+                    error!(
+                        now = ?orig_now,
+                        ?last_presentation_time,
+                        "got a 2+ early VBlank, {:?} until presentation",
+                        last_presentation_time - now,
+                    );
+                    now = last_presentation_time + Duration::from_nanos(refresh_interval_ns);
+                }
+            }
+            let since_last = now - last_presentation_time;
+            let since_last_ns = since_last.as_nanos() as u64;
+            let to_next_ns = (since_last_ns / refresh_interval_ns + 1) * refresh_interval_ns;
             last_presentation_time + Duration::from_nanos(to_next_ns) - now
         }
     }
@@ -381,11 +441,22 @@ impl Timings {
             return Duration::ZERO;
         }
 
-        let Some(avg_submittime) = self.avg_submittime(SAMPLE_TIME_WINDOW) else {
-            return estimated_presentation_time.saturating_sub(baseline + BASE_SAFETY_MARGIN);
+        let margin = if self.vrr {
+            let Some(sample_rendertime) = self.avg_frametime(SAMPLE_TIME_WINDOW) else {
+                return estimated_presentation_time.saturating_sub(baseline + BASE_SAFETY_MARGIN);
+            };
+            sample_rendertime
+        } else {
+            let Some(avg_submittime) = self.avg_submittime(SAMPLE_TIME_WINDOW) else {
+                return estimated_presentation_time.saturating_sub(baseline + BASE_SAFETY_MARGIN);
+            };
+            avg_submittime + BASE_SAFETY_MARGIN
         };
 
+<<<<<<< HEAD
         let margin = avg_submittime + BASE_SAFETY_MARGIN;
+=======
+>>>>>>> 29c96a30 (add vrr target rate)
         estimated_presentation_time.saturating_sub(margin)
     }
 }
