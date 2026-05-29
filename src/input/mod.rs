@@ -11,7 +11,7 @@ use crate::{
     },
     input::gestures::{GestureState, SwipeAction},
     shell::{
-        LastModifierChange, SeatExt, Trigger,
+        CosmicSurface, LastModifierChange, SeatExt, Trigger,
         focus::{
             Stage, render_input_order,
             target::{KeyboardFocusTarget, PointerFocusTarget},
@@ -44,7 +44,9 @@ use smithay::{
         TabletToolButtonEvent, TabletToolEvent, TabletToolProximityEvent, TabletToolTipEvent,
         TabletToolTipState, TouchEvent,
     },
-    desktop::{PopupKeyboardGrab, WindowSurfaceType, utils::under_from_surface_tree},
+    desktop::{
+        PopupKeyboardGrab, WindowSurfaceType, space::SpaceElement, utils::under_from_surface_tree,
+    },
     input::{
         Seat,
         keyboard::{FilterResult, KeysymHandle, ModifiersState},
@@ -66,11 +68,12 @@ use smithay::{
     },
     utils::{Logical, Point, Rectangle, SERIAL_COUNTER, Serial},
     wayland::{
-        compositor::CompositorHandler,
+        compositor::{CompositorHandler, get_parent, with_states},
         image_copy_capture::{BufferConstraints, CursorSessionRef},
         keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitorSeat,
         pointer_constraints::{PointerConstraint, with_pointer_constraint},
         seat::WaylandFocus,
+        shell::xdg::{XDG_POPUP_ROLE, XdgPopupSurfaceData},
         tablet_manager::{TabletDescriptor, TabletSeatTrait},
     },
 };
@@ -2365,117 +2368,130 @@ impl State {
         &mut self,
         surface: &WlSurface,
         pointer: &PointerHandle<Self>,
-        mut location: Point<f64, Logical>,
+        location: Point<f64, Logical>,
     ) {
         let Some(client) = surface.client() else {
             return;
         };
-        location = location.downscale(self.client_compositor_state(&client).client_scale());
 
-        let point_and_output = {
-            let shell = self.common.shell.read();
-            let found = shell.workspaces.sets.iter().find_map(|(out, set)| {
-                set.surface_geometry_offset_from_toplevel(surface)
-                    .map(|(geometry, surface_offset)| (out, geometry, surface_offset))
-            });
+        let seat = self
+            .common
+            .shell
+            .read()
+            .seats
+            .iter()
+            .find(|s| s.get_pointer().as_ref() == Some(pointer))
+            .cloned();
 
-            if let Some((output, geometry, surface_offset)) = found {
-                let mut pos_in_element = location + surface_offset.to_f64();
-                let window_size = geometry.size.to_f64();
-
-                let is_legal = |p: Point<f64, Logical>| {
-                    let in_window =
-                        p.x >= 0.0 && p.y >= 0.0 && p.x < window_size.w && p.y < window_size.h;
-                    if !in_window {
-                        return false;
-                    }
-
-                    with_pointer_constraint(surface, pointer, |constraint| {
-                        if let Some(constraint) = constraint
-                            && let Some(region) = constraint.region()
-                        {
-                            let point_in_surface = (p - surface_offset.to_f64()).to_i32_round();
-                            return region.contains(point_in_surface);
-                        }
-                        true
-                    })
-                };
-
-                let workspace_origin = output.geometry().loc.to_f64();
-                let origin = geometry.loc.to_f64();
-
-                if !is_legal(pos_in_element) {
-                    let original_global = pointer.current_location();
-
-                    let original_pos_in_element = Point::new(
-                        original_global.x - workspace_origin.x - origin.x,
-                        original_global.y - workspace_origin.y - origin.y,
-                    );
-
-                    let y_only_pos = Point::new(original_pos_in_element.x, pos_in_element.y);
-                    let x_only_pos = Point::new(pos_in_element.x, original_pos_in_element.y);
-
-                    if is_legal(y_only_pos) {
-                        pos_in_element = y_only_pos;
-                    } else if is_legal(x_only_pos) {
-                        pos_in_element = x_only_pos;
-                    } else {
-                        pos_in_element = original_pos_in_element;
-                    }
-                }
-
-                let x = workspace_origin.x + origin.x + pos_in_element.x;
-                let y = workspace_origin.y + origin.y + pos_in_element.y;
-                Some((Point::new(x, y), output.clone()))
-            } else {
-                None
-            }
+        let (seat, output, pointer_focus, keyboard_focus) = if let Some(seat) = seat {
+            (
+                seat.clone(),
+                seat.active_output(),
+                seat.get_pointer().and_then(|p| p.current_focus()),
+                seat.get_keyboard().and_then(|k| k.current_focus()),
+            )
+        } else {
+            return;
         };
 
-        if let Some((point, output)) = point_and_output {
+        let location = location.downscale(self.client_compositor_state(&client).client_scale());
+
+        let shell = self.common.shell.read();
+        if let Some(pointer_focus) = pointer_focus
+            && let Some(keyboard_focus) = keyboard_focus
+            && let Some(pointer_toplevel) = pointer_focus.toplevel(&shell)
+            && let Some(pointer_toplevel_surface) = pointer_toplevel.wl_surface()
+            && let Some(surface_offset) = CosmicSurface::surface_tree_offset(&pointer_toplevel_surface, surface)
+            && let Some(keyboard_toplevel_surface) = keyboard_focus.toplevel()
+            && pointer_toplevel_surface == keyboard_toplevel_surface
+        {
+            let geometry = pointer_toplevel.geometry();
+
+            let mut pos_in_element = location + surface_offset.to_f64();
+            let window_size = geometry.size.to_f64();
+
+            let is_legal = |p: Point<f64, Logical>| {
+                let in_window =
+                    p.x >= 0.0 && p.y >= 0.0 && p.x < window_size.w && p.y < window_size.h;
+                if !in_window {
+                    return false;
+                }
+
+                with_pointer_constraint(surface, pointer, |constraint| {
+                    if let Some(constraint) = constraint
+                        && let Some(region) = constraint.region()
+                    {
+                        let point_in_surface = (p - surface_offset.to_f64()).to_i32_round();
+                        return region.contains(point_in_surface);
+                    }
+                    true
+                })
+            };
+
+            let workspace_origin = output.geometry().loc.to_f64();
+            let origin = geometry.loc.to_f64();
+
+            if !is_legal(pos_in_element) {
+                let original_global = pointer.current_location();
+
+                let original_pos_in_element = Point::new(
+                    original_global.x - workspace_origin.x - origin.x,
+                    original_global.y - workspace_origin.y - origin.y,
+                );
+
+                let y_only_pos = Point::new(original_pos_in_element.x, pos_in_element.y);
+                let x_only_pos = Point::new(pos_in_element.x, original_pos_in_element.y);
+
+                if is_legal(y_only_pos) {
+                    pos_in_element = y_only_pos;
+                } else if is_legal(x_only_pos) {
+                    pos_in_element = x_only_pos;
+                } else {
+                    pos_in_element = original_pos_in_element;
+                }
+            }
+
+            let x = workspace_origin.x + origin.x + pos_in_element.x;
+            let y = workspace_origin.y + origin.y + pos_in_element.y;
+
+            let point: Point<f64, Logical> = Point::new(x, y);
+
             let original_position = pointer.current_location();
             pointer.set_location(point);
 
+            drop(shell);
             let mut shell = self.common.shell.write();
             shell.update_pointer_position(point.as_global().to_local(&output), &output);
 
-            let seat = shell
-                .seats
-                .iter()
-                .find(|s| s.get_pointer().as_ref() == Some(pointer))
-                .cloned();
+            shell.update_focal_point(
+                &seat,
+                original_position.as_global(),
+                self.common.config.cosmic_conf.accessibility_zoom.view_moves,
+            );
 
-            if let Some(seat) = seat {
-                shell.update_focal_point(
-                    &seat,
-                    original_position.as_global(),
-                    self.common.config.cosmic_conf.accessibility_zoom.view_moves,
-                );
-
-                let output_geometry = output.geometry();
-                for session in cursor_sessions_for_output(&shell, &output) {
-                    if let Some((geometry, offset)) = seat.cursor_geometry(
-                        point.to_buffer(
-                            output.current_scale().fractional_scale(),
-                            output.current_transform(),
-                            &output_geometry.size.to_f64().as_logical(),
-                        ),
-                        self.common.clock.now(),
-                    ) {
-                        if session
-                            .current_constraints()
-                            .map(|constraint| constraint.size != geometry.size)
-                            .unwrap_or(true)
-                        {
-                            session.update_constraints(BufferConstraints {
-                                size: geometry.size,
-                                shm: vec![ShmFormat::Argb8888],
-                                dma: None,
-                            });
-                        }
-                        session.set_cursor_hotspot(offset);
-                        session.set_cursor_pos(Some(geometry.loc));
+            let output_geometry = output.geometry();
+            for session in cursor_sessions_for_output(&shell, &output) {
+                if let Some((geometry, offset)) = seat.cursor_geometry(
+                    point.to_buffer(
+                        output.current_scale().fractional_scale(),
+                        output.current_transform(),
+                        &output_geometry.size.to_f64().as_logical(),
+                    ),
+                    self.common.clock.now(),
+                ) {
+                    if session
+                        .current_constraints()
+                        .map(|constraint| constraint.size != geometry.size)
+                        .unwrap_or(true)
+                    {
+                        session.update_constraints(BufferConstraints {
+                            size: geometry.size,
+                            shm: vec![ShmFormat::Argb8888],
+                            dma: None,
+                        });
                     }
+                    session.set_cursor_hotspot(offset);
+                    session.set_cursor_pos(Some(geometry.loc));
                 }
             }
         }
