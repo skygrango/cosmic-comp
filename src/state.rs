@@ -518,11 +518,9 @@ impl LockedBackend<'_> {
             )))
             .filter(|x| *x != output.current_location());
             output.change_current_state(mode, transform, scale.map(Scale::Fractional), location);
-
-            output.set_adaptive_sync(final_config.0.vrr);
         }
 
-        match self {
+        let res = match self {
             LockedBackend::Kms(state) => state.apply_config_for_outputs(
                 test_only,
                 loop_handle,
@@ -533,7 +531,16 @@ impl LockedBackend<'_> {
             ),
             LockedBackend::Winit(state) => state.apply_config_for_outputs(test_only),
             LockedBackend::X11(state) => state.apply_config_for_outputs(test_only),
-        }?;
+        };
+
+        if !test_only && res.is_ok() {
+            for output in &all_outputs {
+                let vrr = output.config().vrr;
+                output.set_adaptive_sync(vrr);
+            }
+        }
+
+        res?;
 
         let mut shell_ref = shell.write();
         for output in &all_outputs {
