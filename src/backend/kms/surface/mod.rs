@@ -1158,32 +1158,35 @@ impl SurfaceThreadState {
         let mut remove_frame_flags = FrameFlags::empty();
 
         let (has_active_fullscreen, fullscreen_drives_refresh_rate, animations_going) = {
-            let shell = self.shell.read();
+            let shell: parking_lot::lock_api::RwLockReadGuard<'_, parking_lot::RawRwLock, Shell> = self.shell.read();
             let animations_going = shell.animations_going();
             let output = self.mirroring.as_ref().unwrap_or(&self.output);
             if let Some((_, workspace)) = shell.workspaces.active(output)
-                && let Some(fullscreen_surface) = workspace.get_fullscreen()
             {
-                let has_focused_fullscreen = shell.seats.iter().any(|seat| {
+                let focused_fullscreen = shell.seats.iter().find_map(|seat| {
                     if &seat.active_output() == output
                         && let Some(surface) = seat
                             .get_keyboard()
                             .and_then(|k| k.current_focus())
                             .and_then(|focus| focus.active_window())
+                        && let Some(fullscreen) = workspace.get_fullscreen(seat)
+                        && surface == fullscreen.surface
                     {
-                        surface == *fullscreen_surface
+                        Some(fullscreen.surface.clone())
                     } else {
-                        false
+                        None
                     }
                 });
+
+                let has_focused_fullscreen = focused_fullscreen.is_some();
 
                 let min_vrr_frame_time = self
                     .min_vrr_frame_time
                     .unwrap_or(Duration::from_nanos(1_000_000_000 / 30));
-                let drives_refresh_rate = fullscreen_surface.wl_surface().is_some_and(|surface| {
+                let drives_refresh_rate = focused_fullscreen.is_some_and(|surface| surface.wl_surface().is_some_and(|surface| {
                     recursive_frame_time_estimation(&self.clock, &surface)
                         .is_some_and(|dur| dur <= min_vrr_frame_time)
-                });
+                }));
                 (
                     has_focused_fullscreen,
                     drives_refresh_rate,

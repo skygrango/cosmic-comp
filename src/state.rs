@@ -1098,62 +1098,6 @@ impl Common {
                         )
                     }
                 }
-<<<<<<< HEAD
-            }
-        }
-
-        shell
-            .workspaces
-            .sets
-            .get(output)
-            .unwrap()
-            .sticky_layer
-            .mapped()
-            .for_each(|mapped| {
-                for (window, _) in mapped.windows() {
-                    if let Some(feedback) = window
-                        .wl_surface()
-                        .and_then(|wl_surface| {
-                            advertised_node_for_surface(&wl_surface, &self.display_handle)
-                        })
-                        .and_then(&mut dmabuf_feedback)
-                    {
-                        window.send_dmabuf_feedback(
-                            output,
-                            &feedback,
-                            render_element_states,
-                            surface_primary_scanout_output,
-                        );
-                    }
-                }
-            });
-
-        if let Some(active) = shell.active_space(output) {
-            if let Some(fs) = active.get_fullscreen(shell.seats.last_active())
-                && let Some(feedback) = fs
-                    .surface
-                    .wl_surface()
-                    .and_then(|wl_surface| {
-                        advertised_node_for_surface(&wl_surface, &self.display_handle)
-                    })
-                    .and_then(&mut dmabuf_feedback)
-            {
-                fs.surface.send_dmabuf_feedback(
-                    output,
-                    &feedback,
-                    render_element_states,
-                    surface_primary_scanout_output,
-                );
-            }
-            active.mapped().for_each(|mapped| {
-                for (window, _) in mapped.windows() {
-                    if let Some(feedback) = window
-                        .wl_surface()
-                        .and_then(|wl_surface| {
-                            advertised_node_for_surface(&wl_surface, &self.display_handle)
-                        })
-                        .and_then(&mut dmabuf_feedback)
-=======
                 OutputSurface::Cursor(wl_surface) => {
                     if let Some(feedback) =
                         advertised_node_for_surface(&wl_surface, &self.display_handle)
@@ -1185,7 +1129,6 @@ impl Common {
                                 advertised_node_for_surface(&wl_surface, &self.display_handle)
                             })
                             .and_then(&mut dmabuf_feedback)
->>>>>>> 7f2070ef (commit-timing and fifo)
                     {
                         window.send_dmabuf_feedback(
                             output,
