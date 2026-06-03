@@ -453,10 +453,6 @@ impl Timings {
             avg_submittime + BASE_SAFETY_MARGIN
         };
 
-<<<<<<< HEAD
-        let margin = avg_submittime + BASE_SAFETY_MARGIN;
-=======
->>>>>>> 29c96a30 (add vrr target rate)
         estimated_presentation_time.saturating_sub(margin)
     }
 }
