@@ -5119,6 +5119,26 @@ impl Shell {
                     f(OutputSurface::Cursor(&icon.surface));
                 }
             }
+
+            if let Some(active) = self.active_space(output) {
+                if let Some(window) = active.get_fullscreen(seat) {
+                    if window_set.insert(window.surface.clone()) {
+                        f(OutputSurface::Window(&window.surface, Some(active), true));
+                    }
+                }
+
+                for space in self
+                    .workspaces
+                    .spaces_for_output(output)
+                    .filter(|w| w.handle != active.handle)
+                {
+                    if let Some(window) = space.get_fullscreen(seat) {
+                        if window_set.insert(window.surface.clone()) {
+                            f(OutputSurface::Window(&window.surface, Some(active), true));
+                        }
+                    }
+                }
+            }
         }
 
         self.workspaces
@@ -5136,11 +5156,6 @@ impl Shell {
             });
 
         if let Some(active) = self.active_space(output) {
-            if let Some(window) = active.get_fullscreen() {
-                if window_set.insert(window.clone()) {
-                    f(OutputSurface::Window(&window, Some(active), true));
-                }
-            }
             active.mapped().for_each(|mapped| {
                 for (window, _) in mapped.windows() {
                     if window_set.insert(window.clone()) {
@@ -5163,11 +5178,6 @@ impl Shell {
                 .spaces_for_output(output)
                 .filter(|w| w.handle != active.handle)
             {
-                if let Some(window) = space.get_fullscreen() {
-                    if window_set.insert(window.clone()) {
-                        f(OutputSurface::Window(&window, Some(active), false));
-                    }
-                }
                 space.mapped().for_each(|mapped| {
                     for (window, _) in mapped.windows() {
                         if window_set.insert(window.clone()) {
