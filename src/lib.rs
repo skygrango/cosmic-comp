@@ -30,7 +30,9 @@ use wayland::protocols::{
     keyboard_layout::KeyboardLayoutState, overlap_notify::OverlapNotifyState,
 };
 
-use crate::wayland::handlers::compositor::client_compositor_state;
+use crate::wayland::{
+    handlers::compositor::client_compositor_state, protocols::overlap_notify::OverlapNotifyHandler,
+};
 
 use clap_lex::RawArgs;
 
@@ -191,6 +193,21 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
             state.common.event_loop_signal.stop();
             state.common.event_loop_signal.wakeup();
             return;
+        }
+
+        let outpus: Vec<_> = state.outputs().collect();
+
+        for output in outpus {
+            let (next_deadline, clients) = state
+                .common
+                .shell
+                .read()
+                .signal_commit_timing(&output, state.common.clock.now());
+            let dh = state.common.display_handle.clone();
+
+            for (_, client) in clients {
+                client_compositor_state(&client).blocker_cleared(state, &dh);
+            }
         }
 
         // trigger routines

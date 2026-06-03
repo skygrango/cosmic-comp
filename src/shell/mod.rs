@@ -4,7 +4,7 @@ use grabs::{MenuAlignment, SeatMoveGrabState};
 use indexmap::IndexMap;
 use layout::TilingExceptions;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Mutex, atomic::Ordering},
     thread,
     time::{Duration, Instant},
@@ -39,6 +39,7 @@ use smithay::{
         utils::{
             OutputPresentationFeedback, surface_presentation_feedback_flags_from_states,
             surface_primary_scanout_output, take_presentation_feedback_surface_tree,
+            with_surfaces_surface_tree,
         },
     },
     input::{
@@ -50,11 +51,12 @@ use smithay::{
     output::{Output, WeakOutput},
     reexports::{
         wayland_protocols::ext::session_lock::v1::server::ext_session_lock_v1::ExtSessionLockV1,
-        wayland_server::{Client, protocol::wl_surface::WlSurface},
+        wayland_server::{Client, Resource, protocol::wl_surface::WlSurface},
     },
-    utils::{IsAlive, Logical, Point, Rectangle, Serial, Size},
+    utils::{IsAlive, Logical, Monotonic, Point, Rectangle, Serial, Size, Time},
     wayland::{
-        compositor::{SurfaceAttributes, get_parent, with_states},
+        commit_timing::CommitTimerBarrierStateUserData,
+        compositor::{SurfaceAttributes, SurfaceData, get_parent, with_states},
         seat::WaylandFocus,
         session_lock::LockSurface,
         shell::{
@@ -1686,6 +1688,33 @@ impl Common {
             };
         }
         self.popups.commit(surface);
+    }
+}
+
+pub enum OutputSurface<'a> {
+    Window(&'a CosmicSurface, Option<&'a Workspace>, bool),
+    Layer(&'a LayerSurface),
+    Surface(&'a WlSurface),
+    Cursor(&'a WlSurface),
+    Session(&'a WlSurface),
+}
+
+impl<'a> OutputSurface<'a> {
+    pub fn with_surfaces<F>(&self, processor: F)
+    where
+        F: FnMut(&WlSurface, &SurfaceData),
+    {
+        match self {
+            OutputSurface::Session(s) => with_surfaces_surface_tree(s, processor),
+            OutputSurface::Cursor(s) => with_surfaces_surface_tree(s, processor),
+            OutputSurface::Window(w, _space, active) => {
+                if *active {
+                    w.with_surfaces(processor)
+                }
+            }
+            OutputSurface::Layer(l) => l.with_surfaces(processor),
+            OutputSurface::Surface(s) => with_surfaces_surface_tree(s, processor),
+        }
     }
 }
 
@@ -5037,9 +5066,24 @@ impl Shell {
     ) -> OutputPresentationFeedback {
         let mut output_presentation_feedback = OutputPresentationFeedback::new(output);
 
-        if let Some(active) = self.active_space(output) {
-            active.mapped().for_each(|mapped| {
-                mapped.active_window().take_presentation_feedback(
+        self.for_each_surface_on_output(output, |toplevel| match toplevel {
+            OutputSurface::Window(window, _space, active) => {
+                if active {
+                    window.take_presentation_feedback(
+                        &mut output_presentation_feedback,
+                        surface_primary_scanout_output,
+                        |surface, _| {
+                            surface_presentation_feedback_flags_from_states(
+                                surface,
+                                None,
+                                render_element_states,
+                            )
+                        },
+                    );
+                }
+            }
+            OutputSurface::Layer(layer_surface) => {
+                layer_surface.take_presentation_feedback(
                     &mut output_presentation_feedback,
                     surface_primary_scanout_output,
                     |surface, _| {
@@ -5050,13 +5094,10 @@ impl Shell {
                         )
                     },
                 );
-            });
-        }
-
-        self.override_redirect_windows.iter().for_each(|or| {
-            if let Some(wl_surface) = or.wl_surface() {
+            }
+            OutputSurface::Surface(wl_surface) => {
                 take_presentation_feedback_surface_tree(
-                    &wl_surface,
+                    wl_surface,
                     &mut output_presentation_feedback,
                     surface_primary_scanout_output,
                     |surface, _| {
@@ -5066,7 +5107,35 @@ impl Shell {
                             render_element_states,
                         )
                     },
-                )
+                );
+            }
+            OutputSurface::Cursor(wl_surface) => {
+                take_presentation_feedback_surface_tree(
+                    wl_surface,
+                    &mut output_presentation_feedback,
+                    surface_primary_scanout_output,
+                    |surface, _| {
+                        surface_presentation_feedback_flags_from_states(
+                            surface,
+                            None,
+                            render_element_states,
+                        )
+                    },
+                );
+            }
+            OutputSurface::Session(wl_surface) => {
+                take_presentation_feedback_surface_tree(
+                    wl_surface,
+                    &mut output_presentation_feedback,
+                    surface_primary_scanout_output,
+                    |surface, _| {
+                        surface_presentation_feedback_flags_from_states(
+                            surface,
+                            None,
+                            render_element_states,
+                        )
+                    },
+                );
             }
         });
 
@@ -5099,6 +5168,196 @@ impl Shell {
                         .chain(w.minimized_windows.iter().flat_map(|m| m.mapped()))
                 }))
         })
+    }
+
+    pub fn for_each_surface_on_output(
+        &self,
+        output: &Output,
+        mut f: impl FnMut(OutputSurface<'_>),
+    ) {
+        let mut window_set = HashSet::new();
+        let mut surface_set = HashSet::new();
+        let mut layer_set = HashSet::new();
+
+        if let Some(session_lock) = self.session_lock.as_ref() {
+            if let Some(lock_surface) = session_lock.surfaces.get(output) {
+                if surface_set.insert(lock_surface.wl_surface().clone()) {
+                    f(OutputSurface::Session(lock_surface.wl_surface()));
+                }
+            }
+        }
+
+        for seat in self
+            .seats
+            .iter()
+            .filter(|seat| &seat.active_output() == output)
+        {
+            let cursor_status = seat.cursor_image_status();
+
+            if let CursorImageStatus::Surface(wl_surface) = cursor_status {
+                if surface_set.insert(wl_surface.clone()) {
+                    f(OutputSurface::Cursor(&wl_surface));
+                }
+            }
+
+            if let Some(move_grab) = seat.user_data().get::<SeatMoveGrabState>() {
+                if let Some(grab_state) = move_grab.lock().unwrap().as_ref() {
+                    for (window, _) in grab_state.element().windows() {
+                        if window_set.insert(window.clone()) {
+                            f(OutputSurface::Window(&window, None, true));
+                        }
+                    }
+                }
+            }
+
+            if let Some(icon) = get_dnd_icon(seat) {
+                if surface_set.insert(icon.surface.clone()) {
+                    f(OutputSurface::Cursor(&icon.surface));
+                }
+            }
+
+            if let Some(active) = self.active_space(output) {
+                if let Some(window) = active.get_fullscreen(seat) {
+                    if window_set.insert(window.surface.clone()) {
+                        f(OutputSurface::Window(&window.surface, Some(active), true));
+                    }
+                }
+
+                for space in self
+                    .workspaces
+                    .spaces_for_output(output)
+                    .filter(|w| w.handle != active.handle)
+                {
+                    if let Some(window) = space.get_fullscreen(seat) {
+                        if window_set.insert(window.surface.clone()) {
+                            f(OutputSurface::Window(&window.surface, Some(active), true));
+                        }
+                    }
+                }
+            }
+        }
+
+        self.workspaces
+            .sets
+            .get(output)
+            .unwrap()
+            .sticky_layer
+            .mapped()
+            .for_each(|mapped| {
+                for (window, _) in mapped.windows() {
+                    if window_set.insert(window.clone()) {
+                        f(OutputSurface::Window(&window, None, true));
+                    }
+                }
+            });
+
+        if let Some(active) = self.active_space(output) {
+            active.mapped().for_each(|mapped| {
+                for (window, _) in mapped.windows() {
+                    if window_set.insert(window.clone()) {
+                        f(OutputSurface::Window(&window, Some(active), true));
+                    }
+                }
+            });
+
+            // other (throttled) windows
+            active.minimized_windows.iter().for_each(|m| {
+                for window in m.windows() {
+                    if window_set.insert(window.clone()) {
+                        f(OutputSurface::Window(&window, Some(active), true));
+                    }
+                }
+            });
+
+            for space in self
+                .workspaces
+                .spaces_for_output(output)
+                .filter(|w| w.handle != active.handle)
+            {
+                space.mapped().for_each(|mapped| {
+                    for (window, _) in mapped.windows() {
+                        if window_set.insert(window.clone()) {
+                            f(OutputSurface::Window(&window, Some(active), false));
+                        }
+                    }
+                });
+                space.minimized_windows.iter().for_each(|m| {
+                    for window in m.windows() {
+                        if window_set.insert(window.clone()) {
+                            f(OutputSurface::Window(&window, Some(active), false));
+                        }
+                    }
+                })
+            }
+        }
+
+        // self.pending_windows.iter().for_each(|p| {
+        //     if window_set.insert(p.surface.clone()) {
+        //         f(OutputSurface::Window(&p.surface, None, false));
+        //     }
+        // });
+
+        // self.pending_layers.iter().for_each(|p| {
+        //     if layer_set.insert(p.surface.clone()) {
+        //         f(OutputSurface::Layer(&p.surface));
+        //     }
+        // });
+
+        {
+            let map = smithay::desktop::layer_map_for_output(output);
+            for layer_surface in map.layers() {
+                if layer_set.insert(layer_surface.clone()) {
+                    f(OutputSurface::Layer(layer_surface));
+                }
+            }
+        }
+
+        self.override_redirect_windows.iter().for_each(|or| {
+            // Find output the override redirect window overlaps the most with
+            let or_geo = or.geometry().as_global();
+            let max_intersect_output = self
+                .outputs()
+                .filter_map(|o| Some((o, o.geometry().intersection(or_geo)?)))
+                .max_by_key(|(_, intersection)| intersection.size.w * intersection.size.h)
+                .map(|(o, _)| o);
+            if max_intersect_output == Some(output) {
+                if let Some(wl_surface) = or.wl_surface() {
+                    f(OutputSurface::Surface(&wl_surface));
+                }
+            }
+        });
+    }
+
+    pub fn signal_commit_timing(
+        &self,
+        output: &Output,
+        until: Time<Monotonic>,
+    ) -> (
+        Option<smithay::wayland::commit_timing::Timestamp>,
+        HashMap<ClientId, Client>,
+    ) {
+        let mut clients: HashMap<ClientId, Client> = HashMap::new();
+        let mut next_deadline = None;
+        self.for_each_surface_on_output(output, |toplevel| {
+            toplevel.with_surfaces(|surface: &WlSurface, states: &SurfaceData| {
+                if let Some(mut commit_timer_state) = states
+                    .data_map
+                    .get::<CommitTimerBarrierStateUserData>()
+                    .map(|commit_timer| commit_timer.lock().unwrap())
+                {
+                    if commit_timer_state.signal_until(until) {
+                        let client = surface.client().unwrap();
+                        clients.insert(client.id(), client);
+                        if let Some(deadline) = commit_timer_state.next_deadline() {
+                            next_deadline = Some(
+                                next_deadline.map_or(deadline, |min| std::cmp::min(min, deadline)),
+                            );
+                        }
+                    }
+                }
+            });
+        });
+        (next_deadline, clients)
     }
 }
 

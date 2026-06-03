@@ -837,6 +837,7 @@ dependencies = [
  "indexmap 2.14.0",
  "jiff",
  "keyframe",
+ "libc",
  "libcosmic",
  "libdisplay-info",
  "libsystemd",
