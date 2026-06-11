@@ -13,7 +13,10 @@ use crate::{
     shell::{CosmicSurface, OutputSurface, SeatExt, Shell, grabs::SeatMoveGrabState},
     utils::prelude::OutputExt,
     wayland::{
-        handlers::{data_device::get_dnd_icon, image_copy_capture::SessionHolder},
+        handlers::{
+            compositor::client_compositor_state, data_device::get_dnd_icon,
+            image_copy_capture::SessionHolder,
+        },
         protocols::{
             a11y::A11yState,
             corner_radius::CornerRadiusState,
@@ -328,8 +331,8 @@ pub struct SurfaceDmabufFeedback {
 }
 
 #[derive(Debug)]
-struct SurfaceFrameThrottlingState {
-    last_sent_at: RefCell<Option<(WeakOutput, usize)>>,
+pub struct SurfaceFrameThrottlingState {
+    pub last_sent_at: RefCell<Option<(WeakOutput, usize)>>,
 }
 impl Default for SurfaceFrameThrottlingState {
     fn default() -> Self {
@@ -494,6 +497,7 @@ impl LockedBackend<'_> {
         xdg_activation_state: &XdgActivationState,
         startup_done: Arc<AtomicBool>,
         clock: &Clock<Monotonic>,
+        display_handle: DisplayHandle,
     ) -> Result<(), anyhow::Error> {
         let all_outputs = self.all_outputs();
 
@@ -532,6 +536,7 @@ impl LockedBackend<'_> {
                 shell.clone(),
                 startup_done,
                 clock,
+                display_handle.clone(),
             ),
             LockedBackend::Winit(state) => state.apply_config_for_outputs(test_only),
             LockedBackend::X11(state) => state.apply_config_for_outputs(test_only),
@@ -641,6 +646,20 @@ impl State {
         signal: LoopSignal,
         with_xwayland: bool,
     ) -> State {
+        // if let Ok(rtkit) = RTKit::new() {
+        //     let _ = rtkit.make_thread_realtime(RTKit::current_thread_id(), 1);
+        // }
+
+        unsafe {
+            let min_priority = libc::sched_get_priority_min(libc::SCHED_RR);
+            let sp = libc::sched_param {
+                sched_priority: min_priority,
+            };
+            if libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_RR, &sp) != 0 {
+                tracing::warn!("Failed to gain real time thread priority (Check CAP_SYS_NICE)");
+            }
+        }
+
         let requested_languages = DesktopLanguageRequester::requested_languages();
         i18n_embed::select(&*LANG_LOADER, &Localizations, &requested_languages)
             .with_context(|| "Failed to load languages")
@@ -648,7 +667,37 @@ impl State {
 
         let clock = Clock::new();
         let config = Config::load(&handle);
-        let compositor_state = CompositorState::new::<Self>(dh);
+
+        let (tx_sender, rx_receiver) = calloop::channel::channel();
+        let (commit_ping_tx, commit_ping_rx) = calloop::ping::make_ping().unwrap();
+        handle
+            .insert_source(rx_receiver, |event, _, state| {
+                if let calloop::channel::Event::Msg(msg) = event {
+                    use smithay::wayland::compositor::{CompositorEvent, CompositorHandler};
+                    #[allow(deprecated)]
+                    match msg {
+                        CompositorEvent::NewSurface(surface) => {
+                            state.new_surface(&surface);
+                        }
+                        CompositorEvent::NewSubsurface { surface, parent } => {
+                            state.new_subsurface(&surface, &parent);
+                        }
+                        CompositorEvent::Commit(surface) => {
+                            let dh = state.common.display_handle.clone();
+                            smithay::wayland::compositor::invoke_post_commit_hooks(
+                                state, &dh, &surface,
+                            );
+                            state.commit(&surface);
+                        }
+                        CompositorEvent::Destroyed(surface) => {
+                            state.destroyed(&surface);
+                        }
+                    }
+                }
+            })
+            .unwrap();
+        handle.insert_source(commit_ping_rx, |_, _, _| {}).unwrap();
+        let compositor_state = CompositorState::new::<Self>(dh, tx_sender, commit_ping_tx);
         let corner_radius_state = CornerRadiusState::new::<Self>(dh);
         let data_device_state = DataDeviceState::new::<Self>(dh);
         let dmabuf_state = DmabufState::new();
@@ -920,35 +969,6 @@ impl State {
                 }
                 // drop _fd
             }
-        }
-    }
-
-    pub fn signal_fifos(&mut self, output: &Output) {
-        let mut clients: HashMap<ClientId, Client> = HashMap::new();
-        self.common
-            .shell
-            .read()
-            .for_each_surface_on_output(output, |toplevel| {
-                toplevel.with_surfaces(|surface: &WlSurface, states: &SurfaceData| -> _ {
-                    let fifo_barrier = &states
-                        .cached_state
-                        .get::<FifoBarrierCachedState>()
-                        .current()
-                        .barrier
-                        .take();
-
-                    if let Some(fifo_barrier) = fifo_barrier {
-                        fifo_barrier.signal();
-                        let client = surface.client().unwrap();
-                        clients.insert(client.id(), client);
-                    }
-                })
-            });
-
-        let dh = self.common.display_handle.clone();
-        for (_client_id, client) in clients {
-            self.client_compositor_state(&client)
-                .blocker_cleared(self, &dh);
         }
     }
 }

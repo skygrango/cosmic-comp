@@ -7,12 +7,15 @@ use crate::{
         init_shaders, output_elements,
     },
     config::ScreenFilter,
-    shell::Shell,
-    state::SurfaceDmabufFeedback,
+    shell::{OutputSurface, Shell},
+    signal_commit_timing,
+    state::{SurfaceDmabufFeedback, SurfaceFrameThrottlingState},
     utils::prelude::*,
     wayland::handlers::{
-        compositor::recursive_frame_time_estimation,
-        image_copy_capture::{FrameHolder, PendingImageCopyData, SessionData, submit_buffer},
+        compositor::{client_compositor_state, recursive_frame_time_estimation},
+        image_copy_capture::{
+            FrameHolder, PendingImageCopyData, SessionData, SessionHolder, submit_buffer,
+        },
     },
 };
 use cosmic::widget::canvas::fill::Rule::NonZero;
@@ -60,7 +63,9 @@ use smithay::{
             utils::with_renderer_surface_state,
         },
     },
-    desktop::utils::OutputPresentationFeedback,
+    desktop::utils::{
+        OutputPresentationFeedback, send_frames_surface_tree, surface_primary_scanout_output,
+    },
     output::{Output, OutputNoMode},
     reexports::{
         calloop::{
@@ -73,12 +78,14 @@ use smithay::{
             linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_v1,
             presentation_time::server::wp_presentation_feedback,
         },
-        wayland_server::{Client, protocol::wl_surface::WlSurface},
+        wayland_server::{Client, DisplayHandle, Resource, protocol::wl_surface::WlSurface},
     },
     utils::{Clock, Monotonic, Physical, Point, Rectangle, Time, Transform},
     wayland::{
-        compositor::CompositorHandler,
+        commit_timing::CommitTimerBarrierStateUserData,
+        compositor::{CompositorHandler, SurfaceData},
         dmabuf::{DmabufFeedbackBuilder, get_dmabuf},
+        fifo::FifoBarrierCachedState,
         image_copy_capture::{
             CaptureFailureReason, Frame as ScreencopyFrame, SessionRef as ScreencopySessionRef,
         },
@@ -92,6 +99,7 @@ use wayland_backend::server::ClientId;
 
 use std::{
     borrow::{Borrow, BorrowMut},
+    cmp::min,
     collections::{HashMap, HashSet, hash_map},
     mem,
     sync::{
@@ -149,6 +157,7 @@ pub struct SurfaceThreadState {
     frame_callback_seq: usize,
     thread_sender: Sender<SurfaceCommand>,
 
+    display_handle: DisplayHandle,
     output: Output,
     mirroring: Option<Output>,
     screen_filter: ScreenFilter,
@@ -251,6 +260,7 @@ struct PrePostprocessData {
 impl Surface {
     pub fn new(
         output: &Output,
+        display_handle: DisplayHandle,
         crtc: crtc::Handle,
         connector: connector::Handle,
         primary_node: Arc<RwLock<Option<DrmNode>>>,
@@ -284,6 +294,7 @@ impl Surface {
                     tx2,
                     rx,
                     startup_done,
+                    display_handle,
                 ) {
                     error!("Surface thread crashed: {}", err);
                 }
@@ -343,14 +354,11 @@ impl Surface {
                                 Some(feedback)
                             }
                         });
-                    state.signal_fifos(&output_clone);
                 }
                 Event::Msg(SurfaceCommand::ClientBlockerCleared(clients)) => {
                     let dh = state.common.display_handle.clone();
                     for (_client_id, client) in clients {
-                        state
-                            .client_compositor_state(&client)
-                            .blocker_cleared(state, &dh);
+                        state.client_compositor_state(&client).blocker_cleared(&dh);
                     }
                 }
                 Event::Closed => {}
@@ -533,9 +541,15 @@ fn surface_thread(
     thread_sender: Sender<SurfaceCommand>,
     thread_receiver: Channel<ThreadCommand>,
     startup_done: Arc<AtomicBool>,
+    display_handle: DisplayHandle,
 ) -> Result<()> {
+    // if let Ok(rtkit) = RTKit::new() {
+    //     if let Ok(rr_max) = rtkit.max_realtime_priority() {
+    //         let _ = rtkit.make_thread_realtime(RTKit::current_thread_id(), rr_max as u32);
+    //     }
+    // }
     unsafe {
-        let min_priority = libc::sched_get_priority_min(libc::SCHED_RR);
+        let min_priority = libc::sched_get_priority_max(libc::SCHED_RR);
         let sp = libc::sched_param {
             sched_priority: min_priority,
         };
@@ -593,6 +607,7 @@ fn surface_thread(
         timings: Timings::new(None, None, false, target_node),
         frame_callback_seq: 0,
         thread_sender,
+        display_handle,
         output,
         mirroring: None,
         screen_filter,
@@ -1059,15 +1074,12 @@ impl SurfaceThreadState {
 
         let estimated_presentation = self.timings.next_presentation_time(&self.clock);
 
-        let (next_deadline, clients) = self
-            .shell
-            .read()
-            .signal_commit_timing(&self.output, self.clock.now() + estimated_presentation);
-        if clients.len() > 0 {
-            let _ = self
-                .thread_sender
-                .send(SurfaceCommand::ClientBlockerCleared(clients));
-        }
+        let next_deadline = signal_commit_timing(
+            &self.shell,
+            &self.output,
+            self.clock.now() + estimated_presentation,
+            &self.display_handle,
+        );
 
         let mut render_start = self.timings.next_render_time(&self.clock);
         if let Some(next_deadline) = next_deadline {
@@ -1158,11 +1170,11 @@ impl SurfaceThreadState {
         let mut remove_frame_flags = FrameFlags::empty();
 
         let (has_active_fullscreen, fullscreen_drives_refresh_rate, animations_going) = {
-            let shell: parking_lot::lock_api::RwLockReadGuard<'_, parking_lot::RawRwLock, Shell> = self.shell.read();
+            let shell: parking_lot::lock_api::RwLockReadGuard<'_, parking_lot::RawRwLock, Shell> =
+                self.shell.read();
             let animations_going = shell.animations_going();
             let output = self.mirroring.as_ref().unwrap_or(&self.output);
-            if let Some((_, workspace)) = shell.workspaces.active(output)
-            {
+            if let Some((_, workspace)) = shell.workspaces.active(output) {
                 let focused_fullscreen = shell.seats.iter().find_map(|seat| {
                     if &seat.active_output() == output
                         && let Some(surface) = seat
@@ -1183,10 +1195,12 @@ impl SurfaceThreadState {
                 let min_vrr_frame_time = self
                     .min_vrr_frame_time
                     .unwrap_or(Duration::from_nanos(1_000_000_000 / 30));
-                let drives_refresh_rate = focused_fullscreen.is_some_and(|surface| surface.wl_surface().is_some_and(|surface| {
-                    recursive_frame_time_estimation(&self.clock, &surface)
-                        .is_some_and(|dur| dur <= min_vrr_frame_time)
-                }));
+                let drives_refresh_rate = focused_fullscreen.is_some_and(|surface| {
+                    surface.wl_surface().is_some_and(|surface| {
+                        recursive_frame_time_estimation(&self.clock, &surface)
+                            .is_some_and(|dur| dur <= min_vrr_frame_time)
+                    })
+                });
                 (
                     has_focused_fullscreen,
                     drives_refresh_rate,
@@ -1452,6 +1466,7 @@ impl SurfaceThreadState {
             )
         };
         self.timings.draw_done(&self.clock);
+        signal_fifos(&self.shell, &self.output, &self.display_handle);
 
         match res {
             Ok(frame_result) => {
@@ -1607,9 +1622,7 @@ impl SurfaceThreadState {
 
     fn send_frame_callbacks(&mut self) {
         if self.mirroring.is_none() {
-            let _ = self
-                .thread_sender
-                .send(SurfaceCommand::SendFrames(self.frame_callback_seq));
+            self.send_frames(&self.output, Some(self.frame_callback_seq));
         }
     }
 
@@ -1617,6 +1630,110 @@ impl SurfaceThreadState {
         let _ = self
             .thread_sender
             .send(SurfaceCommand::RenderStates(states));
+    }
+
+    pub fn send_frames(&self, output: &Output, sequence: Option<usize>) {
+        let time = self.clock.now();
+        let should_send = |surface: &WlSurface, states: &SurfaceData| {
+            // Do the standard primary scanout output check. For pointer surfaces it deduplicates
+            // the frame callbacks across potentially multiple outputs, and for regular windows and
+            // layer-shell surfaces it avoids sending frame callbacks to invisible surfaces.
+            let current_primary_output = surface_primary_scanout_output(surface, states);
+            if current_primary_output.as_ref() != Some(output) {
+                return None;
+            }
+
+            let Some(sequence) = sequence else {
+                return Some(output.clone());
+            };
+
+            // Next, check the throttling status.
+            let frame_throttling_state = states
+                .data_map
+                .get_or_insert(SurfaceFrameThrottlingState::default);
+            let mut last_sent_at = frame_throttling_state.last_sent_at.borrow_mut();
+
+            let mut send = true;
+
+            // If we already sent a frame callback to this surface this output refresh
+            // cycle, don't send one again to prevent empty-damage commit busy loops.
+            if let Some((last_output, last_sequence)) = &*last_sent_at
+                && last_output == output
+                && *last_sequence == sequence
+            {
+                send = false;
+            }
+
+            if send {
+                *last_sent_at = Some((output.downgrade(), sequence));
+                Some(output.clone())
+            } else {
+                None
+            }
+        };
+        const THROTTLE: Option<Duration> = Some(Duration::from_millis(995));
+        const SCREENCOPY_THROTTLE: Option<Duration> = Some(Duration::from_nanos(16_666_666));
+
+        fn throttle(session_holder: &impl SessionHolder) -> Option<Duration> {
+            if session_holder.sessions().is_empty() && session_holder.cursor_sessions().is_empty() {
+                THROTTLE
+            } else {
+                SCREENCOPY_THROTTLE
+            }
+        }
+
+        self.shell
+            .read()
+            .for_each_surface_on_output(output, |toplevel| match toplevel {
+                OutputSurface::Session(wl_surface) => {
+                    send_frames_surface_tree(&wl_surface, output, time, None, should_send)
+                }
+                OutputSurface::Cursor(wl_surface) => send_frames_surface_tree(
+                    &wl_surface,
+                    output,
+                    time,
+                    Some(Duration::ZERO),
+                    should_send,
+                ),
+                OutputSurface::Window(window, space, active) => {
+                    let throttle = if !active && let Some(space) = space {
+                        min(throttle(space), throttle(window))
+                    } else {
+                        throttle(window)
+                    };
+                    window.send_frame(output, time, throttle, should_send);
+                }
+                OutputSurface::Layer(layer_surface) => {
+                    layer_surface.send_frame(output, time, THROTTLE, should_send);
+                }
+                OutputSurface::Surface(wl_surface) => {
+                    send_frames_surface_tree(&wl_surface, output, time, THROTTLE, should_send)
+                }
+            });
+    }
+}
+
+fn signal_fifos(shell: &Arc<parking_lot::RwLock<Shell>>, output: &Output, dh: &DisplayHandle) {
+    let mut clients: HashMap<ClientId, Client> = HashMap::new();
+    shell.read().for_each_surface_on_output(output, |toplevel| {
+        toplevel.with_surfaces(|surface: &WlSurface, states: &SurfaceData| -> _ {
+            let fifo_barrier = &states
+                .cached_state
+                .get::<FifoBarrierCachedState>()
+                .current()
+                .barrier
+                .take();
+
+            if let Some(fifo_barrier) = fifo_barrier {
+                fifo_barrier.signal();
+                let client = surface.client().unwrap();
+                clients.insert(client.id(), client);
+            }
+        })
+    });
+
+    for (_client_id, client) in clients {
+        client_compositor_state(&client).blocker_cleared(&dh);
     }
 }
 

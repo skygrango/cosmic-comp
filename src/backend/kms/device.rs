@@ -267,6 +267,7 @@ impl State {
                     self.backend.kms().primary_node.clone(),
                     conn,
                     maybe_crtc,
+                    dh.clone(),
                     (w, 0),
                     &self.common.event_loop_handle,
                     self.common.config.dynamic_conf.screen_filter().clone(),
@@ -355,6 +356,7 @@ impl State {
                         backend.primary_node.clone(),
                         conn,
                         maybe_crtc,
+                        self.common.display_handle.clone(),
                         (w, 0),
                         &self.common.event_loop_handle,
                         self.common.config.dynamic_conf.screen_filter().clone(),
@@ -524,6 +526,7 @@ impl State {
                             if let Some(crtc) = maybe_crtc {
                                 match Surface::new(
                                     &output,
+                                    dh.clone(),
                                     crtc,
                                     conn,
                                     backend.primary_node.clone(),
@@ -564,6 +567,7 @@ impl State {
                             backend.primary_node.clone(),
                             conn,
                             maybe_crtc,
+                            dh.clone(),
                             (w, 0),
                             &self.common.event_loop_handle,
                             self.common.config.dynamic_conf.screen_filter().clone(),
@@ -687,6 +691,7 @@ impl State {
             &self.common.xdg_activation_state,
             self.common.startup_done.clone(),
             &self.common.clock,
+            self.common.display_handle.clone(),
         )?;
         self.common.refresh();
         Ok(())
@@ -1031,6 +1036,7 @@ impl InnerDevice {
         primary_node: Arc<RwLock<Option<DrmNode>>>,
         conn: connector::Handle,
         maybe_crtc: Option<crtc::Handle>,
+        display_handle: DisplayHandle,
         position: (u32, u32),
         evlh: &LoopHandle<'static, State>,
         screen_filter: ScreenFilter,
@@ -1091,6 +1097,7 @@ impl InnerDevice {
             let has_surface = if let Some(crtc) = maybe_crtc {
                 match Surface::new(
                     &output,
+                    display_handle,
                     crtc,
                     conn,
                     primary_node,

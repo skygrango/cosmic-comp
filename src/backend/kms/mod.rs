@@ -768,6 +768,7 @@ impl KmsGuard<'_> {
         shell: Arc<parking_lot::RwLock<Shell>>,
         startup_done: Arc<AtomicBool>,
         clock: &Clock<Monotonic>,
+        display_handle: DisplayHandle,
     ) -> Result<(), anyhow::Error> {
         if !self.session.is_active() {
             return Ok(());
@@ -870,6 +871,7 @@ impl KmsGuard<'_> {
                         self.primary_node.clone(),
                         conn,
                         Some(crtc),
+                        display_handle.clone(),
                         (w, 0),
                         loop_handle,
                         screen_filter.clone(),
