@@ -170,6 +170,13 @@ impl CompositorHandler for State {
         client_compositor_state(client)
     }
 
+    // fn schedule_render(&mut self, surface: &WlSurface) {
+    //     let shell = self.common.shell.read();
+    //     if let Some(output) = shell.visible_output_for_surface(surface) {
+    //         self.backend.schedule_render(output);
+    //     }
+    // }
+
     fn new_surface(&mut self, surface: &WlSurface) {
         add_pre_commit_hook::<Self, _>(surface, move |state, _dh, surface| {
             let mut acquire_point = None;
@@ -202,9 +209,7 @@ impl CompositorHandler for State {
                             .event_loop_handle
                             .insert_source(source, move |_, _, state| {
                                 let dh = state.common.display_handle.clone();
-                                state
-                                    .client_compositor_state(&client)
-                                    .blocker_cleared(state, &dh);
+                                state.client_compositor_state(&client).blocker_cleared(&dh);
                                 Ok(())
                             });
                     if res.is_ok() {
@@ -220,9 +225,7 @@ impl CompositorHandler for State {
                             .event_loop_handle
                             .insert_source(source, move |_, _, state| {
                                 let dh = state.common.display_handle.clone();
-                                state
-                                    .client_compositor_state(&client)
-                                    .blocker_cleared(state, &dh);
+                                state.client_compositor_state(&client).blocker_cleared(&dh);
                                 Ok(())
                             });
                     if res.is_ok() {
