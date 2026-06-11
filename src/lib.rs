@@ -8,16 +8,24 @@
 
 use calloop::timer::{TimeoutAction, Timer};
 use smithay::{
+    output::Output,
     reexports::{
         calloop::{EventLoop, Interest, Mode, PostAction, generic::Generic},
-        wayland_server::{Display, DisplayHandle},
+        wayland_server::{
+            Client, Display, DisplayHandle, Resource, protocol::wl_surface::WlSurface,
+        },
     },
-    wayland::socket::ListeningSocketSource,
+    utils::{Monotonic, Time},
+    wayland::{
+        commit_timing::CommitTimerBarrierStateUserData, compositor::SurfaceData,
+        socket::ListeningSocketSource,
+    },
 };
 
 use anyhow::{Context, Result};
 use state::{LastRefresh, State};
 use std::{
+    collections::HashMap,
     env,
     ffi::OsString,
     os::unix::process::CommandExt,
@@ -27,9 +35,14 @@ use std::{
 };
 use tracing::{error, info, warn};
 use wayland::protocols::overlap_notify::OverlapNotifyState;
+use wayland_backend::server::ClientId;
 
-use crate::wayland::{
-    handlers::compositor::client_compositor_state, protocols::overlap_notify::OverlapNotifyHandler,
+use crate::{
+    shell::Shell,
+    wayland::{
+        handlers::compositor::client_compositor_state,
+        protocols::overlap_notify::OverlapNotifyHandler,
+    },
 };
 
 use clap_lex::RawArgs;
@@ -192,16 +205,12 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
         let outpus: Vec<_> = state.outputs().collect();
 
         for output in outpus {
-            let (next_deadline, clients) = state
-                .common
-                .shell
-                .read()
-                .signal_commit_timing(&output, state.common.clock.now());
-            let dh = state.common.display_handle.clone();
-
-            for (_, client) in clients {
-                client_compositor_state(&client).blocker_cleared(state, &dh);
-            }
+            let _ = signal_commit_timing(
+                &state.common.shell,
+                &output,
+                state.common.clock.now(),
+                &state.common.display_handle,
+            );
         }
 
         // trigger routines
@@ -209,7 +218,7 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
         {
             let dh = state.common.display_handle.clone();
             for client in clients.values() {
-                client_compositor_state(client).blocker_cleared(state, &dh);
+                client_compositor_state(client).blocker_cleared(&dh);
             }
         }
 
@@ -349,4 +358,38 @@ fn refresh(state: &mut State) {
     OverlapNotifyState::refresh(state);
     state.common.update_x11_stacking_order();
     state.last_refresh = LastRefresh::At(Instant::now());
+}
+
+pub fn signal_commit_timing(
+    shell: &Arc<parking_lot::RwLock<Shell>>,
+    output: &Output,
+    until: Time<Monotonic>,
+    dh: &DisplayHandle,
+) -> Option<smithay::wayland::commit_timing::Timestamp> {
+    let mut clients: HashMap<ClientId, Client> = HashMap::new();
+    let mut next_deadline = None;
+    shell.read().for_each_surface_on_output(output, |toplevel| {
+        toplevel.with_surfaces(|surface: &WlSurface, states: &SurfaceData| {
+            if let Some(mut commit_timer_state) = states
+                .data_map
+                .get::<CommitTimerBarrierStateUserData>()
+                .map(|commit_timer| commit_timer.lock().unwrap())
+            {
+                if commit_timer_state.signal_until(until) {
+                    let client = surface.client().unwrap();
+                    clients.insert(client.id(), client);
+                    if let Some(deadline) = commit_timer_state.next_deadline() {
+                        next_deadline = Some(
+                            next_deadline.map_or(deadline, |min| std::cmp::min(min, deadline)),
+                        );
+                    }
+                }
+            }
+        });
+    });
+
+    for (_client_id, client) in clients {
+        client_compositor_state(&client).blocker_cleared(&dh);
+    }
+    next_deadline
 }

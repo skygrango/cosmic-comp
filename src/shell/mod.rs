@@ -5242,38 +5242,6 @@ impl Shell {
             }
         });
     }
-
-    pub fn signal_commit_timing(
-        &self,
-        output: &Output,
-        until: Time<Monotonic>,
-    ) -> (
-        Option<smithay::wayland::commit_timing::Timestamp>,
-        HashMap<ClientId, Client>,
-    ) {
-        let mut clients: HashMap<ClientId, Client> = HashMap::new();
-        let mut next_deadline = None;
-        self.for_each_surface_on_output(output, |toplevel| {
-            toplevel.with_surfaces(|surface: &WlSurface, states: &SurfaceData| {
-                if let Some(mut commit_timer_state) = states
-                    .data_map
-                    .get::<CommitTimerBarrierStateUserData>()
-                    .map(|commit_timer| commit_timer.lock().unwrap())
-                {
-                    if commit_timer_state.signal_until(until) {
-                        let client = surface.client().unwrap();
-                        clients.insert(client.id(), client);
-                        if let Some(deadline) = commit_timer_state.next_deadline() {
-                            next_deadline = Some(
-                                next_deadline.map_or(deadline, |min| std::cmp::min(min, deadline)),
-                            );
-                        }
-                    }
-                }
-            });
-        });
-        (next_deadline, clients)
-    }
 }
 
 fn workspace_set_idx(

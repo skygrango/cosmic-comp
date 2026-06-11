@@ -165,6 +165,7 @@ impl State {
             &self.common.xdg_activation_state,
             self.common.startup_done.clone(),
             &self.common.clock,
+            self.common.display_handle.clone(),
         );
         if let Err(err) = res {
             warn!("Failed to apply config. Resetting: {:?}", err);
@@ -188,6 +189,7 @@ impl State {
                     &self.common.xdg_activation_state,
                     self.common.startup_done.clone(),
                     &self.common.clock,
+                    self.common.display_handle.clone(),
                 )
             {
                 error!("Failed to reset output config: {:?}", err);

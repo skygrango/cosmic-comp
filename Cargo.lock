@@ -868,6 +868,7 @@ dependencies = [
  "sanitize-filename",
  "serde",
  "serde_json",
+ "smallvec",
  "smithay",
  "smithay-egui",
  "thiserror 2.0.18",
@@ -4925,7 +4926,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 [[package]]
 name = "smithay"
 version = "0.7.0"
-source = "git+https://github.com/smithay/smithay.git?rev=85f83ab#85f83ab61711e725aa1f3481df4f4dc5370e925b"
+source = "git+https://github.com/skygrango/smithay?rev=20b92aa#20b92aa17d2e0e8a097d6cd2f77ca687830f5d32"
 dependencies = [
  "aliasable",
  "appendlist",
@@ -6656,9 +6657,9 @@ checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
 
 [[package]]
 name = "winit"
-version = "0.30.12"
+version = "0.30.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c66d4b9ed69c4009f6321f762d6e61ad8a2389cd431b97cb1e146812e9e6c732"
+checksum = "a6755fa58a9f8350bd1e472d4c3fcc25f824ec358933bba33306d0b63df5978d"
 dependencies = [
  "ahash",
  "android-activity",

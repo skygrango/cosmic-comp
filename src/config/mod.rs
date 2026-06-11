@@ -25,6 +25,7 @@ pub use smithay::{
             AccelProfile, ClickMethod, Device as InputDevice, ScrollMethod, SendEventsMode,
             TapButtonMap,
         },
+        wayland_server::DisplayHandle as DH,
     },
     utils::{Logical, Physical, Point, SERIAL_COUNTER, Size, Transform},
 };
@@ -42,7 +43,7 @@ mod input_config;
 pub mod key_bindings;
 mod types;
 
-use cosmic::config::CosmicTk;
+use cosmic::{config::CosmicTk, iced::window::raw_window_handle::DisplayHandle};
 pub use cosmic_comp_config::EdidProduct;
 use cosmic_comp_config::{
     ActivationPolicy, AppearanceConfig, CosmicCompConfig, KeyboardConfig, TileBehavior, XkbConfig,
@@ -407,6 +408,7 @@ impl Config {
         xdg_activation_state: &XdgActivationState,
         startup_done: Arc<AtomicBool>,
         clock: &Clock<Monotonic>,
+        display_handle: DH,
     ) -> anyhow::Result<()> {
         let outputs = output_state.outputs().collect::<Vec<_>>();
         let mut infos = outputs
@@ -474,6 +476,7 @@ impl Config {
                 xdg_activation_state,
                 startup_done.clone(),
                 clock,
+                display_handle.clone(),
             ) {
                 warn!(?err, "Failed to set new config.");
                 found_outputs.clear();
@@ -497,6 +500,7 @@ impl Config {
                         xdg_activation_state,
                         startup_done,
                         clock,
+                        display_handle.clone(),
                     )
                     .context("Failed to reset config")?;
 
@@ -556,6 +560,7 @@ impl Config {
                     xdg_activation_state,
                     startup_done.clone(),
                     clock,
+                    display_handle.clone(),
                 )
                 .context("Failed to set new config")?;
 

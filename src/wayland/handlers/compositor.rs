@@ -202,9 +202,7 @@ impl CompositorHandler for State {
                             .event_loop_handle
                             .insert_source(source, move |_, _, state| {
                                 let dh = state.common.display_handle.clone();
-                                state
-                                    .client_compositor_state(&client)
-                                    .blocker_cleared(state, &dh);
+                                state.client_compositor_state(&client).blocker_cleared(&dh);
                                 Ok(())
                             });
                     if res.is_ok() {
@@ -220,9 +218,7 @@ impl CompositorHandler for State {
                             .event_loop_handle
                             .insert_source(source, move |_, _, state| {
                                 let dh = state.common.display_handle.clone();
-                                state
-                                    .client_compositor_state(&client)
-                                    .blocker_cleared(state, &dh);
+                                state.client_compositor_state(&client).blocker_cleared(&dh);
                                 Ok(())
                             });
                     if res.is_ok() {
