@@ -518,11 +518,11 @@ impl State {
                                 .map(|(target, pos)| (target, pos.as_logical()));
 
                             // TODO: We might need a solution that allows constraints to bypass the surface without affecting the constraints themselves
-                            if new_under.as_ref().and_then(|(under, _)| under.wl_surface())
-                                != surface.wl_surface()
-                            {
-                                return (false, None);
-                            }
+                            // if new_under.as_ref().and_then(|(under, _)| under.wl_surface())
+                            //     != surface.wl_surface()
+                            // {
+                            //     return (false, None);
+                            // }
 
                             match surface {
                                 PointerFocusTarget::WlSurface { surface, .. } => {
@@ -2386,6 +2386,7 @@ impl State {
                         return false;
                     }
 
+<<<<<<< HEAD
                     with_pointer_constraint(surface, pointer, |constraint| {
                         if let Some(constraint) = constraint
                             && let Some(region) = constraint.region()
@@ -2395,6 +2396,19 @@ impl State {
                         }
                         true
                     })
+=======
+                    true
+
+                    // with_pointer_constraint(surface, pointer, |constraint| {
+                    //     if let Some(constraint) = constraint
+                    //         && let Some(region) = constraint.region()
+                    //     {
+                    //         let point_in_surface = (p - surface_offset.to_f64()).to_i32_round();
+                    //         return region.contains(point_in_surface);
+                    //     }
+                    //     true
+                    // })
+>>>>>>> 719526df (lock-free commit)
                 };
 
                 let workspace_origin = output.geometry().loc.to_f64();

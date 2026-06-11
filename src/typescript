@@ -1,0 +1,158 @@
+Script started on 2026-06-19 04:36:47+08:00 [COMMAND="WAYLAND_DEBUG=1 steam" TERM="xterm-256color" TTY="/dev/pts/1" COLUMNS="-1" LINES="-1"]
+[0msteam.sh[394465]: Starting SteamRT3 Steam[0m
+[0mCProcessEnvironmentManager is ready, 6 preallocated environment variables.[0m
+[0mRunCommand:  /home/menter/.local/share/Steam/steamrt64/pv-runtime/steam-runtime-steamrt/bin/steam-runtime-check-requirements 2>/dev/null >/dev/null[0m
+[0m[0m
+[0mStarting program with command-launcher service.[0m
+[0m[0m
+[0mTo run commands alongside the Steam client, use a command like:[0m
+[0m[0m
+[0msteam-runtime-launch-client \[0m
+[0m	--bus-name=com.steampowered.PressureVessel.LaunchAlongsideSteam \[0m
+[0m	-- \[0m
+[0m	bash[0m
+[0m[0m
+[0mbus_name=com.steampowered.PressureVessel.LaunchAlongsideSteam[0m
+[0m[2026-06-19 04:36:48] Startup - updater built Jun 13 2026 02:43:57[0m
+[0m[2026-06-19 04:36:48] Startup - Steam Client launched with: '/home/menter/.local/share/Steam/steamrt64/steam' '-srt-logger-opened'[0m
+[0m[2026-06-19 04:36:48] Opted in to client beta 'publicbeta' via beta file[0m
+[0mYou are in the 'publicbeta' client beta.[0m
+[0m06/19 04:36:48 minidumps folder is set to /tmp/dumps[0m
+[0m06/19 04:36:48 Init: Installing breakpad exception handler for appid(steam)/version(1781329812)/tid(394488)[0m
+[0mLooks like steam didn't shutdown cleanly, scheduling immediate update check[0m
+[0mCProcessEnvironmentManager is ready, 6 preallocated environment variables.[0m
+[0m[2026-06-19 04:36:48] Loading cached metrics from disk (/home/menter/.local/share/Steam/package/steam_client_metrics.bin)[0m
+[0m[2026-06-19 04:36:48] Using the following download hosts for Public, Realm steamglobal[0m
+[0m[2026-06-19 04:36:48] 1. https://client-update.fastly.steamstatic.com, /, Realm 'steamglobal', weight was 900, source = 'update_hosts_cached.vdf'[0m
+[0m[2026-06-19 04:36:48] 2. https://client-update.akamai.steamstatic.com, /, Realm 'steamglobal', weight was 400, source = 'update_hosts_cached.vdf'[0m
+[0m[2026-06-19 04:36:48] 3. https://client-update.steamstatic.com, /, Realm 'steamglobal', weight was 1, source = 'baked in'[0m
+[0m[2026-06-19 04:36:48] Checking for update on startup[0m
+[0m[2026-06-19 04:36:48] 正在檢查可用更新…[0m
+[0m[2026-06-19 04:36:48] Downloading manifest: https://client-update.fastly.steamstatic.com/steam_client_publicbeta_ubuntu12[0m
+[0m[2026-06-19 04:36:48] Manifest download: send request[0m
+[0m[2026-06-19 04:36:48] Process started with command-line: '/home/menter/.local/share/Steam/steamrt64/steam' '-child-update-ui' '-child-update-ui-socket' '9' '-srt-logger-opened'[0m
+[0m06/19 04:36:48 minidumps folder is set to /tmp/dumps[0m
+[0m[2026-06-19 04:36:48] Using update UI: xwin[0m
+[0m06/19 04:36:48 Init: Installing breakpad exception handler for appid(steam)/version(0)/tid(394502)[0m
+[0m[2026-06-19 04:36:48] Create window[0m
+[0m[2026-06-19 04:36:48] Set percent complete: 0[0m
+[0m[2026-06-19 04:36:48] Set status message: 正在檢查可用更新…[0m
+[0m[2026-06-19 04:36:48] Set percent complete: -1[0m
+[0m[2026-06-19 04:36:48] Manifest download: waiting for download to finish[0m
+[0m[2026-06-19 04:36:48] Manifest download: finished[0m
+[0m[2026-06-19 04:36:48] Download skipped: /steam_client_publicbeta_ubuntu12 version 1781329812, installed version 1781329812, existing pending version 0[0m
+[0m[2026-06-19 04:36:48] Nothing to do[0m
+[0m[2026-06-19 04:36:48] 正在確認安裝…[0m
+[0m[2026-06-19 04:36:48] Verifying all executable checksums[0m
+[0m[2026-06-19 04:36:48] Set percent complete: -1[0m
+[0m[2026-06-19 04:36:48] Set status message: 正在確認安裝…[0m
+
+[0m[2026-06-19 04:36:49] Verification complete[0m
+[0mUpdateUI: skip show logo[0m
+[0mSkipping ~/.steam/steam symlink, dev environment detected[0m
+[0mUpdating symlink: /home/menter/.steam/bin32 -> /home/menter/.local/share/Steam/steamrt32[0m
+[0mUpdating symlink: /home/menter/.steam/bin64 -> /home/menter/.local/share/Steam/steamrt64[0m
+[0mUpdating symlink: /home/menter/.steam/sdk32 -> /home/menter/.local/share/Steam/linux32[0m
+[0mUpdating symlink: /home/menter/.steam/sdk64 -> /home/menter/.local/share/Steam/linux64[0m
+[0mUpdating symlink: /home/menter/.steam/root -> /home/menter/.local/share/Steam/[0m
+[0msrt-logger: disabled, already open[0m
+[0mReexecToLauncher: opted into beta[0m
+[0mReexecToLauncher: opted into steamrt3 client[0m
+[0mReexecToLauncher: don't have a valid steamrt64/steam executable[0m
+[0mReexecToLauncher: proceeding in current environment[0m
+[0m[2026-06-19 04:36:49] Shutdown[0m
+[0m[2026-06-19 04:36:49] ProcessNextMessage: socket disconnected[0m
+[0m[2026-06-19 04:36:49] No more messages are expected - exiting[0m
+[0mReexecSteamLinux: received re-exec request with code: 67 steamrt: 0[0m
+[0mReexecSteamLinux: re-launching steam in SteamRT runtime[0m
+[0mCProcessEnvironmentManager is ready, 6 preallocated environment variables.[0m
+[0m[2026-06-19 04:36:50] Startup - updater built Jun 13 2026 02:43:57[0m
+[0m[2026-06-19 04:36:50] Startup - Steam Client launched with: '/home/menter/.local/share/Steam/steamrt64/steam' '-srt-logger-opened'[0m
+[0m[2026-06-19 04:36:50] Opted in to client beta 'publicbeta' via beta file[0m
+[0mYou are in the 'publicbeta' client beta.[0m
+[0m06/19 04:36:50 minidumps folder is set to /tmp/dumps[0m
+[0m06/19 04:36:50 Init: Installing breakpad exception handler for appid(steam)/version(1781329812)/tid(394635)[0m
+[0mCProcessEnvironmentManager is ready, 6 preallocated environment variables.[0m
+[0m[2026-06-19 04:36:50] Loading cached metrics from disk (/home/menter/.local/share/Steam/package/steam_client_metrics.bin)[0m
+[0m[2026-06-19 04:36:50] Using the following download hosts for Public, Realm steamglobal[0m
+[0m[2026-06-19 04:36:50] 1. https://client-update.akamai.steamstatic.com, /, Realm 'steamglobal', weight was 400, source = 'update_hosts_cached.vdf'[0m
+[0m[2026-06-19 04:36:50] 2. https://client-update.fastly.steamstatic.com, /, Realm 'steamglobal', weight was 900, source = 'update_hosts_cached.vdf'[0m
+[0m[2026-06-19 04:36:50] 3. https://client-update.steamstatic.com, /, Realm 'steamglobal', weight was 1, source = 'baked in'[0m
+[0m[2026-06-19 04:36:50] 正在確認安裝…[0m
+[0m[2026-06-19 04:36:50] Verifying file sizes only[0m
+[0m[2026-06-19 04:36:50] Process started with command-line: '/home/menter/.local/share/Steam/steamrt64/steam' '-child-update-ui' '-child-update-ui-socket' '8' '-srt-logger-opened'[0m
+[0m06/19 04:36:50 minidumps folder is set to /tmp/dumps[0m
+[0m[2026-06-19 04:36:50] Using update UI: console[0m
+[0m06/19 04:36:50 Init: Installing breakpad exception handler for appid(steam)/version(0)/tid(394637)[0m
+[0m[2026-06-19 04:36:50] Create window[0m
+[0m[2026-06-19 04:36:50] Set percent complete: 0[0m
+[0m[2026-06-19 04:36:50] Set percent complete: -1[0m
+[0m[2026-06-19 04:36:50] Set status message: 正在確認安裝…[0m
+[0m[----] 正在確認安裝…[0m
+[0m[2026-06-19 04:36:50] Verification complete[0m
+[0mUpdateUI: skip show logo[0m
+[0mReexecToLauncher: opted into beta[0m
+[0mReexecToLauncher: opted into steamrt3 client[0m
+[0mReexecToLauncher: don't have a valid steamrt64/steam executable[0m
+[0mReexecToLauncher: proceeding in current environment[0m
+[0m[2026-06-19 04:36:50] Destroy window[0m
+[0m[0m
+[0mSteam logging initialized: directory: /home/menter/.local/share/Steam/logs[0m
+[0m[0m
+[0m[2026-06-19 04:36:50] ProcessNextMessage: socket disconnected[0m
+[0m[2026-06-19 04:36:50] No more messages are expected - exiting[0m
+[0mXOpenIM() failed, LANG = en_US.UTF-8[0m
+[0mXOpenIM() failed, LANG = en_US.UTF-8[0m[0m<6>steam-runtime-launcher-service[394489]: I: Running spawn command lspci[0m
+[0mXRRGetOutputInfo Workaround: initialized with override: 0 real: 0x7f775f004a10[0m
+[0mXRRGetCrtcInfo Workaround: initialized with override: 0 real: 0x7f775f003350[0m
+[0m06/19 04:36:51 minidumps folder is set to /tmp/dumps[0m
+[0m06/19 04:36:51 Init: Installing breakpad exception handler for appid(steamsysinfo)/version(1781329812)/tid(394656)[0m
+[0mRunning query: 1 - GpuTopology[0m
+[0mResponse: gpu_topology {[0m
+[0m  gpus {[0m
+[0m    id: 1[0m
+[0m    name: "AMD Radeon RX 7900 XTX (RADV NAVI31)"[0m
+[0m    vram_size_bytes: 25753026560[0m
+[0m    driver_id: k_EGpuDriverId_MesaRadv[0m
+[0m    driver_version_major: 26[0m
+[0m    driver_version_minor: 1[0m
+[0m    driver_version_patch: 99[0m
+[0m    luid: 0[0m
+[0m  }[0m
+[0m  gpus {[0m
+[0m    id: 2[0m
+[0m    name: "llvmpipe (LLVM 22.1.6, 256 bits)"[0m
+[0m    vram_size_bytes: 3221225472[0m
+[0m    driver_id: k_EGpuDriverId_MesaLLVMPipe[0m
+[0m    driver_version_major: 26[0m
+[0m    driver_version_minor: 1[0m
+[0m    driver_version_patch: 99[0m
+[0m    luid: 0[0m
+[0m  }[0m
+[0m  default_gpu_id: 1[0m
+[0m}[0m
+[0m[0m
+[0mExit code: 0[0m
+[0mSaving response to: /tmp/steamkjhiGp - 116 bytes[0m
+[0msteam-runtime-launcher-service[394489]: I: Running spawn command lspci[0m
+[0m06/19 04:36:51 minidumps folder is set to /tmp/dumps[0m
+[0m[0619/043651.234315:ERROR:context.cc(107)] The browser_subprocess_path directory (./steamwebhelper) is not an absolute path. Defaulting to empty.[0m
+[0m[0619/043651.273267:WARNING:crash_reporting.cc(271)] Failed to set crash key: UserID with value: 0[0m
+[0m[0619/043651.273310:WARNING:crash_reporting.cc(271)] Failed to set crash key: BuildID with value: 1781329812[0m
+[0m[0619/043651.273312:WARNING:crash_reporting.cc(271)] Failed to set crash key: SteamUniverse with value: Public[0m
+[0m[0619/043651.273315:WARNING:crash_reporting.cc(271)] Failed to set crash key: Vendor with value: Valve[0m
+[0m[0619/043651.273316:WARNING:crash_reporting.cc(271)] Failed to set crash key: Platform with value: Linux[0m
+[0m[0619/043651.274501:WARNING:crash_reporting.cc(271)] Failed to set crash key: UserID with value: 0[0m
+[0m[0619/043651.274539:WARNING:crash_reporting.cc(271)] Failed to set crash key: BuildID with value: 1781329812[0m
+[0m[0619/043651.274542:WARNING:crash_reporting.cc(271)] Failed to set crash key: SteamUniverse with value: Public[0m
+[0m[0619/043651.274544:WARNING:crash_reporting.cc(271)] Failed to set crash key: Vendor with value: Valve[0m
+[0m[0619/043651.274546:WARNING:crash_reporting.cc(271)] Failed to set crash key: Platform with value: Linux[0m
+[0mGtk-Message: 04:36:51.301: Failed to load module "window-decorations-gtk-module"[0m
+[0mGtk-Message: 04:36:51.301: Failed to load module "colorreload-gtk-module"[0m
+^[[C^[[C[0m[0619/043651.631787:WARNING:crash_reporting.cc(271)] Failed to set crash key: UserID with value: 0[0m
+[0m[0619/043651.631827:WARNING:crash_reporting.cc(271)] Failed to set crash key: BuildID with value: 1781329812[0m
+[0m[0619/043651.631830:WARNING:crash_reporting.cc(271)] Failed to set crash key: SteamUniverse with value: Public[0m
+[0m[0619/043651.631832:WARNING:crash_reporting.cc(271)] Failed to set crash key: Vendor with value: Valve[0m
+[0m[0619/043651.631835:WARNING:crash_reporting.cc(271)] Failed to set crash key: Platform with value: Linux[0m
+^[[D^C
+Script done on 2026-06-19 04:36:52+08:00 [COMMAND_EXIT_CODE="130"]

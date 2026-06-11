@@ -381,6 +381,7 @@ pub fn init_backend(
             &state.common.xdg_activation_state,
             state.common.startup_done.clone(),
             &state.common.clock,
+            state.common.display_handle.clone(),
         ) {
             error!("Unrecoverable output configuration error: {}", err);
         }
