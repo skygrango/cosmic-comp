@@ -145,4 +145,4 @@ cosmic-protocols = { git = "https://github.com/skygrango/cosmic-protocols", bran
 cosmic-client-toolkit = { git = "https://github.com/skygrango/cosmic-protocols", branch = "vrr_target_rate" }
 
 [patch.crates-io]
-smithay = { git = "https://github.com/skygrango/smithay", rev = "20b92aa" }
+smithay = { git = "https://github.com/skygrango/smithay", rev = "3c60355" }
