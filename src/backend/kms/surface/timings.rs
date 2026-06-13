@@ -437,9 +437,10 @@ impl Timings {
         }
 
         // HACK: Nvidia returns `page_flip`/`commit` early, so we have no information to optimize latency on submission.
-        if self.vendor == Some(0x10de) {
-            return Duration::ZERO;
-        }
+        // Disable for testing
+        // if self.vendor == Some(0x10de) {
+        //     return Duration::ZERO;
+        // }
 
         let margin = if self.vrr {
             let Some(sample_rendertime) = self.avg_frametime(SAMPLE_TIME_WINDOW) else {
