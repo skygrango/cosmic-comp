@@ -669,7 +669,7 @@ impl State {
         let config = Config::load(&handle);
 
         let (tx_sender, rx_receiver) = calloop::channel::channel();
-        let (commit_ping_tx, commit_ping_rx) = calloop::ping::make_ping().unwrap();
+        //let (commit_ping_tx, commit_ping_rx) = calloop::ping::make_ping().unwrap();
         handle
             .insert_source(rx_receiver, |event, _, state| {
                 if let calloop::channel::Event::Msg(msg) = event {
@@ -696,8 +696,8 @@ impl State {
                 }
             })
             .unwrap();
-        handle.insert_source(commit_ping_rx, |_, _, _| {}).unwrap();
-        let compositor_state = CompositorState::new::<Self>(dh, tx_sender, commit_ping_tx);
+        //handle.insert_source(commit_ping_rx, |_, _, _| {}).unwrap();
+        let compositor_state = CompositorState::new::<Self>(dh, tx_sender);
         let corner_radius_state = CornerRadiusState::new::<Self>(dh);
         let data_device_state = DataDeviceState::new::<Self>(dh);
         let dmabuf_state = DmabufState::new();
