@@ -357,6 +357,8 @@ fn refresh(state: &mut State) {
     state::Common::refresh_focus(state);
     OverlapNotifyState::refresh(state);
     state.common.update_x11_stacking_order();
-    KeyboardLayoutState::refresh(state);
+    if let state::BackendData::Kms(kms) = &mut state.backend {
+        kms.cleanup_renderer_caches();
+    }
     state.last_refresh = LastRefresh::At(Instant::now());
 }
