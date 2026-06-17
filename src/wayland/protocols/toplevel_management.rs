@@ -242,6 +242,9 @@ where
                             .rectangles
                             .retain(|(s, _)| s.id() != surface.id());
                     } else {
+                        toplevel_state
+                            .rectangles
+                            .retain(|(s, _)| s.id() != surface.id());
                         toplevel_state.rectangles.push((
                             surface.downgrade(),
                             Rectangle::new((x, y).into(), (width, height).into()),
