@@ -2360,6 +2360,7 @@ impl State {
         surface: &WlSurface,
         pointer: &PointerHandle<Self>,
         mut location: Point<f64, Logical>,
+        constraint: Option<&PointerConstraint>,
     ) {
         let Some(client) = surface.client() else {
             return;
@@ -2384,15 +2385,23 @@ impl State {
                         return false;
                     }
 
-                    with_pointer_constraint(surface, pointer, |constraint| {
-                        if let Some(constraint) = constraint
-                            && let Some(region) = constraint.region()
-                        {
+                    if let Some(constraint) = constraint {
+                        if let Some(region) = constraint.region() {
                             let point_in_surface = (p - surface_offset.to_f64()).to_i32_floor();
                             return region.contains(point_in_surface);
                         }
                         true
-                    })
+                    } else {
+                        with_pointer_constraint(&surface, &pointer, |constraint| {
+                            if let Some(constraint) = constraint
+                                && let Some(region) = constraint.region()
+                            {
+                                let point_in_surface = (p - surface_offset.to_f64()).to_i32_floor();
+                                return region.contains(point_in_surface);
+                            }
+                            true
+                        })
+                    }
                 };
 
                 let workspace_origin = output.geometry().loc.to_f64();

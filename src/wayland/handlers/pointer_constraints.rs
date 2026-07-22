@@ -76,27 +76,6 @@ impl PointerConstraintsHandler for State {
         }
     }
 
-    fn remove_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
-        if with_pointer_constraint(surface, pointer, |constraint| constraint.is_none()) {
-            let seat = self
-                .common
-                .shell
-                .read()
-                .seats
-                .iter()
-                .find(|s| s.get_pointer().as_ref() == Some(pointer))
-                .cloned();
-
-            if let Some(seat) = seat
-                && let Some((hint_surface, hint_location)) = seat.pointer_constraint_hint()
-                && hint_surface == *surface
-            {
-                self.apply_cursor_hint(surface, pointer, hint_location);
-                seat.set_pointer_constraint_hint(None);
-            }
-        }
-    }
-
     fn cursor_position_hint(
         &mut self,
         surface: &WlSurface,

@@ -6,7 +6,15 @@ use crate::{
     state::State,
     utils::prelude::SeatExt,
 };
-use smithay::input::{SeatHandler, SeatState, keyboard::LedState, pointer::CursorImageStatus};
+use smithay::{
+    input::{
+        SeatHandler, SeatState,
+        keyboard::LedState,
+        pointer::{CursorImageStatus, PointerHandle},
+    },
+    reexports::wayland_server::protocol::wl_surface::WlSurface,
+    wayland::pointer_constraints::PointerConstraint,
+};
 
 impl SeatHandler for State {
     type KeyboardFocus = KeyboardFocusTarget;
@@ -32,5 +40,29 @@ impl SeatHandler for State {
         let userdata = seat.user_data();
         let devices = userdata.get::<Devices>().unwrap();
         devices.update_led_state(led_state);
+    }
+
+    fn remove_constraint(
+        &mut self,
+        surface: &WlSurface,
+        pointer: &PointerHandle<Self>,
+        constraint: Option<&PointerConstraint>,
+    ) {
+        let seat = self
+            .common
+            .shell
+            .read()
+            .seats
+            .iter()
+            .find(|s| s.get_pointer().as_ref() == Some(pointer))
+            .cloned();
+
+        if let Some(seat) = seat
+            && let Some((hint_surface, hint_location)) = seat.pointer_constraint_hint()
+            && hint_surface == *surface
+        {
+            self.apply_cursor_hint(surface, pointer, hint_location, constraint);
+            seat.set_pointer_constraint_hint(None);
+        }
     }
 }

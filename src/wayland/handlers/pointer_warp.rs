@@ -5,7 +5,7 @@ use smithay::{
     input::pointer::PointerHandle,
     reexports::wayland_server::protocol::{wl_pointer::WlPointer, wl_surface::WlSurface},
     utils::{Logical, Point, Serial},
-    wayland::pointer_warp::PointerWarpHandler,
+    wayland::{pointer_constraints::with_pointer_constraint, pointer_warp::PointerWarpHandler},
 };
 
 impl PointerWarpHandler for State {
@@ -38,7 +38,7 @@ impl PointerWarpHandler for State {
         drop(shell);
 
         if let Some(pointer_handle) = pointer_handle {
-            self.apply_cursor_hint(&surface, &pointer_handle, pos);
+            self.apply_cursor_hint(&surface, &pointer_handle, pos, None);
         }
     }
 }
