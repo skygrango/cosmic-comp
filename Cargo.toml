@@ -142,8 +142,8 @@ inherits = "release"
 lto = "fat"
 
 [patch."https://github.com/pop-os/cosmic-protocols"]
-cosmic-protocols = { git = "https://github.com/skygrango/cosmic-protocols", branch = "vrr_target_rate" }
-cosmic-client-toolkit = { git = "https://github.com/skygrango/cosmic-protocols", branch = "vrr_target_rate" }
+cosmic-protocols = { git = "https://github.com/skygrango/cosmic-protocols", branch = "vrr_target_rate_v2" }
+cosmic-client-toolkit = { git = "https://github.com/skygrango/cosmic-protocols", branch = "vrr_target_rate_v2" }
 
 [patch.crates-io]
 smithay = { path = "./smithay" }
