@@ -1077,7 +1077,7 @@ impl SurfaceThreadState {
         //     &self.display_handle,
         // );
 
-        let mut render_start = self.timings.next_render_time(&self.clock);
+        let render_start = self.timings.next_render_time(&self.clock);
         // if let Some(next_deadline) = next_deadline {
         //     let next_deadline = Time::elapsed(&self.clock.now(), next_deadline.into());
         //     // wait for client
@@ -1451,6 +1451,7 @@ impl SurfaceThreadState {
             )
         };
         self.timings.draw_done(&self.clock);
+        signal_fifos(&self.shell, &self.output, &self.display_handle);
 
         match res {
             Ok(frame_result) => {
@@ -1480,7 +1481,6 @@ impl SurfaceThreadState {
 
                         // Update `state` after `queue_frame`, before any early return from errors
                         if x.is_ok() {
-                            signal_fifos(&self.shell, &self.output, &self.display_handle);
 
                             let new_state = QueueState::WaitingForVBlank {
                                 redraw_needed: false,
