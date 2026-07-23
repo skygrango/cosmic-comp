@@ -2385,8 +2385,6 @@ impl State {
                     if !in_window {
                         return false;
                     }
-
-<<<<<<< HEAD
                     with_pointer_constraint(surface, pointer, |constraint| {
                         if let Some(constraint) = constraint
                             && let Some(region) = constraint.region()
@@ -2396,19 +2394,6 @@ impl State {
                         }
                         true
                     })
-=======
-                    true
-
-                    // with_pointer_constraint(surface, pointer, |constraint| {
-                    //     if let Some(constraint) = constraint
-                    //         && let Some(region) = constraint.region()
-                    //     {
-                    //         let point_in_surface = (p - surface_offset.to_f64()).to_i32_round();
-                    //         return region.contains(point_in_surface);
-                    //     }
-                    //     true
-                    // })
->>>>>>> 719526df (lock-free commit)
                 };
 
                 let workspace_origin = output.geometry().loc.to_f64();
