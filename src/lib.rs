@@ -208,16 +208,16 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
             return;
         }
 
-        let outpus: Vec<_> = state.outputs().collect();
+        // let outpus: Vec<_> = state.outputs().collect();
 
-        for output in outpus {
-            let _ = signal_commit_timing(
-                &state.common.shell,
-                &output,
-                state.common.clock.now(),
-                &state.common.display_handle,
-            );
-        }
+        // for output in outpus {
+        //     let _ = signal_commit_timing(
+        //         &state.common.shell,
+        //         &output,
+        //         state.common.clock.now(),
+        //         &state.common.display_handle,
+        //     );
+        // }
 
         // trigger routines
         let clients = state.common.shell.write().update_animations();

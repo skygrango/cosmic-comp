@@ -1070,22 +1070,22 @@ impl SurfaceThreadState {
 
         let estimated_presentation = self.timings.next_presentation_time(&self.clock);
 
-        let next_deadline = signal_commit_timing(
-            &self.shell,
-            &self.output,
-            self.clock.now() + estimated_presentation,
-            &self.display_handle,
-        );
+        // let next_deadline = signal_commit_timing(
+        //     &self.shell,
+        //     &self.output,
+        //     self.clock.now() + estimated_presentation,
+        //     &self.display_handle,
+        // );
 
         let mut render_start = self.timings.next_render_time(&self.clock);
-        if let Some(next_deadline) = next_deadline {
-            let next_deadline = Time::elapsed(&self.clock.now(), next_deadline.into());
-            // wait for client
-            if render_start.as_nanos() < next_deadline.as_nanos() {
-                render_start = next_deadline;
-                force = true;
-            }
-        }
+        // if let Some(next_deadline) = next_deadline {
+        //     let next_deadline = Time::elapsed(&self.clock.now(), next_deadline.into());
+        //     // wait for client
+        //     if render_start.as_nanos() < next_deadline.as_nanos() {
+        //         render_start = next_deadline;
+        //         force = true;
+        //     }
+        // }
 
         let timer = if render_start.is_zero() {
             trace!("Running late for frame.");
