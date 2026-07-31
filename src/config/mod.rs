@@ -969,7 +969,7 @@ fn config_changed(config: cosmic_config::Config, keys: Vec<String>, state: &mut 
                     state.common.config.cosmic_conf.appearance_settings = new;
                     state.common.update_config();
                     for output in state.common.shell.read().outputs() {
-                        state.backend.schedule_render(output);
+                        state.backend.schedule_render(output, false);
                     }
                 }
             }
@@ -991,7 +991,7 @@ fn config_changed(config: cosmic_config::Config, keys: Vec<String>, state: &mut 
                         let outputs: Vec<_> =
                             state.common.shell.read().outputs().cloned().collect();
                         for output in outputs {
-                            state.backend.schedule_render(&output);
+                            state.backend.schedule_render(&output, false);
                         }
                     }
                 }
