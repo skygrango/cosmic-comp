@@ -218,7 +218,7 @@ fn init_libinput(
         state.process_input_event(event, crate::input::InputBackendId::Normal);
 
         for output in state.common.shell.read().outputs() {
-            state.backend.kms().schedule_render(output);
+            state.backend.kms().schedule_render(output, false);
         }
     })
     .map_err(|err| err.error)
@@ -709,14 +709,14 @@ impl KmsState {
         Ok(node)
     }
 
-    pub fn schedule_render(&mut self, output: &Output) {
+    pub fn schedule_render(&mut self, output: &Output, is_fullscrenn: bool) {
         for surface in self
             .drm_devices
             .values()
             .flat_map(|d| d.inner.surfaces.values())
             .filter(|s| s.output == *output || s.output.mirroring().is_some_and(|o| &o == output))
         {
-            surface.schedule_render();
+            surface.schedule_render(is_fullscrenn);
         }
     }
 
@@ -813,14 +813,14 @@ impl KmsState {
 }
 
 impl KmsGuard<'_> {
-    pub fn schedule_render(&mut self, output: &Output) {
+    pub fn schedule_render(&mut self, output: &Output, is_fullscrenn: bool) {
         for surface in self
             .drm_devices
             .values()
             .flat_map(|d| d.inner.surfaces.values())
             .filter(|s| s.output == *output || s.output.mirroring().is_some_and(|o| &o == output))
         {
-            surface.schedule_render();
+            surface.schedule_render(is_fullscrenn);
         }
     }
 
