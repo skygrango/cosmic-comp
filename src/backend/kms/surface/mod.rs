@@ -1038,6 +1038,7 @@ impl SurfaceThreadState {
 
             self.queue_redraw(false, immediate_draw);
         }
+        signal_fifos(&self.shell, &self.output, &self.display_handle);
         self.send_frame_callbacks();
     }
 
@@ -1060,6 +1061,7 @@ impl SurfaceThreadState {
         if force || self.shell.read().animations_going() {
             self.queue_redraw(false, false);
         }
+        signal_fifos(&self.shell, &self.output, &self.display_handle);
         self.send_frame_callbacks();
     }
 
@@ -1501,7 +1503,6 @@ impl SurfaceThreadState {
             )
         };
         self.timings.draw_done(&self.clock);
-        signal_fifos(&self.shell, &self.output, &self.display_handle);
 
         match res {
             Ok(frame_result) => {
