@@ -1719,6 +1719,8 @@ impl SurfaceThreadState {
             }
         }
 
+        let fullscreen_surface = self.output.is_foreground_fullscreen_occupied();
+
         self.shell
             .read()
             .for_each_surface_on_output(output, |toplevel| match toplevel {
@@ -1738,7 +1740,19 @@ impl SurfaceThreadState {
                     } else {
                         throttle(window)
                     };
-                    window.send_frame(output, time, throttle, should_send);
+                    if active {
+                        if let Some(fullscreen_surface) = &fullscreen_surface {
+                            if fullscreen_surface == window {
+                                window.send_frame(output, time, throttle, should_send);
+                            } else {
+                                window.send_frame(output, time, THROTTLE, should_send);
+                            }
+                        } else {
+                            window.send_frame(output, time, throttle, should_send);
+                        }
+                    } else {
+                        window.send_frame(output, time, throttle, |_, _| None);
+                    }
                 }
                 OutputSurface::Layer(layer_surface) => {
                     layer_surface.send_frame(output, time, THROTTLE, should_send);

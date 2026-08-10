@@ -5266,7 +5266,7 @@ impl Shell {
             active.minimized_windows.iter().for_each(|m| {
                 for window in m.windows() {
                     if window_set.insert(window.clone()) {
-                        f(OutputSurface::Window(&window, Some(active), true));
+                        f(OutputSurface::Window(&window, Some(active), false));
                     }
                 }
             });
