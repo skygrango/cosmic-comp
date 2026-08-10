@@ -749,8 +749,7 @@ fn focus_target_is_valid(
                 .get::<SeatMoveGrabState>()
                 .is_some_and(|state| {
                     state
-                        .lock()
-                        .unwrap()
+                        .read()
                         .as_ref()
                         .is_some_and(|state| state.element() == mapped)
                 })

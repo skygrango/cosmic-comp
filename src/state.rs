@@ -1058,7 +1058,7 @@ impl Common {
 
             // grabs
             if let Some(move_grab) = seat.user_data().get::<SeatMoveGrabState>()
-                && let Some(grab_state) = move_grab.lock().unwrap().as_ref()
+                && let Some(grab_state) = move_grab.read().as_ref()
             {
                 for (window, _) in grab_state.element().windows() {
                     window.with_surfaces(processor(None));

@@ -520,12 +520,7 @@ impl Workspace {
 
             // Move grab is treated as focused, so don't change focus to a
             // window while grab exists.
-            let move_grab_state = seat
-                .user_data()
-                .get::<SeatMoveGrabState>()
-                .unwrap()
-                .lock()
-                .unwrap();
+            let move_grab_state = seat.user_data().get::<SeatMoveGrabState>().unwrap().read();
             let move_mapped = (*move_grab_state)
                 .as_ref()
                 .map(|move_grab_state| move_grab_state.element());

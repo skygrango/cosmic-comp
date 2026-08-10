@@ -1642,7 +1642,7 @@ impl Common {
 
             for seat in shell.seats.iter() {
                 if let Some(move_grab) = seat.user_data().get::<SeatMoveGrabState>()
-                    && let Some(grab_state) = move_grab.lock().unwrap().as_ref()
+                    && let Some(grab_state) = move_grab.read().as_ref()
                 {
                     let mapped = grab_state.element();
                     if mapped.active_window().wl_surface().as_deref() == Some(surface) {
@@ -1943,8 +1943,7 @@ impl Shell {
                     .get::<SeatMoveGrabState>()
                     .is_some_and(|state| {
                         state
-                            .lock()
-                            .unwrap()
+                            .read()
                             .as_ref()
                             .is_some_and(|state| state.element() == elem)
                     })
@@ -2131,7 +2130,7 @@ impl Shell {
                             }
 
                             if let Some(move_grab) = seat.user_data().get::<SeatMoveGrabState>()
-                                && let Some(grab_state) = move_grab.lock().unwrap().as_ref()
+                                && let Some(grab_state) = move_grab.read().as_ref()
                             {
                                 for (window, _) in grab_state.element().windows() {
                                     let mut matches = false;
@@ -5203,7 +5202,7 @@ impl Shell {
             }
 
             if let Some(move_grab) = seat.user_data().get::<SeatMoveGrabState>() {
-                if let Some(grab_state) = move_grab.lock().unwrap().as_ref() {
+                if let Some(grab_state) = move_grab.read().as_ref() {
                     for (window, _) in grab_state.element().windows() {
                         if window_set.insert(window.clone()) {
                             f(OutputSurface::Window(&window, None, true));
