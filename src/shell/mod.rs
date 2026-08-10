@@ -5178,7 +5178,6 @@ impl Shell {
     ) {
         let mut window_set = HashSet::new();
         let mut surface_set = HashSet::new();
-        let mut layer_set = HashSet::new();
 
         if let Some(session_lock) = self.session_lock.as_ref() {
             if let Some(lock_surface) = session_lock.surfaces.get(output) {
@@ -5231,7 +5230,7 @@ impl Shell {
                 {
                     if let Some(window) = space.get_fullscreen(seat) {
                         if window_set.insert(window.surface.clone()) {
-                            f(OutputSurface::Window(&window.surface, Some(active), true));
+                            f(OutputSurface::Window(&window.surface, Some(active), false));
                         }
                     }
                 }
@@ -5307,7 +5306,7 @@ impl Shell {
         {
             let map = smithay::desktop::layer_map_for_output(output);
             for layer_surface in map.layers() {
-                if layer_set.insert(layer_surface.clone()) {
+                if surface_set.insert(layer_surface.wl_surface().clone()) {
                     f(OutputSurface::Layer(layer_surface));
                 }
             }
@@ -5323,7 +5322,9 @@ impl Shell {
                 .map(|(o, _)| o);
             if max_intersect_output == Some(output) {
                 if let Some(wl_surface) = or.wl_surface() {
-                    f(OutputSurface::Surface(&wl_surface));
+                    if surface_set.insert(wl_surface.clone()) {
+                        f(OutputSurface::Surface(&wl_surface));
+                    }
                 }
             }
         });
