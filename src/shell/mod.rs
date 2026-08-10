@@ -1694,8 +1694,8 @@ impl Common {
 }
 
 pub enum OutputSurface<'a> {
-    Window(&'a CosmicSurface, Option<&'a Workspace>, bool),
-    Layer(&'a LayerSurface),
+    Window(&'a CosmicSurface, Option<&'a Workspace>, bool, bool),
+    Layer(&'a LayerSurface, usize),
     Surface(&'a WlSurface),
     Cursor(&'a WlSurface),
     Session(&'a WlSurface),
@@ -1709,12 +1709,12 @@ impl<'a> OutputSurface<'a> {
         match self {
             OutputSurface::Session(s) => with_surfaces_surface_tree(s, processor),
             OutputSurface::Cursor(s) => with_surfaces_surface_tree(s, processor),
-            OutputSurface::Window(w, _space, active) => {
+            OutputSurface::Window(w, _space, active, _is_fullscreen) => {
                 if *active {
                     w.with_surfaces(processor)
                 }
             }
-            OutputSurface::Layer(l) => l.with_surfaces(processor),
+            OutputSurface::Layer(l, _namespace) => l.with_surfaces(processor),
             OutputSurface::Surface(s) => with_surfaces_surface_tree(s, processor),
         }
     }
@@ -5068,7 +5068,7 @@ impl Shell {
         let mut output_presentation_feedback = OutputPresentationFeedback::new(output);
 
         self.for_each_surface_on_output(output, |toplevel| match toplevel {
-            OutputSurface::Window(window, _space, active) => {
+            OutputSurface::Window(window, _space, active, _is_fullscreen) => {
                 if active {
                     window.take_presentation_feedback(
                         &mut output_presentation_feedback,
@@ -5082,19 +5082,6 @@ impl Shell {
                         },
                     );
                 }
-            }
-            OutputSurface::Layer(layer_surface) => {
-                layer_surface.take_presentation_feedback(
-                    &mut output_presentation_feedback,
-                    surface_primary_scanout_output,
-                    |surface, _| {
-                        surface_presentation_feedback_flags_from_states(
-                            surface,
-                            None,
-                            render_element_states,
-                        )
-                    },
-                );
             }
             OutputSurface::Surface(wl_surface) => {
                 take_presentation_feedback_surface_tree(
@@ -5110,51 +5097,21 @@ impl Shell {
                     },
                 );
             }
-            OutputSurface::Cursor(wl_surface) => {
-                take_presentation_feedback_surface_tree(
-                    wl_surface,
+            OutputSurface::Layer(layer_surface, namespace) => {
+                layer_surface.take_presentation_feedback(
                     &mut output_presentation_feedback,
                     surface_primary_scanout_output,
                     |surface, _| {
                         surface_presentation_feedback_flags_from_states(
                             surface,
-                            None,
+                            Some(namespace),
                             render_element_states,
                         )
                     },
                 );
             }
-            OutputSurface::Session(wl_surface) => {
-                take_presentation_feedback_surface_tree(
-                    wl_surface,
-                    &mut output_presentation_feedback,
-                    surface_primary_scanout_output,
-                    |surface, _| {
-                        surface_presentation_feedback_flags_from_states(
-                            surface,
-                            None,
-                            render_element_states,
-                        )
-                    },
-                );
-            }
+            _ => {}
         });
-
-        let map = smithay::desktop::layer_map_for_output(output);
-        for layer_surface in map.layers() {
-            let namespace = self.workspaces.active_num(output).1;
-            layer_surface.take_presentation_feedback(
-                &mut output_presentation_feedback,
-                surface_primary_scanout_output,
-                |surface, _| {
-                    surface_presentation_feedback_flags_from_states(
-                        surface,
-                        Some(namespace),
-                        render_element_states,
-                    )
-                },
-            );
-        }
 
         output_presentation_feedback
     }
@@ -5204,7 +5161,7 @@ impl Shell {
                 if let Some(grab_state) = move_grab.read().as_ref() {
                     for (window, _) in grab_state.element().windows() {
                         if window_set.insert(window.clone()) {
-                            f(OutputSurface::Window(&window, None, true));
+                            f(OutputSurface::Window(&window, None, true, false));
                         }
                     }
                 }
@@ -5219,7 +5176,12 @@ impl Shell {
             if let Some(active) = self.active_space(output) {
                 if let Some(window) = active.get_fullscreen(seat) {
                     if window_set.insert(window.surface.clone()) {
-                        f(OutputSurface::Window(&window.surface, Some(active), true));
+                        f(OutputSurface::Window(
+                            &window.surface,
+                            Some(active),
+                            true,
+                            true,
+                        ));
                     }
                 }
 
@@ -5230,7 +5192,12 @@ impl Shell {
                 {
                     if let Some(window) = space.get_fullscreen(seat) {
                         if window_set.insert(window.surface.clone()) {
-                            f(OutputSurface::Window(&window.surface, Some(active), false));
+                            f(OutputSurface::Window(
+                                &window.surface,
+                                Some(active),
+                                false,
+                                true,
+                            ));
                         }
                     }
                 }
@@ -5246,7 +5213,7 @@ impl Shell {
             .for_each(|mapped| {
                 for (window, _) in mapped.windows() {
                     if window_set.insert(window.clone()) {
-                        f(OutputSurface::Window(&window, None, true));
+                        f(OutputSurface::Window(&window, None, true, false));
                     }
                 }
             });
@@ -5255,7 +5222,7 @@ impl Shell {
             active.mapped().for_each(|mapped| {
                 for (window, _) in mapped.windows() {
                     if window_set.insert(window.clone()) {
-                        f(OutputSurface::Window(&window, Some(active), true));
+                        f(OutputSurface::Window(&window, Some(active), true, false));
                     }
                 }
             });
@@ -5264,7 +5231,7 @@ impl Shell {
             active.minimized_windows.iter().for_each(|m| {
                 for window in m.windows() {
                     if window_set.insert(window.clone()) {
-                        f(OutputSurface::Window(&window, Some(active), false));
+                        f(OutputSurface::Window(&window, Some(active), false, false));
                     }
                 }
             });
@@ -5277,14 +5244,14 @@ impl Shell {
                 space.mapped().for_each(|mapped| {
                     for (window, _) in mapped.windows() {
                         if window_set.insert(window.clone()) {
-                            f(OutputSurface::Window(&window, Some(active), false));
+                            f(OutputSurface::Window(&window, Some(active), false, false));
                         }
                     }
                 });
                 space.minimized_windows.iter().for_each(|m| {
                     for window in m.windows() {
                         if window_set.insert(window.clone()) {
-                            f(OutputSurface::Window(&window, Some(active), false));
+                            f(OutputSurface::Window(&window, Some(active), false, false));
                         }
                     }
                 })
@@ -5305,9 +5272,10 @@ impl Shell {
 
         {
             let map = smithay::desktop::layer_map_for_output(output);
+            let namespace = self.workspaces.active_num(output).1;
             for layer_surface in map.layers() {
                 if surface_set.insert(layer_surface.wl_surface().clone()) {
-                    f(OutputSurface::Layer(layer_surface));
+                    f(OutputSurface::Layer(layer_surface, namespace));
                 }
             }
         }

@@ -1169,7 +1169,7 @@ impl Common {
                         );
                     }
                 }
-                OutputSurface::Window(window, _space, active) => {
+                OutputSurface::Window(window, _space, active, _is_fullscreen) => {
                     if active
                         && let Some(feedback) = window
                             .wl_surface()
@@ -1186,7 +1186,7 @@ impl Common {
                         );
                     }
                 }
-                OutputSurface::Layer(layer_surface) => {
+                OutputSurface::Layer(layer_surface, _namespace) => {
                     if let Some(feedback) = advertised_node_for_surface(
                         layer_surface.wl_surface(),
                         &self.display_handle,
@@ -1300,7 +1300,7 @@ impl Common {
                     Some(Duration::ZERO),
                     should_send,
                 ),
-                OutputSurface::Window(window, space, active) => {
+                OutputSurface::Window(window, space, active, _is_fullscreen) => {
                     let throttle = if !active && let Some(space) = space {
                         min(throttle(space), throttle(window))
                     } else {
@@ -1308,7 +1308,7 @@ impl Common {
                     };
                     window.send_frame(output, time, throttle, should_send);
                 }
-                OutputSurface::Layer(layer_surface) => {
+                OutputSurface::Layer(layer_surface, _namespace) => {
                     layer_surface.send_frame(output, time, THROTTLE, should_send);
                 }
                 OutputSurface::Surface(wl_surface) => {

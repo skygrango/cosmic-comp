@@ -101,7 +101,7 @@ use wayland_backend::server::ClientId;
 
 use std::{
     borrow::{Borrow, BorrowMut},
-    cmp::min,
+    cmp::{max, min},
     collections::{HashMap, HashSet, hash_map},
     mem,
     sync::{
@@ -1708,9 +1708,10 @@ impl SurfaceThreadState {
                 None
             }
         };
+
         const THROTTLE: Option<Duration> = Some(Duration::from_millis(995));
         const SCREENCOPY_THROTTLE: Option<Duration> = Some(Duration::from_nanos(16_666_666));
-
+        const FULLSCREEN_THROTTLE: Option<Duration> = Some(Duration::from_nanos(33_333_333));
         fn throttle(session_holder: &impl SessionHolder) -> Option<Duration> {
             if session_holder.sessions().is_empty() && session_holder.cursor_sessions().is_empty() {
                 THROTTLE
@@ -1734,18 +1735,26 @@ impl SurfaceThreadState {
                     Some(Duration::ZERO),
                     should_send,
                 ),
-                OutputSurface::Window(window, space, active) => {
+                OutputSurface::Window(window, space, active, is_fullscreen) => {
                     let throttle = if !active && let Some(space) = space {
-                        min(throttle(space), throttle(window))
+                        if is_fullscreen {
+                            max(min(throttle(space), throttle(window)), FULLSCREEN_THROTTLE)
+                        }else{
+                            min(throttle(space), throttle(window))
+                        }
                     } else {
-                        throttle(window)
+                        if is_fullscreen {
+                            max(throttle(window), FULLSCREEN_THROTTLE)
+                        }else{
+                            throttle(window)
+                        }
                     };
                     if active {
                         if let Some(fullscreen_surface) = &fullscreen_surface {
                             if fullscreen_surface == window {
                                 window.send_frame(output, time, throttle, should_send);
                             } else {
-                                window.send_frame(output, time, THROTTLE, should_send);
+                                window.send_frame(output, time, throttle, |_, _| None);
                             }
                         } else {
                             window.send_frame(output, time, throttle, should_send);
@@ -1754,7 +1763,7 @@ impl SurfaceThreadState {
                         window.send_frame(output, time, throttle, |_, _| None);
                     }
                 }
-                OutputSurface::Layer(layer_surface) => {
+                OutputSurface::Layer(layer_surface, _namespace) => {
                     layer_surface.send_frame(output, time, THROTTLE, should_send);
                 }
                 OutputSurface::Surface(wl_surface) => {
