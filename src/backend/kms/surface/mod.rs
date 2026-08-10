@@ -246,6 +246,7 @@ pub enum ThreadCommand {
     AdaptiveSyncAvailable(SyncSender<Result<VrrSupport>>),
     UseAdaptiveSync(AdaptiveSync),
     UpdateVrrTargetRate(u32),
+    UpdateSessionLock(bool),
     AllowFrameFlags(bool, FrameFlags),
     End,
     DpmsOff,
@@ -466,6 +467,12 @@ impl Surface {
         let _ = self
             .thread_command
             .send(ThreadCommand::UpdateVrrTargetRate(rate));
+    }
+
+    pub fn set_session_lock(&mut self, is_lock: bool) {
+        let _ = self
+            .thread_command
+            .send(ThreadCommand::UpdateSessionLock(is_lock));
     }
 
     pub fn allow_frame_flags(&mut self, flag: bool, flags: FrameFlags) {
@@ -770,6 +777,9 @@ fn surface_thread(
                 } else {
                     state.frame_flags.remove(flags);
                 }
+            }
+            Event::Msg(ThreadCommand::UpdateSessionLock(is_lock)) => {
+                state.timings.session_lock = is_lock;
             }
             Event::Closed | Event::Msg(ThreadCommand::End) => {
                 signal.stop();
@@ -1739,13 +1749,13 @@ impl SurfaceThreadState {
                     let throttle = if !active && let Some(space) = space {
                         if is_fullscreen {
                             max(min(throttle(space), throttle(window)), FULLSCREEN_THROTTLE)
-                        }else{
+                        } else {
                             min(throttle(space), throttle(window))
                         }
                     } else {
                         if is_fullscreen {
                             max(throttle(window), FULLSCREEN_THROTTLE)
-                        }else{
+                        } else {
                             throttle(window)
                         }
                     };

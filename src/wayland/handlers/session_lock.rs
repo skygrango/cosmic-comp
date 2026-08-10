@@ -37,6 +37,12 @@ impl SessionLockHandler for State {
             surfaces: HashMap::new(),
         });
 
+        for device in self.backend.kms().drm_devices.values_mut() {
+            for surface in device.inner.surfaces.values_mut() {
+                surface.set_session_lock(true);
+            }
+        }
+
         for output in shell.outputs() {
             self.backend.schedule_render(output, false);
         }
@@ -45,6 +51,12 @@ impl SessionLockHandler for State {
     fn unlock(&mut self) {
         let mut shell = self.common.shell.write();
         shell.session_lock = None;
+
+        for device in self.backend.kms().drm_devices.values_mut() {
+            for surface in device.inner.surfaces.values_mut() {
+                surface.set_session_lock(false);
+            }
+        }
 
         for output in shell.outputs() {
             self.backend.schedule_render(output, false);

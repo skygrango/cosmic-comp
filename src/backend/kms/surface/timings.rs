@@ -15,6 +15,7 @@ pub struct Timings {
     pub vrr_target_rate_internal_ns: Option<NonZeroU64>,
     min_refresh_interval_ns: Option<NonZeroU64>,
     vrr: bool,
+    pub session_lock: bool,
     vendor: Option<u32>,
 
     pub pending_frame: Option<PendingFrame>,
@@ -90,6 +91,7 @@ impl Timings {
             min_refresh_interval_ns,
             vrr_target_rate_internal_ns: refresh_interval_ns,
             vrr,
+            session_lock: false,
             vendor,
 
             pending_frame: None,
@@ -351,7 +353,7 @@ impl Timings {
         };
         let refresh_interval_ns = refresh_interval_ns.get();
 
-        if self.vrr {
+        if self.vrr || self.session_lock {
             let earliest_presentation =
                 last_presentation_time + Duration::from_nanos(refresh_interval_ns);
             // let mut temp: Duration = now.clone();
@@ -442,7 +444,7 @@ impl Timings {
         //     return Duration::ZERO;
         // }
 
-        let margin = if self.vrr {
+        let margin = if self.vrr || self.session_lock {
             let Some(sample_rendertime) = self.avg_frametime(SAMPLE_TIME_WINDOW) else {
                 return estimated_presentation_time.saturating_sub(baseline + BASE_SAFETY_MARGIN);
             };
