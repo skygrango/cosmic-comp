@@ -1751,7 +1751,7 @@ impl SurfaceThreadState {
                     };
                     if active {
                         if let Some(fullscreen_surface) = &fullscreen_surface {
-                            if fullscreen_surface == window {
+                            if is_fullscreen && fullscreen_surface == window {
                                 window.send_frame(output, time, throttle, should_send);
                             } else {
                                 window.send_frame(output, time, throttle, |_, _| None);
