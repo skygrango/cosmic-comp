@@ -5176,8 +5176,8 @@ impl Shell {
         output: &Output,
         mut f: impl FnMut(OutputSurface<'_>),
     ) {
-        let mut window_set = HashSet::new();
-        let mut surface_set = HashSet::new();
+        let mut window_set = HashSet::with_capacity(128);
+        let mut surface_set = HashSet::with_capacity(128);
 
         if let Some(session_lock) = self.session_lock.as_ref() {
             if let Some(lock_surface) = session_lock.surfaces.get(output) {
