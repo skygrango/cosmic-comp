@@ -1748,13 +1748,13 @@ impl SurfaceThreadState {
                 OutputSurface::Window(window, space, active, is_fullscreen) => {
                     let throttle = if !active && let Some(space) = space {
                         if is_fullscreen {
-                            max(min(throttle(space), throttle(window)), FULLSCREEN_THROTTLE)
+                            min(min(throttle(space), throttle(window)), FULLSCREEN_THROTTLE)
                         } else {
                             min(throttle(space), throttle(window))
                         }
                     } else {
                         if is_fullscreen {
-                            max(throttle(window), FULLSCREEN_THROTTLE)
+                            min(throttle(window), FULLSCREEN_THROTTLE)
                         } else {
                             throttle(window)
                         }
