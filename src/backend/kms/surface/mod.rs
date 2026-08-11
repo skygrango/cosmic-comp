@@ -67,6 +67,7 @@ use smithay::{
     },
     desktop::utils::{
         OutputPresentationFeedback, send_frames_surface_tree, surface_primary_scanout_output,
+        with_surfaces_surface_tree,
     },
     output::{Output, OutputNoMode},
     reexports::{
@@ -1048,7 +1049,6 @@ impl SurfaceThreadState {
 
             self.queue_redraw(false, immediate_draw);
         }
-        signal_fifos(&self.shell, &self.output, &self.display_handle);
         self.send_frame_callbacks();
     }
 
@@ -1071,7 +1071,6 @@ impl SurfaceThreadState {
         if force || self.shell.read().animations_going() {
             self.queue_redraw(false, false);
         }
-        signal_fifos(&self.shell, &self.output, &self.display_handle);
         self.send_frame_callbacks();
     }
 
@@ -1731,6 +1730,24 @@ impl SurfaceThreadState {
         }
 
         let fullscreen_surface = self.output.is_foreground_fullscreen_occupied();
+        let mut clients: HashSet<ClientId> = HashSet::new();
+        let mut signal_fifo = |surface: &WlSurface, states: &SurfaceData| {
+            let fifo_barrier = &states
+                .cached_state
+                .get::<FifoBarrierCachedState>()
+                .current()
+                .barrier
+                .take();
+
+            if let Some(fifo_barrier) = fifo_barrier {
+                fifo_barrier.signal();
+                if let Some(client) = surface.client()
+                    && clients.insert(client.id())
+                {
+                    client_compositor_state(&client).blocker_cleared(&self.display_handle);
+                }
+            }
+        };
 
         self.shell
             .read()
@@ -1746,6 +1763,7 @@ impl SurfaceThreadState {
                     should_send,
                 ),
                 OutputSurface::Window(window, space, active, is_fullscreen) => {
+                    window.with_surfaces(&mut signal_fifo);
                     let throttle = if !active && let Some(space) = space {
                         if is_fullscreen {
                             min(min(throttle(space), throttle(window)), FULLSCREEN_THROTTLE)
@@ -1774,36 +1792,14 @@ impl SurfaceThreadState {
                     }
                 }
                 OutputSurface::Layer(layer_surface, _namespace) => {
+                    layer_surface.with_surfaces(&mut signal_fifo);
                     layer_surface.send_frame(output, time, THROTTLE, should_send);
                 }
                 OutputSurface::Surface(wl_surface) => {
+                    with_surfaces_surface_tree(wl_surface, &mut signal_fifo);
                     send_frames_surface_tree(&wl_surface, output, time, THROTTLE, should_send)
                 }
             });
-    }
-}
-
-fn signal_fifos(shell: &Arc<parking_lot::RwLock<Shell>>, output: &Output, dh: &DisplayHandle) {
-    let mut clients: HashMap<ClientId, Client> = HashMap::new();
-    shell.read().for_each_surface_on_output(output, |toplevel| {
-        toplevel.with_surfaces(|surface: &WlSurface, states: &SurfaceData| -> _ {
-            let fifo_barrier = &states
-                .cached_state
-                .get::<FifoBarrierCachedState>()
-                .current()
-                .barrier
-                .take();
-
-            if let Some(fifo_barrier) = fifo_barrier {
-                fifo_barrier.signal();
-                let client = surface.client().unwrap();
-                clients.insert(client.id(), client);
-            }
-        })
-    });
-
-    for (_client_id, client) in clients {
-        client_compositor_state(&client).blocker_cleared(&dh);
     }
 }
 
