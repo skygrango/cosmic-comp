@@ -1049,7 +1049,7 @@ impl SurfaceThreadState {
 
             self.queue_redraw(false, immediate_draw);
         }
-        self.send_frame_callbacks();
+        self.send_frame_callbacks(true);
     }
 
     #[profiling::function]
@@ -1071,7 +1071,7 @@ impl SurfaceThreadState {
         if force || self.shell.read().animations_going() {
             self.queue_redraw(false, false);
         }
-        self.send_frame_callbacks();
+        self.send_frame_callbacks(true);
     }
 
     fn queue_redraw(&mut self, mut force: bool, immediate: bool) {
@@ -1584,7 +1584,7 @@ impl SurfaceThreadState {
                         if x.is_ok() {
                             if self.mirroring.is_none() {
                                 self.frame_callback_seq = self.frame_callback_seq.wrapping_add(1);
-                                self.send_frame_callbacks();
+                                self.send_frame_callbacks(false);
                             }
                         } else {
                             // we don't expect a vblank
@@ -1666,9 +1666,13 @@ impl SurfaceThreadState {
         self.postprocess_textures.clear();
     }
 
-    fn send_frame_callbacks(&mut self) {
+    fn send_frame_callbacks(&mut self, shoud_signal_fifo: bool) {
         if self.mirroring.is_none() {
-            self.send_frames(&self.output, Some(self.frame_callback_seq));
+            self.send_frames(
+                &self.output,
+                Some(self.frame_callback_seq),
+                shoud_signal_fifo,
+            );
         }
     }
 
@@ -1678,7 +1682,7 @@ impl SurfaceThreadState {
             .send(SurfaceCommand::RenderStates(states));
     }
 
-    pub fn send_frames(&self, output: &Output, sequence: Option<usize>) {
+    pub fn send_frames(&self, output: &Output, sequence: Option<usize>, shoud_signal_fifo: bool) {
         let time = self.clock.now();
         let should_send = |surface: &WlSurface, states: &SurfaceData| {
             // Do the standard primary scanout output check. For pointer surfaces it deduplicates
@@ -1763,7 +1767,9 @@ impl SurfaceThreadState {
                     should_send,
                 ),
                 OutputSurface::Window(window, space, active, is_fullscreen) => {
-                    window.with_surfaces(&mut signal_fifo);
+                    if shoud_signal_fifo {
+                        window.with_surfaces(&mut signal_fifo);
+                    }
                     let throttle = if !active && let Some(space) = space {
                         if is_fullscreen {
                             min(min(throttle(space), throttle(window)), FULLSCREEN_THROTTLE)
@@ -1792,11 +1798,15 @@ impl SurfaceThreadState {
                     }
                 }
                 OutputSurface::Layer(layer_surface, _namespace) => {
-                    layer_surface.with_surfaces(&mut signal_fifo);
+                    if shoud_signal_fifo {
+                        layer_surface.with_surfaces(&mut signal_fifo);
+                    }
                     layer_surface.send_frame(output, time, THROTTLE, should_send);
                 }
                 OutputSurface::Surface(wl_surface) => {
-                    with_surfaces_surface_tree(wl_surface, &mut signal_fifo);
+                    if shoud_signal_fifo {
+                        with_surfaces_surface_tree(wl_surface, &mut signal_fifo);
+                    }
                     send_frames_surface_tree(&wl_surface, output, time, THROTTLE, should_send)
                 }
             });
