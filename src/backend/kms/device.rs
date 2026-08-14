@@ -27,7 +27,7 @@ use smithay::{
             output::{DrmOutputManager, LockedDrmOutputManager},
         },
         egl::{EGLContext, EGLDevice, EGLDisplay, context::ContextPriority},
-        renderer::glow::GlowRenderer,
+        renderer::{PresentationMode, glow::GlowRenderer},
         session::{Session, libseat::LibSeatSession},
     },
     desktop::utils::OutputPresentationFeedback,
@@ -953,7 +953,13 @@ impl LockedDevice<'_> {
                 };
 
                 let mut compositor = compositor.lock().unwrap();
-                compositor.render_frame(renderer, &elements, CLEAR_COLOR, FrameFlags::empty())?;
+                compositor.render_frame(
+                    renderer,
+                    &elements,
+                    CLEAR_COLOR,
+                    FrameFlags::empty(),
+                    PresentationMode::VSync,
+                )?;
                 if let Err(err) = compositor.commit_frame()
                     && !matches!(err, FrameError::EmptyFrame)
                 {

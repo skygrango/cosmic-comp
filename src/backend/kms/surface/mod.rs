@@ -7,8 +7,7 @@ use crate::{
         init_shaders, output_elements,
     },
     config::ScreenFilter,
-    shell::{OutputSurface, Shell},
-    signal_commit_timing,
+    shell::{CosmicSurface, OutputSurface, Shell},
     state::{SurfaceDmabufFeedback, SurfaceFrameThrottlingState},
     utils::prelude::*,
     wayland::handlers::{
@@ -44,6 +43,7 @@ use smithay::{
             output::DrmOutput,
         },
         egl::EGLContext,
+        renderer::PresentationMode,
         renderer::{
             Bind, Blit, BufferType, Frame, ImportDma, Offscreen, Renderer, RendererSuper, Texture,
             TextureFilter, buffer_dimensions, buffer_type,
@@ -67,6 +67,7 @@ use smithay::{
     },
     desktop::utils::{
         OutputPresentationFeedback, send_frames_surface_tree, surface_primary_scanout_output,
+        with_surfaces_surface_tree,
     },
     output::{Output, OutputNoMode},
     reexports::{
@@ -939,7 +940,7 @@ impl SurfaceThreadState {
         let _ = self.vblank_frame.take();
 
         // mark last frame completed
-        if let Ok(Some(Some((mut feedback, frames, estimated_presentation_time)))) =
+        if let Ok(Some((mut feedback, frames, estimated_presentation_time))) =
             compositor.frame_submitted()
             && self.mirroring.is_none()
         {
@@ -1288,6 +1289,7 @@ impl SurfaceThreadState {
         };
         self.timings.set_vrr(vrr);
         self.timings.elements_done(&self.clock);
+        //self.signal_commit_timing(&self.shell, &self.output, self.output.is_foreground_fullscreen_occupied(), until, &self.display_handle);
 
         // we can't use the elements after `compositor.render_frame`,
         // so let's collect everything we need for screencopy now
@@ -1488,6 +1490,13 @@ impl SurfaceThreadState {
                 &self.screen_filter,
             );
 
+            let presentation_mode = if self.output.is_foreground_fullscreen_occupied().is_some() {
+                additional_frame_flags |= FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY;
+                PresentationMode::Async
+            } else {
+                PresentationMode::VSync
+            };
+
             if let Err(err) = compositor.with_compositor(|c| c.use_vrr(vrr)) {
                 warn!("Unable to set adaptive VRR state: {}", err);
             }
@@ -1498,8 +1507,16 @@ impl SurfaceThreadState {
                 self.frame_flags
                     .union(additional_frame_flags)
                     .difference(remove_frame_flags),
+                presentation_mode,
             )
         } else {
+            let presentation_mode = if self.output.is_foreground_fullscreen_occupied().is_some() {
+                additional_frame_flags |= FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY;
+                PresentationMode::Async
+            } else {
+                PresentationMode::VSync
+            };
+
             if let Err(err) = compositor.with_compositor(|c| c.use_vrr(vrr)) {
                 warn!("Unable to set adaptive VRR state: {}", err);
             }
@@ -1510,6 +1527,7 @@ impl SurfaceThreadState {
                 self.frame_flags
                     .union(additional_frame_flags)
                     .difference(remove_frame_flags),
+                presentation_mode,
             )
         };
         self.timings.draw_done(&self.clock);
@@ -1780,6 +1798,97 @@ impl SurfaceThreadState {
                     send_frames_surface_tree(&wl_surface, output, time, THROTTLE, should_send)
                 }
             });
+    }
+
+    pub fn signal_commit_timing(
+        &self,
+        shell: &Arc<parking_lot::RwLock<Shell>>,
+        output: &Output,
+        fullscreen_surface: Option<CosmicSurface>,
+        until: Time<Monotonic>,
+        dh: &DisplayHandle,
+    ) {
+        let mut clients: HashMap<ClientId, Client> = HashMap::new();
+        let mut fullscreen_clients: HashMap<ClientId, Client> = HashMap::new();
+        let mut next_deadline = None;
+        let enable_commit_timing = fullscreen_surface.is_some();
+        let mut clear_commit_timing = |surface: &WlSurface, states: &SurfaceData| {
+            if let Some(mut commit_timer_state) = states
+                .data_map
+                .get::<CommitTimerBarrierStateUserData>()
+                .map(|commit_timer| commit_timer.lock().unwrap())
+            {
+                if commit_timer_state.signal_until(until)
+                    && let Some(client) = surface.client()
+                {
+                    clients.insert(client.id(), client);
+                }
+            }
+        };
+        let mut get_commit_timing = |surface: &WlSurface, states: &SurfaceData| {
+            if let Some(mut commit_timer_state) = states
+                .data_map
+                .get::<CommitTimerBarrierStateUserData>()
+                .map(|commit_timer| commit_timer.lock().unwrap())
+            {
+                let deadline = commit_timer_state.next_deadline();
+                if commit_timer_state.signal_until(until)
+                    && let Some(client) = surface.client()
+                {
+                    fullscreen_clients.insert(client.id(), client);
+
+                    if let Some(deadline) = deadline {
+                        next_deadline = Some(
+                            next_deadline.map_or(deadline, |min| std::cmp::min(min, deadline)),
+                        );
+                    }
+                }
+            }
+        };
+
+        shell
+            .read()
+            .for_each_surface_on_output(output, |toplevel| match toplevel {
+                OutputSurface::Window(cosmic_surface, _workspace, is_active, is_fullscreen) => {
+                    if enable_commit_timing {
+                        if is_fullscreen
+                            && is_active
+                            && let Some(fullscreen_surface) = &fullscreen_surface
+                            && cosmic_surface == fullscreen_surface
+                        {
+                            cosmic_surface.with_surfaces(&mut get_commit_timing);
+                        } else {
+                            cosmic_surface.with_surfaces(&mut clear_commit_timing);
+                        }
+                    } else {
+                        cosmic_surface.with_surfaces(&mut clear_commit_timing);
+                    }
+                }
+                OutputSurface::Layer(layer_surface, _) => {
+                    layer_surface.with_surfaces(&mut clear_commit_timing)
+                }
+                OutputSurface::Surface(wl_surface) => {
+                    with_surfaces_surface_tree(wl_surface, &mut clear_commit_timing)
+                }
+                _ => {}
+            });
+
+        for (_client_id, client) in clients {
+            client_compositor_state(&client).blocker_cleared(&dh);
+        }
+
+        if let Some(next_deadline) = next_deadline {
+            let next_deadline =
+                Timer::from_duration(Time::elapsed(&self.clock.now(), next_deadline.into()));
+            self.loop_handle
+                .insert_source(next_deadline, move |_time, _, state| {
+                    for client in fullscreen_clients.values() {
+                        client_compositor_state(client).blocker_cleared(&state.display_handle);
+                    }
+                    TimeoutAction::Drop
+                })
+                .expect("Failed to schedule render");
+        }
     }
 }
 

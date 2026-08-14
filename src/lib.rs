@@ -8,6 +8,7 @@
 
 use calloop::timer::{TimeoutAction, Timer};
 use smithay::{
+    desktop::utils::with_surfaces_surface_tree,
     output::Output,
     reexports::{
         calloop::{EventLoop, Interest, Mode, PostAction, generic::Generic},
@@ -40,7 +41,7 @@ use wayland::protocols::{
 use wayland_backend::server::ClientId;
 
 use crate::{
-    shell::Shell,
+    shell::{CosmicSurface, OutputSurface, Shell, element::CosmicWindow},
     wayland::{
         handlers::compositor::client_compositor_state,
         protocols::overlap_notify::OverlapNotifyHandler,
@@ -389,37 +390,87 @@ fn refresh(state: &mut State) {
     state.last_refresh = LastRefresh::At(Instant::now());
 }
 
-pub fn signal_commit_timing(
-    shell: &Arc<parking_lot::RwLock<Shell>>,
-    output: &Output,
-    until: Time<Monotonic>,
-    dh: &DisplayHandle,
-) -> Option<smithay::wayland::commit_timing::Timestamp> {
-    let mut clients: HashMap<ClientId, Client> = HashMap::new();
-    let mut next_deadline = None;
-    shell.read().for_each_surface_on_output(output, |toplevel| {
-        toplevel.with_surfaces(|surface: &WlSurface, states: &SurfaceData| {
-            if let Some(mut commit_timer_state) = states
-                .data_map
-                .get::<CommitTimerBarrierStateUserData>()
-                .map(|commit_timer| commit_timer.lock().unwrap())
-            {
-                let deadline = commit_timer_state.next_deadline();
-                if commit_timer_state.signal_until(until) {
-                    let client = surface.client().unwrap();
-                    clients.insert(client.id(), client);
-                    if let Some(deadline) = deadline {
-                        next_deadline = Some(
-                            next_deadline.map_or(deadline, |min| std::cmp::min(min, deadline)),
-                        );
-                    }
-                }
-            }
-        });
-    });
+// pub fn clear_commit_timing(surface: &WlSurface, states: &SurfaceData) {
+//     if let Some(mut commit_timer_state) = states
+//         .data_map
+//         .get::<CommitTimerBarrierStateUserData>()
+//         .map(|commit_timer| commit_timer.lock().unwrap())
+//     {
+//         let _ = commit_timer_state.signal_until(until);
+//     }
+// }
 
-    for (_client_id, client) in clients {
-        client_compositor_state(&client).blocker_cleared(&dh);
-    }
-    next_deadline
-}
+// pub fn signal_commit_timing(
+//     shell: &Arc<parking_lot::RwLock<Shell>>,
+//     output: &Output,
+//     fullscreen_surface: Option<CosmicSurface>,
+//     until: Time<Monotonic>,
+//     dh: &DisplayHandle,
+// ) -> Option<smithay::wayland::commit_timing::Timestamp> {
+//     let mut clients: HashMap<ClientId, Client> = HashMap::new();
+//     let mut next_deadline = None;
+//     let enable_commit_timing = fullscreen_surface.is_some();
+//     let mut clear_commit_timing = |surface: &WlSurface, states: &SurfaceData| {
+//         if let Some(mut commit_timer_state) = states
+//             .data_map
+//             .get::<CommitTimerBarrierStateUserData>()
+//             .map(|commit_timer| commit_timer.lock().unwrap())
+//         {
+//             if commit_timer_state.signal_until(until)
+//                 && let Some(client) = surface.client()
+//             {
+//                 clients.insert(client.id(), client);
+//             }
+//         }
+//     };
+//     let mut get_commit_timing = |surface: &WlSurface, states: &SurfaceData| {
+//         if let Some(mut commit_timer_state) = states
+//             .data_map
+//             .get::<CommitTimerBarrierStateUserData>()
+//             .map(|commit_timer| commit_timer.lock().unwrap())
+//         {
+//             let deadline = commit_timer_state.next_deadline();
+//             if commit_timer_state.signal_until(until)
+//                 && let Some(client) = surface.client()
+//             {
+//                 clients.insert(client.id(), client);
+
+//                 if let Some(deadline) = deadline {
+//                     next_deadline =
+//                         Some(next_deadline.map_or(deadline, |min| std::cmp::min(min, deadline)));
+//                 }
+//             }
+//         }
+//     };
+//     shell
+//         .read()
+//         .for_each_surface_on_output(output, |toplevel| match toplevel {
+//             OutputSurface::Window(cosmic_surface, _workspace, is_active, is_fullscreen) => {
+//                 if enable_commit_timing {
+//                     if is_fullscreen
+//                         && is_active
+//                         && let Some(fullscreen_surface) = &fullscreen_surface
+//                         && cosmic_surface == fullscreen_surface
+//                     {
+//                         cosmic_surface.with_surfaces(&mut get_commit_timing);
+//                     } else {
+//                         cosmic_surface.with_surfaces(&mut clear_commit_timing);
+//                     }
+//                 } else {
+//                     cosmic_surface.with_surfaces(&mut clear_commit_timing);
+//                 }
+//             }
+//             OutputSurface::Layer(layer_surface, _) => {
+//                 layer_surface.with_surfaces(&mut clear_commit_timing)
+//             }
+//             OutputSurface::Surface(wl_surface) => {
+//                 with_surfaces_surface_tree(wl_surface, &mut clear_commit_timing)
+//             }
+//             _ => {}
+//         });
+
+//     for (_client_id, client) in clients {
+//         client_compositor_state(&client).blocker_cleared(&dh);
+//     }
+//     next_deadline
+// }
