@@ -1019,6 +1019,11 @@ impl LockedDevice<'_> {
                     modifier: *mo,
                 }))
             };
+            surface.primary_async_formats = if flag {
+                comp.surface().plane_info().formats_async.clone()
+            } else {
+                None
+            };
             surface.feedback.clear();
         }
 

@@ -137,6 +137,7 @@ pub struct Surface {
     pub feedback: HashMap<DrmNode, SurfaceDmabufFeedback>,
     pub(super) primary_plane_formats: FormatSet,
     overlay_plane_formats: Option<FormatSet>,
+    pub(super) primary_async_formats: Option<FormatSet>,
 
     loop_handle: LoopHandle<'static, State>,
     thread_command: Sender<ThreadCommand>,
@@ -360,6 +361,7 @@ impl Surface {
                                     target_formats,
                                     surface.primary_plane_formats.clone(),
                                     surface.overlay_plane_formats.clone(),
+                                    surface.primary_async_formats.clone(),
                                 );
                                 surface.feedback.insert(source_node, feedback.clone());
                                 Some(feedback)
@@ -385,6 +387,7 @@ impl Surface {
             feedback: HashMap::new(),
             primary_plane_formats: FormatSet::default(),
             overlay_plane_formats: None,
+            primary_async_formats: None,
             loop_handle: evlh.clone(),
             thread_command: tx,
             thread_token,
@@ -493,9 +496,11 @@ impl Surface {
         compositor: GbmDrmOutput,
         primary_plane_formats: FormatSet,
         overlay_plane_formats: Option<FormatSet>,
+        primary_async_formats: Option<FormatSet>,
     ) {
         self.primary_plane_formats = primary_plane_formats;
         self.overlay_plane_formats = overlay_plane_formats;
+        self.primary_async_formats = primary_async_formats;
         self.feedback.clear();
         self.active.store(true, Ordering::SeqCst);
         self.dpms = true;
@@ -1577,9 +1582,9 @@ impl SurfaceThreadState {
                                 immediate_draw: false,
                             };
                             match mem::replace(&mut self.state, new_state) {
-                                QueueState::Idle => unreachable!(),
+                                QueueState::Idle => (),
                                 QueueState::Queued(_) => (),
-                                QueueState::WaitingForVBlank { .. } => unreachable!(),
+                                QueueState::WaitingForVBlank { .. } => (),
                                 QueueState::WaitingForEstimatedVBlank(estimated_vblank)
                                 | QueueState::WaitingForEstimatedVBlankAndQueued {
                                     estimated_vblank,
@@ -1652,9 +1657,9 @@ impl SurfaceThreadState {
 
     fn queue_estimated_vblank(&mut self, target_presentation_time: Duration, force: bool) {
         match mem::take(&mut self.state) {
-            QueueState::Idle => unreachable!(),
+            QueueState::Idle => (),
             QueueState::Queued(_) => (),
-            QueueState::WaitingForVBlank { .. } => unreachable!(),
+            QueueState::WaitingForVBlank { .. } => (),
             QueueState::WaitingForEstimatedVBlank(token)
             | QueueState::WaitingForEstimatedVBlankAndQueued {
                 estimated_vblank: token,
@@ -1983,6 +1988,7 @@ fn get_surface_dmabuf_feedback(
     _target_formats: FormatSet,
     primary_plane_formats: FormatSet,
     overlay_plane_formats: Option<FormatSet>,
+    primary_async_formats: Option<FormatSet>,
 ) -> SurfaceDmabufFeedback {
     // We limit the scan-out trache to formats we can also render from
     // so that there is always a fallback render path available in case
@@ -1998,7 +2004,7 @@ fn get_surface_dmabuf_feedback(
             .cloned()
             .collect::<FormatSet>()
     });
-    let builder = DmabufFeedbackBuilder::new(render_node.dev_id(), render_formats);
+    let builder = DmabufFeedbackBuilder::new(render_node.dev_id(), render_formats.clone());
 
     /*
     // Sadly no implementation would pick this up as a preferred render tranche,
@@ -2034,8 +2040,9 @@ fn get_surface_dmabuf_feedback(
             .clone()
             .add_preference_tranche(
                 render_node.dev_id(),
-                Some(zwp_linux_dmabuf_feedback_v1::TrancheFlags::Scanout),
-                primary_plane_formats,
+                zwp_linux_dmabuf_feedback_v1::TrancheFlags::Scanout,
+                primary_plane_formats.clone(),
+                4..=6,
             )
             .build()
             .unwrap()
@@ -2044,19 +2051,41 @@ fn get_surface_dmabuf_feedback(
         .filter(|_| target_node == render_node)
         .map(|formats| {
             builder
+                .clone()
                 .add_preference_tranche(
                     render_node.dev_id(),
-                    Some(zwp_linux_dmabuf_feedback_v1::TrancheFlags::Scanout),
+                    zwp_linux_dmabuf_feedback_v1::TrancheFlags::Scanout,
                     formats,
+                    4..=6,
                 )
                 .build()
                 .unwrap()
         });
 
+    let async_scanout_feedback = (target_node == render_node).then(|| {
+        let async_formats = primary_async_formats
+            .as_ref()
+            .unwrap_or(&primary_plane_formats)
+            .intersection(&render_formats)
+            .cloned()
+            .collect::<FormatSet>();
+        builder
+            .clone()
+            .add_preference_tranche(
+                render_node.dev_id(),
+                zwp_linux_dmabuf_feedback_v1::TrancheFlags::Scanout,
+                async_formats,
+                4..=6,
+            )
+            .build()
+            .unwrap()
+    });
+
     SurfaceDmabufFeedback {
         render_feedback,
         overlay_scanout_feedback,
         primary_scanout_feedback,
+        async_scanout_feedback,
     }
 }
 

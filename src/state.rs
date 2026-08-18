@@ -338,6 +338,7 @@ pub struct SurfaceDmabufFeedback {
     pub render_feedback: DmabufFeedback,
     pub overlay_scanout_feedback: Option<DmabufFeedback>,
     pub primary_scanout_feedback: Option<DmabufFeedback>,
+    pub async_scanout_feedback: Option<DmabufFeedback>,
 }
 
 #[derive(Debug)]
@@ -1133,14 +1134,21 @@ impl Common {
                             output,
                             surface_primary_scanout_output,
                             |surface, _| {
+                                let scanout = feedback
+                                    .primary_scanout_feedback
+                                    .as_ref()
+                                    .unwrap_or(&feedback.render_feedback);
+                                let async_scanout = feedback
+                                    .async_scanout_feedback
+                                    .as_ref()
+                                    .or(feedback.primary_scanout_feedback.as_ref())
+                                    .unwrap_or(&feedback.render_feedback);
                                 select_dmabuf_feedback(
                                     surface,
                                     render_element_states,
                                     &feedback.render_feedback,
-                                    feedback
-                                        .primary_scanout_feedback
-                                        .as_ref()
-                                        .unwrap_or(&feedback.render_feedback),
+                                    scanout,
+                                    async_scanout,
                                 )
                             },
                         )
@@ -1156,14 +1164,21 @@ impl Common {
                             output,
                             surface_primary_scanout_output,
                             |surface, _| {
+                                let overlay = feedback
+                                    .overlay_scanout_feedback
+                                    .as_ref()
+                                    .unwrap_or(&feedback.render_feedback);
+                                let async_scanout = feedback
+                                    .async_scanout_feedback
+                                    .as_ref()
+                                    .or(feedback.overlay_scanout_feedback.as_ref())
+                                    .unwrap_or(&feedback.render_feedback);
                                 select_dmabuf_feedback(
                                     surface,
                                     render_element_states,
                                     &feedback.render_feedback,
-                                    feedback
-                                        .overlay_scanout_feedback
-                                        .as_ref()
-                                        .unwrap_or(&feedback.render_feedback),
+                                    overlay,
+                                    async_scanout,
                                 )
                             },
                         );
@@ -1197,14 +1212,21 @@ impl Common {
                             output,
                             surface_primary_scanout_output,
                             |surface, _| {
+                                let overlay = feedback
+                                    .overlay_scanout_feedback
+                                    .as_ref()
+                                    .unwrap_or(&feedback.render_feedback);
+                                let async_scanout = feedback
+                                    .async_scanout_feedback
+                                    .as_ref()
+                                    .or(feedback.overlay_scanout_feedback.as_ref())
+                                    .unwrap_or(&feedback.render_feedback);
                                 select_dmabuf_feedback(
                                     surface,
                                     render_element_states,
                                     &feedback.render_feedback,
-                                    feedback
-                                        .overlay_scanout_feedback
-                                        .as_ref()
-                                        .unwrap_or(&feedback.render_feedback),
+                                    overlay,
+                                    async_scanout,
                                 )
                             },
                         );
@@ -1220,14 +1242,21 @@ impl Common {
                             output,
                             surface_primary_scanout_output,
                             |surface, _| {
+                                let overlay = feedback
+                                    .overlay_scanout_feedback
+                                    .as_ref()
+                                    .unwrap_or(&feedback.render_feedback);
+                                let async_scanout = feedback
+                                    .async_scanout_feedback
+                                    .as_ref()
+                                    .or(feedback.overlay_scanout_feedback.as_ref())
+                                    .unwrap_or(&feedback.render_feedback);
                                 select_dmabuf_feedback(
                                     surface,
                                     render_element_states,
                                     &feedback.render_feedback,
-                                    feedback
-                                        .overlay_scanout_feedback
-                                        .as_ref()
-                                        .unwrap_or(&feedback.render_feedback),
+                                    overlay,
+                                    async_scanout,
                                 )
                             },
                         )

@@ -1066,6 +1066,7 @@ impl KmsGuard<'_> {
                             .ok();
 
                         let primary_formats = compositor_ref.surface().plane_info().formats.clone();
+                        let primary_async_formats = compositor_ref.surface().plane_info().formats_async.clone();
                         let overlay_formats = planes
                             .overlay
                             .iter()
@@ -1075,6 +1076,7 @@ impl KmsGuard<'_> {
                             compositor,
                             primary_formats,
                             Some(overlay_formats).filter(|f| !f.indexset().is_empty()),
+                            primary_async_formats,
                         );
 
                         surface.output.set_adaptive_sync_support(vrr_support);
