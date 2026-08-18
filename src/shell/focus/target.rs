@@ -16,7 +16,7 @@ use crate::{
 };
 use id_tree::NodeId;
 use smithay::{
-    backend::input::{KeyState, TabletToolDescriptor},
+    backend::input::KeyState,
     desktop::{LayerSurface, PopupKind, WindowSurface, WindowSurfaceType, space::SpaceElement},
     input::{
         Seat,
@@ -27,17 +27,6 @@ use smithay::{
             GesturePinchBeginEvent, GesturePinchEndEvent, GesturePinchUpdateEvent,
             GestureSwipeBeginEvent, GestureSwipeEndEvent, GestureSwipeUpdateEvent,
             MotionEvent as PointerMotionEvent, PointerTarget, RelativeMotionEvent,
-        },
-        tablet::{
-            Tablet,
-            tool::{
-                TabletToolTarget,
-                DownEvent as TabletDownEvent,
-                UpEvent as TabletUpEvent,
-                MotionEvent as TabletMotionEvent,
-                AxisFrame as TabletAxisFrame,
-                ButtonEvent as TabletButtonEvent,
-            },
         },
         touch::{
             DownEvent, FrameMarker, MotionEvent as TouchMotionEvent, OrientationEvent, ShapeEvent,
@@ -857,122 +846,5 @@ impl From<PopupKind> for KeyboardFocusTarget {
 impl From<LockSurface> for KeyboardFocusTarget {
     fn from(l: LockSurface) -> Self {
         KeyboardFocusTarget::LockSurface(l)
-    }
-}
-
-impl TabletToolTarget<State> for PointerFocusTarget {
-    fn proximity_in(
-        &self,
-        seat: &Seat<State>,
-        data: &mut State,
-        tool_descriptor: &TabletToolDescriptor,
-        tablet: &Tablet,
-        serial: Serial,
-    ) {
-        match self {
-            PointerFocusTarget::WlSurface { surface, .. } => {
-                TabletToolTarget::proximity_in(surface, seat, data, tool_descriptor, tablet, serial);
-            }
-            PointerFocusTarget::X11Surface { surface, .. } => {
-                TabletToolTarget::proximity_in(surface, seat, data, tool_descriptor, tablet, serial);
-            }
-            _ => {}
-        }
-    }
-
-    fn proximity_out(&self, seat: &Seat<State>, data: &mut State, tool_descriptor: &TabletToolDescriptor) {
-        match self {
-            PointerFocusTarget::WlSurface { surface, .. } => {
-                TabletToolTarget::proximity_out(surface, seat, data, tool_descriptor);
-            }
-            PointerFocusTarget::X11Surface { surface, .. } => {
-                TabletToolTarget::proximity_out(surface, seat, data, tool_descriptor);
-            }
-            _ => {}
-        }
-    }
-
-    fn down(&self, seat: &Seat<State>, data: &mut State, tool_descriptor: &TabletToolDescriptor, event: &TabletDownEvent) {
-        match self {
-            PointerFocusTarget::WlSurface { surface, .. } => {
-                TabletToolTarget::down(surface, seat, data, tool_descriptor, event);
-            }
-            PointerFocusTarget::X11Surface { surface, .. } => {
-                TabletToolTarget::down(surface, seat, data, tool_descriptor, event);
-            }
-            _ => {}
-        }
-    }
-
-    fn up(&self, seat: &Seat<State>, data: &mut State, tool_descriptor: &TabletToolDescriptor, event: &TabletUpEvent) {
-        match self {
-            PointerFocusTarget::WlSurface { surface, .. } => {
-                TabletToolTarget::up(surface, seat, data, tool_descriptor, event);
-            }
-            PointerFocusTarget::X11Surface { surface, .. } => {
-                TabletToolTarget::up(surface, seat, data, tool_descriptor, event);
-            }
-            _ => {}
-        }
-    }
-
-    fn motion(
-        &self,
-        seat: &Seat<State>,
-        data: &mut State,
-        tool_descriptor: &TabletToolDescriptor,
-        event: &TabletMotionEvent,
-    ) {
-        match self {
-            PointerFocusTarget::WlSurface { surface, .. } => {
-                TabletToolTarget::motion(surface, seat, data, tool_descriptor, event);
-            }
-            PointerFocusTarget::X11Surface { surface, .. } => {
-                TabletToolTarget::motion(surface, seat, data, tool_descriptor, event);
-            }
-            _ => {}
-        }
-    }
-
-    fn axis(&self, seat: &Seat<State>, data: &mut State, tool_descriptor: &TabletToolDescriptor, frame: TabletAxisFrame) {
-        match self {
-            PointerFocusTarget::WlSurface { surface, .. } => {
-                TabletToolTarget::axis(surface, seat, data, tool_descriptor, frame);
-            }
-            PointerFocusTarget::X11Surface { surface, .. } => {
-                TabletToolTarget::axis(surface, seat, data, tool_descriptor, frame);
-            }
-            _ => {}
-        }
-    }
-
-    fn button(
-        &self,
-        seat: &Seat<State>,
-        data: &mut State,
-        tool_descriptor: &TabletToolDescriptor,
-        event: &TabletButtonEvent,
-    ) {
-        match self {
-            PointerFocusTarget::WlSurface { surface, .. } => {
-                TabletToolTarget::button(surface, seat, data, tool_descriptor, event);
-            }
-            PointerFocusTarget::X11Surface { surface, .. } => {
-                TabletToolTarget::button(surface, seat, data, tool_descriptor, event);
-            }
-            _ => {}
-        }
-    }
-
-    fn frame(&self, seat: &Seat<State>, data: &mut State, tool_descriptor: &TabletToolDescriptor, time: u32) {
-        match self {
-            PointerFocusTarget::WlSurface { surface, .. } => {
-                TabletToolTarget::frame(surface, seat, data, tool_descriptor, time);
-            }
-            PointerFocusTarget::X11Surface { surface, .. } => {
-                TabletToolTarget::frame(surface, seat, data, tool_descriptor, time);
-            }
-            _ => {}
-        }
     }
 }
