@@ -884,11 +884,13 @@ impl SurfaceThreadState {
         // handle edge-cases right after resume
         if !matches!(
             self.state,
-            QueueState::WaitingForVBlank { .. } | QueueState::Idle
+            QueueState::WaitingForVBlank { .. } | QueueState::Idle | QueueState::Queued(..)
         ) {
             match mem::replace(&mut self.state, QueueState::Idle) {
-                QueueState::WaitingForVBlank { .. } | QueueState::Idle => unreachable!(),
-                QueueState::Queued(token) | QueueState::WaitingForEstimatedVBlank(token) => {
+                QueueState::WaitingForVBlank { .. } | QueueState::Idle | QueueState::Queued(..) => {
+                    unreachable!()
+                }
+                QueueState::WaitingForEstimatedVBlank(token) => {
                     self.loop_handle.remove(token);
                 }
                 QueueState::WaitingForEstimatedVBlankAndQueued {
@@ -1032,7 +1034,7 @@ impl SurfaceThreadState {
         let (redraw_needed, immediate_draw) = match mem::replace(&mut self.state, QueueState::Idle)
         {
             QueueState::Idle => unreachable!(),
-            QueueState::Queued(_) => unreachable!(),
+            QueueState::Queued(_) => (false, false),
             QueueState::WaitingForVBlank {
                 redraw_needed,
                 immediate_draw,
@@ -1100,7 +1102,11 @@ impl SurfaceThreadState {
                     immediate_draw: immediate,
                 };
             }
-            return;
+            if !(self.timings.vrr() && immediate) {
+                // we want to block background surface, only allow fullscreen surface to queue redraw
+                // if fullscreen surface come, let it queue redraw again, don't wait for vblank.
+                return;
+            }
         }
 
         if !force {
@@ -1196,6 +1202,12 @@ impl SurfaceThreadState {
                     estimated_vblank: *estimated_vblank,
                     queued_render: token,
                 };
+            }
+            QueueState::WaitingForVBlank {
+                redraw_needed,
+                immediate_draw,
+            } if force => {
+                self.state = QueueState::Queued(token);
             }
             _ => unreachable!(),
         }
