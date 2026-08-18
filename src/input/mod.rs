@@ -43,8 +43,7 @@ use smithay::{
         AbsolutePositionEvent, Axis, AxisRelativeDirection, AxisSource, Device, DeviceCapability,
         GestureBeginEvent, GestureEndEvent, GesturePinchUpdateEvent as _,
         GestureSwipeUpdateEvent as _, InputBackend, InputEvent, KeyState, KeyboardKeyEvent,
-        PointerAxisEvent, ProximityState, TabletToolButtonEvent, TabletToolEvent,
-        TabletToolProximityEvent, TabletToolTipEvent, TabletToolTipState, TouchEvent,
+        PointerAxisEvent, TouchEvent,
     },
     desktop::{PopupKeyboardGrab, WindowSurfaceType, utils::under_from_surface_tree},
     input::{
@@ -56,7 +55,6 @@ use smithay::{
             GestureSwipeBeginEvent, GestureSwipeEndEvent, GestureSwipeUpdateEvent, MotionEvent,
             PointerGrab, PointerHandle, RelativeMotionEvent,
         },
-        tablet::{self, TabletDescriptor, TabletSeatTrait},
         touch::{DownEvent, MotionEvent as TouchMotionEvent, UpEvent},
     },
     output::Output,
@@ -178,25 +176,12 @@ impl State {
                 let seat = shell.seats.last_active();
                 let led_state = seat.get_keyboard().unwrap().led_state();
                 seat.devices().add_device(&device, led_state);
-                if device.has_capability(DeviceCapability::TabletTool) {
-                    seat.tablet_seat().add_wp_tablet(
-                        &self.common.display_handle,
-                        &TabletDescriptor::from(&device),
-                    );
-                }
             }
             InputEvent::DeviceRemoved { device } => {
                 for seat in &mut self.common.shell.read().seats.iter() {
                     let devices = seat.devices();
                     if devices.has_device(&device) {
                         devices.remove_device(&device);
-                        if device.has_capability(DeviceCapability::TabletTool) {
-                            seat.tablet_seat()
-                                .remove_tablet(&TabletDescriptor::from(&device));
-                            if seat.tablet_seat().count_tablets() == 0 {
-                                seat.tablet_seat().clear_tools();
-                            }
-                        }
                         break;
                     }
                 }
@@ -1438,38 +1423,6 @@ impl State {
                             time: self.common.clock.now().as_millis(),
                         },
                     );
-
-                    let tablet_seat = seat.tablet_seat();
-
-                    let tablet = tablet_seat.get_tablet(&TabletDescriptor::from(&event.device()));
-                    let tool = tablet_seat.get_tool(&event.tool());
-
-                    if let (Some(_tablet), Some(tool)) = (tablet, tool) {
-                        let frame = tablet::tool::AxisFrame {
-                            pressure: event.pressure_has_changed().then(|| event.pressure()),
-                            distance: event.distance_has_changed().then(|| event.distance()),
-                            tilt: event.tilt_has_changed().then(|| event.tilt()),
-                            rotation: event.rotation_has_changed().then(|| event.rotation()),
-                            slider: event.slider_has_changed().then(|| event.slider_position()),
-                            wheel: event
-                                .wheel_has_changed()
-                                .then(|| (event.wheel_delta(), event.wheel_delta_discrete())),
-                        };
-
-                        tool.axis(self, frame);
-
-                        tool.motion(
-                            self,
-                            under,
-                            &tablet::tool::MotionEvent {
-                                location: position.as_logical(),
-                                serial: SERIAL_COUNTER.next_serial(),
-                                time: event.time_msec(),
-                            },
-                        );
-
-                        tool.frame(self, event.time_msec());
-                    }
                 }
             }
             InputEvent::TabletToolProximity { event, .. } => {
@@ -1501,52 +1454,6 @@ impl State {
                             time: self.common.clock.now().as_millis(),
                         },
                     );
-
-                    let tablet_seat = seat.tablet_seat();
-
-                    let tablet = tablet_seat.get_tablet(&TabletDescriptor::from(&event.device()));
-                    let dh = self.common.display_handle.clone();
-                    let tool = tablet_seat.add_wp_tool(self, &dh, &event.tool());
-
-                    if let Some(tablet) = tablet {
-                        let frame = tablet::tool::AxisFrame {
-                            pressure: event.pressure_has_changed().then(|| event.pressure()),
-                            distance: event.distance_has_changed().then(|| event.distance()),
-                            tilt: event.tilt_has_changed().then(|| event.tilt()),
-                            rotation: event.rotation_has_changed().then(|| event.rotation()),
-                            slider: event.slider_has_changed().then(|| event.slider_position()),
-                            wheel: event
-                                .wheel_has_changed()
-                                .then(|| (event.wheel_delta(), event.wheel_delta_discrete())),
-                        };
-
-                        match event.state() {
-                            ProximityState::In => {
-                                tool.proximity_in(
-                                    self,
-                                    under,
-                                    tablet,
-                                    &tablet::tool::ProximityInEvent {
-                                        location: position.as_logical(),
-                                        axis: Some(frame),
-                                        serial: SERIAL_COUNTER.next_serial(),
-                                        time: event.time_msec(),
-                                    },
-                                );
-                            }
-                            ProximityState::Out => {
-                                tool.proximity_out(
-                                    self,
-                                    &tablet::tool::ProximityOutEvent {
-                                        serial: SERIAL_COUNTER.next_serial(),
-                                        time: event.time_msec(),
-                                    },
-                                );
-                            }
-                        }
-
-                        tool.frame(self, event.time_msec());
-                    }
                 }
             }
             InputEvent::TabletToolTip { event, .. } => {
@@ -1560,29 +1467,6 @@ impl State {
                 if let Some(seat) = maybe_seat {
                     self.common.idle_notifier_state.notify_activity(&seat);
                     notify_cursor_activity(self, &seat);
-                    if let Some(tool) = seat.tablet_seat().get_tool(&event.tool()) {
-                        match event.tip_state() {
-                            TabletToolTipState::Down => {
-                                tool.down(
-                                    self,
-                                    &tablet::tool::DownEvent {
-                                        serial: SERIAL_COUNTER.next_serial(),
-                                        time: event.time_msec(),
-                                    },
-                                );
-                            }
-                            TabletToolTipState::Up => {
-                                tool.up(
-                                    self,
-                                    &tablet::tool::UpEvent {
-                                        serial: SERIAL_COUNTER.next_serial(),
-                                        time: event.time_msec(),
-                                    },
-                                );
-                            }
-                        }
-                        tool.frame(self, event.time_msec());
-                    }
                 }
             }
             InputEvent::TabletToolButton { event, .. } => {
@@ -1596,18 +1480,6 @@ impl State {
                 if let Some(seat) = maybe_seat {
                     self.common.idle_notifier_state.notify_activity(&seat);
                     notify_cursor_activity(self, &seat);
-                    if let Some(tool) = seat.tablet_seat().get_tool(&event.tool()) {
-                        tool.button(
-                            self,
-                            &tablet::tool::ButtonEvent {
-                                serial: SERIAL_COUNTER.next_serial(),
-                                button: event.button(),
-                                state: event.button_state(),
-                                time: event.time_msec(),
-                            },
-                        );
-                        tool.frame(self, event.time_msec());
-                    }
                 }
             }
             InputEvent::Special(_) => {}

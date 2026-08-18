@@ -31,9 +31,12 @@ use smithay::{
         tablet::{
             Tablet,
             tool::{
-                AxisFrame as TabletAxisFrame, ButtonEvent as TabletButtonEvent,
-                DownEvent as TabletDownEvent, MotionEvent as TabletMotionEvent, TabletToolTarget,
+                TabletToolTarget,
+                DownEvent as TabletDownEvent,
                 UpEvent as TabletUpEvent,
+                MotionEvent as TabletMotionEvent,
+                AxisFrame as TabletAxisFrame,
+                ButtonEvent as TabletButtonEvent,
             },
         },
         touch::{
@@ -868,35 +871,16 @@ impl TabletToolTarget<State> for PointerFocusTarget {
     ) {
         match self {
             PointerFocusTarget::WlSurface { surface, .. } => {
-                TabletToolTarget::proximity_in(
-                    surface,
-                    seat,
-                    data,
-                    tool_descriptor,
-                    tablet,
-                    serial,
-                );
+                TabletToolTarget::proximity_in(surface, seat, data, tool_descriptor, tablet, serial);
             }
             PointerFocusTarget::X11Surface { surface, .. } => {
-                TabletToolTarget::proximity_in(
-                    surface,
-                    seat,
-                    data,
-                    tool_descriptor,
-                    tablet,
-                    serial,
-                );
+                TabletToolTarget::proximity_in(surface, seat, data, tool_descriptor, tablet, serial);
             }
             _ => {}
         }
     }
 
-    fn proximity_out(
-        &self,
-        seat: &Seat<State>,
-        data: &mut State,
-        tool_descriptor: &TabletToolDescriptor,
-    ) {
+    fn proximity_out(&self, seat: &Seat<State>, data: &mut State, tool_descriptor: &TabletToolDescriptor) {
         match self {
             PointerFocusTarget::WlSurface { surface, .. } => {
                 TabletToolTarget::proximity_out(surface, seat, data, tool_descriptor);
@@ -908,13 +892,7 @@ impl TabletToolTarget<State> for PointerFocusTarget {
         }
     }
 
-    fn down(
-        &self,
-        seat: &Seat<State>,
-        data: &mut State,
-        tool_descriptor: &TabletToolDescriptor,
-        event: &TabletDownEvent,
-    ) {
+    fn down(&self, seat: &Seat<State>, data: &mut State, tool_descriptor: &TabletToolDescriptor, event: &TabletDownEvent) {
         match self {
             PointerFocusTarget::WlSurface { surface, .. } => {
                 TabletToolTarget::down(surface, seat, data, tool_descriptor, event);
@@ -926,13 +904,7 @@ impl TabletToolTarget<State> for PointerFocusTarget {
         }
     }
 
-    fn up(
-        &self,
-        seat: &Seat<State>,
-        data: &mut State,
-        tool_descriptor: &TabletToolDescriptor,
-        event: &TabletUpEvent,
-    ) {
+    fn up(&self, seat: &Seat<State>, data: &mut State, tool_descriptor: &TabletToolDescriptor, event: &TabletUpEvent) {
         match self {
             PointerFocusTarget::WlSurface { surface, .. } => {
                 TabletToolTarget::up(surface, seat, data, tool_descriptor, event);
@@ -962,13 +934,7 @@ impl TabletToolTarget<State> for PointerFocusTarget {
         }
     }
 
-    fn axis(
-        &self,
-        seat: &Seat<State>,
-        data: &mut State,
-        tool_descriptor: &TabletToolDescriptor,
-        frame: TabletAxisFrame,
-    ) {
+    fn axis(&self, seat: &Seat<State>, data: &mut State, tool_descriptor: &TabletToolDescriptor, frame: TabletAxisFrame) {
         match self {
             PointerFocusTarget::WlSurface { surface, .. } => {
                 TabletToolTarget::axis(surface, seat, data, tool_descriptor, frame);
@@ -998,13 +964,7 @@ impl TabletToolTarget<State> for PointerFocusTarget {
         }
     }
 
-    fn frame(
-        &self,
-        seat: &Seat<State>,
-        data: &mut State,
-        tool_descriptor: &TabletToolDescriptor,
-        time: u32,
-    ) {
+    fn frame(&self, seat: &Seat<State>, data: &mut State, tool_descriptor: &TabletToolDescriptor, time: u32) {
         match self {
             PointerFocusTarget::WlSurface { surface, .. } => {
                 TabletToolTarget::frame(surface, seat, data, tool_descriptor, time);
