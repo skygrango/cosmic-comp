@@ -59,9 +59,11 @@ mod device;
 mod drm_helpers;
 pub mod render;
 mod surface;
+mod thread;
 use device::*;
 pub(crate) use surface::Surface;
 pub use surface::Timings;
+pub use thread::{KmsMessage, start_kms_thread};
 
 use super::render::{CLEAR_COLOR, CursorMode, output_elements};
 
@@ -214,7 +216,7 @@ fn init_libinput(
         state.process_input_event(event, crate::input::InputBackendId::Normal);
 
         for output in state.common.shell.read().outputs() {
-            state.backend.kms().schedule_render(output);
+            state.backend.kms().schedule_render(output, false);
         }
     })
     .map_err(|err| err.error)
@@ -700,14 +702,14 @@ impl KmsState {
         Ok(node)
     }
 
-    pub fn schedule_render(&mut self, output: &Output) {
+    pub fn schedule_render(&mut self, output: &Output, immediate_draw: bool) {
         for surface in self
             .drm_devices
             .values()
             .flat_map(|d| d.inner.surfaces.values())
             .filter(|s| s.output == *output || s.output.mirroring().is_some_and(|o| &o == output))
         {
-            surface.schedule_render();
+            surface.schedule_render(immediate_draw);
         }
     }
 
@@ -804,14 +806,14 @@ impl KmsState {
 }
 
 impl KmsGuard<'_> {
-    pub fn schedule_render(&mut self, output: &Output) {
+    pub fn schedule_render(&mut self, output: &Output, immediate_draw: bool) {
         for surface in self
             .drm_devices
             .values()
             .flat_map(|d| d.inner.surfaces.values())
             .filter(|s| s.output == *output || s.output.mirroring().is_some_and(|o| &o == output))
         {
-            surface.schedule_render();
+            surface.schedule_render(immediate_draw);
         }
     }
 
@@ -879,6 +881,7 @@ impl KmsGuard<'_> {
         shell: Arc<parking_lot::RwLock<Shell>>,
         startup_done: Arc<AtomicBool>,
         clock: &Clock<Monotonic>,
+        display_handle: DisplayHandle,
     ) -> Result<(), anyhow::Error> {
         if !self.session.is_active() {
             return Ok(());
@@ -993,11 +996,13 @@ impl KmsGuard<'_> {
                         self.primary_node.clone(),
                         conn,
                         Some(crtc),
+                        display_handle.clone(),
                         (w, 0),
                         loop_handle,
                         screen_filter.clone(),
                         shell.clone(),
                         startup_done.clone(),
+                        device.kms_thread.clone(),
                     )?;
                     if output.mirroring().is_none() {
                         w += output.geometry().size.w as u32;
@@ -1126,6 +1131,7 @@ impl KmsGuard<'_> {
                         }
 
                         let vrr = output_config.0.vrr;
+                        let vrr_target_rate = output_config.0.vrr_target_rate;
                         std::mem::drop(output_config);
 
                         let compositor_ref = drm.compositors().get(crtc).unwrap().lock().unwrap();
@@ -1166,8 +1172,21 @@ impl KmsGuard<'_> {
                             surface.output.config_mut().vrr = AdaptiveSync::Disabled;
                             surface.output.set_adaptive_sync(AdaptiveSync::Disabled);
                         }
+
+                        if let Some(rate) = vrr_target_rate {
+                            surface.set_vrr_target_rate(rate);
+                        } else {
+                            surface.set_vrr_target_rate(
+                                surface
+                                    .output
+                                    .current_mode()
+                                    .map(|m| m.refresh as u32)
+                                    .unwrap_or(60000),
+                            );
+                        }
                     } else {
                         let vrr = output_config.0.vrr;
+                        let vrr_target_rate = output_config.0.vrr_target_rate;
                         std::mem::drop(output_config);
                         if vrr != surface.output.adaptive_sync() {
                             if match surface.output.adaptive_sync_support() {
@@ -1184,6 +1203,18 @@ impl KmsGuard<'_> {
 
                             surface.use_adaptive_sync(vrr);
                             surface.output.set_adaptive_sync(vrr);
+                        }
+
+                        if let Some(rate) = vrr_target_rate {
+                            surface.set_vrr_target_rate(rate);
+                        } else {
+                            surface.set_vrr_target_rate(
+                                surface
+                                    .output
+                                    .current_mode()
+                                    .map(|m| m.refresh as u32)
+                                    .unwrap_or(60000),
+                            );
                         }
 
                         let mut renderer = self

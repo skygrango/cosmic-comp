@@ -222,6 +222,7 @@ impl Surface {
         let mut fb = renderer
             .bind(&mut buffer)
             .with_context(|| "Failed to bind dmabuf")?;
+
         match render::render_output(
             None,
             renderer,
@@ -381,6 +382,7 @@ pub fn init_backend(
             &state.common.xdg_activation_state,
             state.common.startup_done.clone(),
             &state.common.clock,
+            state.common.display_handle.clone(),
         ) {
             error!("Unrecoverable output configuration error: {}", err);
         }

@@ -198,12 +198,23 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
             return;
         }
 
+        // let outpus: Vec<_> = state.outputs().collect();
+
+        // for output in outpus {
+        //     let _ = signal_commit_timing(
+        //         &state.common.shell,
+        //         &output,
+        //         state.common.clock.now(),
+        //         &state.common.display_handle,
+        //     );
+        // }
+
         // trigger routines
         let clients = state.common.shell.write().update_animations();
         {
             let dh = state.common.display_handle.clone();
             for client in clients.values() {
-                client_compositor_state(client).blocker_cleared(state, &dh);
+                client_compositor_state(client).blocker_cleared(&dh);
             }
         }
 
@@ -213,7 +224,7 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
             let shell = state.common.shell.read();
             if shell.animations_going() {
                 for output in shell.outputs().cloned().collect::<Vec<_>>().into_iter() {
-                    state.backend.schedule_render(&output);
+                    state.backend.schedule_render(&output, false);
                 }
             }
         }
@@ -365,3 +376,88 @@ fn refresh(state: &mut State) {
     KeyboardLayoutState::refresh(state);
     state.last_refresh = LastRefresh::At(Instant::now());
 }
+
+// pub fn clear_commit_timing(surface: &WlSurface, states: &SurfaceData) {
+//     if let Some(mut commit_timer_state) = states
+//         .data_map
+//         .get::<CommitTimerBarrierStateUserData>()
+//         .map(|commit_timer| commit_timer.lock().unwrap())
+//     {
+//         let _ = commit_timer_state.signal_until(until);
+//     }
+// }
+
+// pub fn signal_commit_timing(
+//     shell: &Arc<parking_lot::RwLock<Shell>>,
+//     output: &Output,
+//     fullscreen_surface: Option<CosmicSurface>,
+//     until: Time<Monotonic>,
+//     dh: &DisplayHandle,
+// ) -> Option<smithay::wayland::commit_timing::Timestamp> {
+//     let mut clients: HashMap<ClientId, Client> = HashMap::new();
+//     let mut next_deadline = None;
+//     let enable_commit_timing = fullscreen_surface.is_some();
+//     let mut clear_commit_timing = |surface: &WlSurface, states: &SurfaceData| {
+//         if let Some(mut commit_timer_state) = states
+//             .data_map
+//             .get::<CommitTimerBarrierStateUserData>()
+//             .map(|commit_timer| commit_timer.lock().unwrap())
+//         {
+//             if commit_timer_state.signal_until(until)
+//                 && let Some(client) = surface.client()
+//             {
+//                 clients.insert(client.id(), client);
+//             }
+//         }
+//     };
+//     let mut get_commit_timing = |surface: &WlSurface, states: &SurfaceData| {
+//         if let Some(mut commit_timer_state) = states
+//             .data_map
+//             .get::<CommitTimerBarrierStateUserData>()
+//             .map(|commit_timer| commit_timer.lock().unwrap())
+//         {
+//             let deadline = commit_timer_state.next_deadline();
+//             if commit_timer_state.signal_until(until)
+//                 && let Some(client) = surface.client()
+//             {
+//                 clients.insert(client.id(), client);
+
+//                 if let Some(deadline) = deadline {
+//                     next_deadline =
+//                         Some(next_deadline.map_or(deadline, |min| std::cmp::min(min, deadline)));
+//                 }
+//             }
+//         }
+//     };
+//     shell
+//         .read()
+//         .for_each_surface_on_output(output, |toplevel| match toplevel {
+//             OutputSurface::Window(cosmic_surface, _workspace, is_active, is_fullscreen) => {
+//                 if enable_commit_timing {
+//                     if is_fullscreen
+//                         && is_active
+//                         && let Some(fullscreen_surface) = &fullscreen_surface
+//                         && cosmic_surface == fullscreen_surface
+//                     {
+//                         cosmic_surface.with_surfaces(&mut get_commit_timing);
+//                     } else {
+//                         cosmic_surface.with_surfaces(&mut clear_commit_timing);
+//                     }
+//                 } else {
+//                     cosmic_surface.with_surfaces(&mut clear_commit_timing);
+//                 }
+//             }
+//             OutputSurface::Layer(layer_surface, _) => {
+//                 layer_surface.with_surfaces(&mut clear_commit_timing)
+//             }
+//             OutputSurface::Surface(wl_surface) => {
+//                 with_surfaces_surface_tree(wl_surface, &mut clear_commit_timing)
+//             }
+//             _ => {}
+//         });
+
+//     for (_client_id, client) in clients {
+//         client_compositor_state(&client).blocker_cleared(&dh);
+//     }
+//     next_deadline
+// }
