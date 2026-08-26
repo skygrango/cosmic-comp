@@ -566,8 +566,7 @@ pub fn cursor_elements<'a, 'frame, R>(
             .user_data()
             .get::<SeatMoveGrabState>()
             .unwrap()
-            .lock()
-            .unwrap()
+            .read()
             .as_ref()
         {
             grab_state.render(renderer, output, theme, scanout_node, &mut |elem| {
@@ -787,8 +786,7 @@ where
         .user_data()
         .get::<SeatMoveGrabState>()
         .unwrap()
-        .lock()
-        .unwrap()
+        .read()
         .is_some();
     let focused_output = last_active_seat.focused_or_active_output();
     let set = shell.workspaces.sets.get(output).ok_or(OutputNoMode)?;

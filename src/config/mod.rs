@@ -29,6 +29,7 @@ pub use smithay::{
             AccelProfile, ClickMethod, Device as InputDevice, ScrollMethod, SendEventsMode,
             TapButtonMap,
         },
+        wayland_server::DisplayHandle as DH,
     },
     utils::{Logical, Physical, Point, SERIAL_COUNTER, Size, Transform},
 };
@@ -411,6 +412,7 @@ impl Config {
         xdg_activation_state: &XdgActivationState,
         startup_done: Arc<AtomicBool>,
         clock: &Clock<Monotonic>,
+        display_handle: DH,
     ) -> anyhow::Result<()> {
         let outputs = output_state.outputs().collect::<Vec<_>>();
         let mut infos = outputs
@@ -478,6 +480,7 @@ impl Config {
                 xdg_activation_state,
                 startup_done.clone(),
                 clock,
+                display_handle.clone(),
             ) {
                 warn!(?err, "Failed to set new config.");
                 found_outputs.clear();
@@ -501,6 +504,7 @@ impl Config {
                         xdg_activation_state,
                         startup_done,
                         clock,
+                        display_handle.clone(),
                     )
                     .context("Failed to reset config")?;
 
@@ -560,6 +564,7 @@ impl Config {
                     xdg_activation_state,
                     startup_done.clone(),
                     clock,
+                    display_handle.clone(),
                 )
                 .context("Failed to set new config")?;
 
@@ -968,7 +973,7 @@ fn config_changed(config: cosmic_config::Config, keys: Vec<String>, state: &mut 
                     state.common.config.cosmic_conf.appearance_settings = new;
                     state.common.update_config();
                     for output in state.common.shell.read().outputs() {
-                        state.backend.schedule_render(output);
+                        state.backend.schedule_render(output, false);
                     }
                 }
             }
@@ -990,7 +995,7 @@ fn config_changed(config: cosmic_config::Config, keys: Vec<String>, state: &mut 
                         let outputs: Vec<_> =
                             state.common.shell.read().outputs().cloned().collect();
                         for output in outputs {
-                            state.backend.schedule_render(&output);
+                            state.backend.schedule_render(&output, false);
                         }
                     }
                 }

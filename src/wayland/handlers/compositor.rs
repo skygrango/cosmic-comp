@@ -31,7 +31,11 @@ use smithay::{
     },
     xwayland::XWaylandClientData,
 };
-use std::{collections::VecDeque, sync::Mutex, time::Duration};
+use std::{collections::VecDeque, sync::LazyLock, sync::Mutex, time::Duration};
+
+pub static FULLSCREEN_IMMEDIATE_RENDER: LazyLock<bool> = LazyLock::new(|| {
+    crate::utils::env::bool_var("COSMIC_FULLSCREEN_IMMEDIATE_RENDER").unwrap_or(true)
+});
 
 fn toplevel_ensure_initial_configure(
     toplevel: &ToplevelSurface,
@@ -173,6 +177,13 @@ impl CompositorHandler for State {
         client_compositor_state(client)
     }
 
+    // fn schedule_render(&mut self, surface: &WlSurface) {
+    //     let shell = self.common.shell.read();
+    //     if let Some(output) = shell.visible_output_for_surface(surface) {
+    //         self.backend.schedule_render(output);
+    //     }
+    // }
+
     fn new_surface(&mut self, surface: &WlSurface) {
         add_pre_commit_hook::<Self, _>(surface, move |state, _dh, surface| {
             let mut acquire_point = None;
@@ -205,9 +216,7 @@ impl CompositorHandler for State {
                             .event_loop_handle
                             .insert_source(source, move |_, _, state| {
                                 let dh = state.common.display_handle.clone();
-                                state
-                                    .client_compositor_state(&client)
-                                    .blocker_cleared(state, &dh);
+                                state.client_compositor_state(&client).blocker_cleared(&dh);
                                 Ok(())
                             });
                     if res.is_ok() {
@@ -223,9 +232,7 @@ impl CompositorHandler for State {
                             .event_loop_handle
                             .insert_source(source, move |_, _, state| {
                                 let dh = state.common.display_handle.clone();
-                                state
-                                    .client_compositor_state(&client)
-                                    .blocker_cleared(state, &dh);
+                                state.client_compositor_state(&client).blocker_cleared(&dh);
                                 Ok(())
                             });
                     if res.is_ok() {
@@ -274,7 +281,13 @@ impl CompositorHandler for State {
 
         // schedule a new render
         if let Some(output) = shell.visible_output_for_surface(surface) {
-            self.backend.schedule_render(output);
+            let immediate = *FULLSCREEN_IMMEDIATE_RENDER
+                && output
+                    .is_foreground_fullscreen_occupied()
+                    .is_some_and(|cosmic_surface| {
+                        cosmic_surface.has_surface(surface, WindowSurfaceType::ALL)
+                    });
+            self.backend.schedule_render(output, immediate);
         }
 
         if mapped {
@@ -301,8 +314,7 @@ impl CompositorHandler for State {
                 .user_data()
                 .get::<SeatMoveGrabState>()
                 .unwrap()
-                .lock()
-                .unwrap()
+                .read()
                 .as_ref()
                 .and_then(|state| {
                     state

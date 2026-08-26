@@ -354,7 +354,7 @@ impl State {
                             cursor.is_magnifying()
                         };
                         if active {
-                            self.backend.schedule_render(&current_output);
+                            self.backend.schedule_render(&current_output, false);
                         }
                     }
 

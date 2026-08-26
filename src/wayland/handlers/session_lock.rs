@@ -37,8 +37,14 @@ impl SessionLockHandler for State {
             surfaces: HashMap::new(),
         });
 
+        for device in self.backend.kms().drm_devices.values_mut() {
+            for surface in device.inner.surfaces.values_mut() {
+                surface.set_session_lock(true);
+            }
+        }
+
         for output in shell.outputs() {
-            self.backend.schedule_render(output);
+            self.backend.schedule_render(output, false);
         }
     }
 
@@ -46,13 +52,14 @@ impl SessionLockHandler for State {
         let mut shell = self.common.shell.write();
         shell.session_lock = None;
 
-        let seats = shell.seats.iter().cloned().collect::<Vec<_>>();
-        for seat in &seats {
-            self.common.idle_notifier_state.notify_activity(seat);
+        for device in self.backend.kms().drm_devices.values_mut() {
+            for surface in device.inner.surfaces.values_mut() {
+                surface.set_session_lock(false);
+            }
         }
 
         for output in shell.outputs() {
-            self.backend.schedule_render(output);
+            self.backend.schedule_render(output, false);
         }
     }
 

@@ -10,7 +10,7 @@ use crate::{
     config::{CompOutputConfig, Config, ScreenFilter},
     dbus::DBusState,
     input::{PointerFocusState, gestures::GestureState},
-    shell::{CosmicSurface, SeatExt, Shell, grabs::SeatMoveGrabState},
+    shell::{CosmicSurface, OutputSurface, SeatExt, Shell, grabs::SeatMoveGrabState},
     utils::prelude::OutputExt,
     wayland::{
         handlers::{data_device::get_dnd_icon, image_copy_capture::SessionHolder},
@@ -77,6 +77,7 @@ use smithay::{
         compositor::{CompositorClientState, CompositorState, SurfaceData},
         cursor_shape::CursorShapeManagerState,
         dmabuf::{DmabufFeedback, DmabufGlobal, DmabufState},
+        fifo::FifoManagerState,
         fixes::FixesState,
         fractional_scale::{FractionalScaleManagerState, with_fractional_scale},
         idle_inhibit::IdleInhibitManagerState,
@@ -279,6 +280,8 @@ pub struct Common {
     pub data_device_state: DataDeviceState,
     pub dmabuf_state: DmabufState,
     pub fractional_scale_state: FractionalScaleManagerState,
+    //pub commit_timing_manager_state: CommitTimingManagerState,
+    pub fifo_manager_state: FifoManagerState,
     pub keyboard_shortcuts_inhibit_state: KeyboardShortcutsInhibitState,
     pub output_state: OutputManagerState,
     pub output_configuration_state: OutputConfigurationState<State>,
@@ -352,8 +355,8 @@ pub struct SurfaceDmabufFeedback {
 }
 
 #[derive(Debug)]
-struct SurfaceFrameThrottlingState {
-    last_sent_at: RefCell<Option<(WeakOutput, usize)>>,
+pub struct SurfaceFrameThrottlingState {
+    pub last_sent_at: RefCell<Option<(WeakOutput, usize)>>,
 }
 impl Default for SurfaceFrameThrottlingState {
     fn default() -> Self {
@@ -385,13 +388,13 @@ impl BackendData {
         }
     }
 
-    pub fn schedule_render(&mut self, output: &Output) {
+    pub fn schedule_render(&mut self, output: &Output, force: bool) {
         match self {
             BackendData::Winit(_) => {} // We cannot do this on the winit backend.
             // Winit has a very strict render-loop and skipping frames breaks atleast the wayland winit-backend.
             // Swapping with damage (which should be empty on these frames) is likely good enough anyway.
             BackendData::X11(state) => state.schedule_render(output),
-            BackendData::Kms(state) => state.schedule_render(output),
+            BackendData::Kms(state) => state.schedule_render(output, force),
             _ => unreachable!("No backend was initialized"),
         }
     }
@@ -518,6 +521,7 @@ impl LockedBackend<'_> {
         xdg_activation_state: &XdgActivationState,
         startup_done: Arc<AtomicBool>,
         clock: &Clock<Monotonic>,
+        display_handle: DisplayHandle,
     ) -> Result<(), anyhow::Error> {
         let all_outputs = self.all_outputs();
 
@@ -546,11 +550,9 @@ impl LockedBackend<'_> {
             )))
             .filter(|x| *x != output.current_location());
             output.change_current_state(mode, transform, scale.map(Scale::Fractional), location);
-
-            output.set_adaptive_sync(final_config.0.vrr);
         }
 
-        match self {
+        let res = match self {
             LockedBackend::Kms(state) => state.apply_config_for_outputs(
                 test_only,
                 loop_handle,
@@ -558,10 +560,20 @@ impl LockedBackend<'_> {
                 shell.clone(),
                 startup_done,
                 clock,
+                display_handle.clone(),
             ),
             LockedBackend::Winit(state) => state.apply_config_for_outputs(test_only),
             LockedBackend::X11(state) => state.apply_config_for_outputs(test_only),
-        }?;
+        };
+
+        if !test_only && res.is_ok() {
+            for output in &all_outputs {
+                let vrr = output.config().vrr;
+                output.set_adaptive_sync(vrr);
+            }
+        }
+
+        res?;
 
         let mut shell_ref = shell.write();
         for output in &all_outputs {
@@ -607,7 +619,7 @@ impl LockedBackend<'_> {
                 // Winit has a very strict render-loop and skipping frames breaks atleast the wayland winit-backend.
                 // Swapping with damage (which should be empty on these frames) is likely good enough anyway.
                 LockedBackend::X11(state) => state.schedule_render(&output),
-                LockedBackend::Kms(state) => state.schedule_render(&output),
+                LockedBackend::Kms(state) => state.schedule_render(&output, false),
             }
         }
 
@@ -659,6 +671,20 @@ impl State {
         with_xwayland: bool,
         kiosk_command: Option<Command>,
     ) -> State {
+        // if let Ok(rtkit) = RTKit::new() {
+        //     let _ = rtkit.make_thread_realtime(RTKit::current_thread_id(), 1);
+        // }
+
+        unsafe {
+            let min_priority = libc::sched_get_priority_min(libc::SCHED_RR);
+            let sp = libc::sched_param {
+                sched_priority: min_priority,
+            };
+            if libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_RR, &sp) != 0 {
+                tracing::warn!("Failed to gain real time thread priority (Check CAP_SYS_NICE)");
+            }
+        }
+
         let requested_languages = DesktopLanguageRequester::requested_languages();
         i18n_embed::select(&*LANG_LOADER, &Localizations, &requested_languages)
             .with_context(|| "Failed to load languages")
@@ -666,11 +692,43 @@ impl State {
 
         let clock = Clock::new();
         let config = Config::load(&handle);
-        let compositor_state = CompositorState::new::<Self>(dh);
+
+        let (tx_sender, rx_receiver) = calloop::channel::channel();
+        //let (commit_ping_tx, commit_ping_rx) = calloop::ping::make_ping().unwrap();
+        handle
+            .insert_source(rx_receiver, |event, _, state| {
+                if let calloop::channel::Event::Msg(msg) = event {
+                    use smithay::wayland::compositor::{CompositorEvent, CompositorHandler};
+                    #[allow(deprecated)]
+                    match msg {
+                        CompositorEvent::NewSurface(surface) => {
+                            state.new_surface(&surface);
+                        }
+                        CompositorEvent::NewSubsurface { surface, parent } => {
+                            state.new_subsurface(&surface, &parent);
+                        }
+                        CompositorEvent::Commit(surface) => {
+                            let dh = state.common.display_handle.clone();
+                            smithay::wayland::compositor::invoke_post_commit_hooks(
+                                state, &dh, &surface,
+                            );
+                            state.commit(&surface);
+                        }
+                        CompositorEvent::Destroyed(surface) => {
+                            state.destroyed(&surface);
+                        }
+                    }
+                }
+            })
+            .unwrap();
+        //handle.insert_source(commit_ping_rx, |_, _, _| {}).unwrap();
+        let compositor_state = CompositorState::new::<Self>(dh, tx_sender);
         let corner_radius_state = CornerRadiusState::new::<Self>(dh);
         let data_device_state = DataDeviceState::new::<Self>(dh);
         let dmabuf_state = DmabufState::new();
         let fractional_scale_state = FractionalScaleManagerState::new::<State>(dh);
+        //let commit_timing_manager_state = CommitTimingManagerState::new::<State>(dh);
+        let fifo_manager_state = FifoManagerState::new::<State>(dh);
         let keyboard_shortcuts_inhibit_state = KeyboardShortcutsInhibitState::new::<Self>(dh);
         let output_state = OutputManagerState::new_with_xdg_output::<Self>(dh);
         let output_configuration_state =
@@ -791,6 +849,8 @@ impl State {
                 data_device_state,
                 dmabuf_state,
                 fractional_scale_state,
+                //commit_timing_manager_state,
+                fifo_manager_state,
                 idle_notifier_state,
                 idle_inhibit_manager_state,
                 idle_inhibiting_surfaces,
@@ -1012,7 +1072,7 @@ impl Common {
 
             // grabs
             if let Some(move_grab) = seat.user_data().get::<SeatMoveGrabState>()
-                && let Some(grab_state) = move_grab.lock().unwrap().as_ref()
+                && let Some(grab_state) = move_grab.read().as_ref()
             {
                 for (window, _) in grab_state.element().windows() {
                     window.with_surfaces(processor(None));
@@ -1074,155 +1134,63 @@ impl Common {
         render_element_states: &RenderElementStates,
         mut dmabuf_feedback: impl FnMut(DrmNode) -> Option<SurfaceDmabufFeedback>,
     ) {
-        let shell = self.shell.read();
-
-        if let Some(session_lock) = shell.session_lock.as_ref()
-            && let Some(lock_surface) = session_lock.surfaces.get(output)
-            && let Some(feedback) =
-                advertised_node_for_surface(lock_surface.wl_surface(), &self.display_handle)
-                    .and_then(&mut dmabuf_feedback)
-        {
-            send_dmabuf_feedback_surface_tree(
-                lock_surface.wl_surface(),
-                output,
-                surface_primary_scanout_output,
-                |surface, _| {
-                    select_dmabuf_feedback(
-                        surface,
-                        render_element_states,
-                        &feedback.render_feedback,
-                        &feedback.primary_scanout_feedback,
-                    )
-                },
-            )
-        }
-
-        for seat in shell
-            .seats
-            .iter()
-            .filter(|seat| &seat.active_output() == output)
-        {
-            let cursor_status = seat.cursor_image_status();
-
-            if let CursorImageStatus::Surface(wl_surface) = cursor_status
-                && let Some(feedback) =
-                    advertised_node_for_surface(&wl_surface, &self.display_handle)
-                        .and_then(&mut dmabuf_feedback)
-            {
-                send_dmabuf_feedback_surface_tree(
-                    &wl_surface,
-                    output,
-                    surface_primary_scanout_output,
-                    |surface, _| {
-                        select_dmabuf_feedback(
-                            surface,
-                            render_element_states,
-                            &feedback.render_feedback,
-                            feedback
-                                .overlay_scanout_feedback
-                                .as_ref()
-                                .unwrap_or(&feedback.render_feedback),
-                        )
-                    },
-                );
-            }
-
-            if let Some(icon) = get_dnd_icon(seat)
-                && let Some(feedback) =
-                    advertised_node_for_surface(&icon.surface, &self.display_handle)
-                        .and_then(&mut dmabuf_feedback)
-            {
-                send_dmabuf_feedback_surface_tree(
-                    &icon.surface,
-                    output,
-                    surface_primary_scanout_output,
-                    |surface, _| {
-                        select_dmabuf_feedback(
-                            surface,
-                            render_element_states,
-                            &feedback.render_feedback,
-                            feedback
-                                .overlay_scanout_feedback
-                                .as_ref()
-                                .unwrap_or(&feedback.render_feedback),
-                        )
-                    },
-                );
-            }
-
-            if let Some(move_grab) = seat.user_data().get::<SeatMoveGrabState>()
-                && let Some(grab_state) = move_grab.lock().unwrap().as_ref()
-            {
-                for (window, _) in grab_state.element().windows() {
-                    if let Some(feedback) = window
-                        .wl_surface()
-                        .and_then(|wl_surface| {
-                            advertised_node_for_surface(&wl_surface, &self.display_handle)
-                        })
-                        .and_then(&mut dmabuf_feedback)
+        self.shell
+            .read()
+            .for_each_surface_on_output(output, |toplevel| match toplevel {
+                OutputSurface::Session(wl_surface) => {
+                    if let Some(feedback) =
+                        advertised_node_for_surface(wl_surface, &self.display_handle)
+                            .and_then(&mut dmabuf_feedback)
                     {
-                        window.send_dmabuf_feedback(
+                        send_dmabuf_feedback_surface_tree(
+                            wl_surface,
                             output,
-                            &feedback,
-                            render_element_states,
                             surface_primary_scanout_output,
-                        );
+                            |surface, _| {
+                                select_dmabuf_feedback(
+                                    surface,
+                                    render_element_states,
+                                    &feedback.render_feedback,
+                                    &feedback.primary_scanout_feedback,
+                                    &feedback.primary_scanout_feedback,
+                                )
+                            },
+                        )
                     }
                 }
-            }
-        }
-
-        shell
-            .workspaces
-            .sets
-            .get(output)
-            .unwrap()
-            .sticky_layer
-            .mapped()
-            .for_each(|mapped| {
-                for (window, _) in mapped.windows() {
-                    if let Some(feedback) = window
-                        .wl_surface()
-                        .and_then(|wl_surface| {
-                            advertised_node_for_surface(&wl_surface, &self.display_handle)
-                        })
-                        .and_then(&mut dmabuf_feedback)
-                    {
-                        window.send_dmabuf_feedback(
-                            output,
-                            &feedback,
-                            render_element_states,
-                            surface_primary_scanout_output,
-                        );
-                    }
-                }
-            });
-
-        if let Some(active) = shell.active_space(output) {
-            if let Some(fs) = active.get_fullscreen(shell.seats.last_active())
-                && let Some(feedback) = fs
-                    .surface
-                    .wl_surface()
-                    .and_then(|wl_surface| {
+                OutputSurface::Cursor(wl_surface) => {
+                    if let Some(feedback) =
                         advertised_node_for_surface(&wl_surface, &self.display_handle)
-                    })
-                    .and_then(&mut dmabuf_feedback)
-            {
-                fs.surface.send_dmabuf_feedback(
-                    output,
-                    &feedback,
-                    render_element_states,
-                    surface_primary_scanout_output,
-                );
-            }
-            active.mapped().for_each(|mapped| {
-                for (window, _) in mapped.windows() {
-                    if let Some(feedback) = window
-                        .wl_surface()
-                        .and_then(|wl_surface| {
-                            advertised_node_for_surface(&wl_surface, &self.display_handle)
-                        })
-                        .and_then(&mut dmabuf_feedback)
+                            .and_then(&mut dmabuf_feedback)
+                    {
+                        let overlay = feedback
+                            .overlay_scanout_feedback
+                            .as_ref()
+                            .unwrap_or(&feedback.render_feedback);
+                        send_dmabuf_feedback_surface_tree(
+                            &wl_surface,
+                            output,
+                            surface_primary_scanout_output,
+                            |surface, _| {
+                                select_dmabuf_feedback(
+                                    surface,
+                                    render_element_states,
+                                    &feedback.render_feedback,
+                                    overlay,
+                                    overlay,
+                                )
+                            },
+                        );
+                    }
+                }
+                OutputSurface::Window(window, _space, active, _is_fullscreen) => {
+                    if active
+                        && let Some(feedback) = window
+                            .wl_surface()
+                            .and_then(|wl_surface| {
+                                advertised_node_for_surface(&wl_surface, &self.display_handle)
+                            })
+                            .and_then(&mut dmabuf_feedback)
                     {
                         window.send_dmabuf_feedback(
                             output,
@@ -1232,57 +1200,58 @@ impl Common {
                         );
                     }
                 }
-            });
-        }
-
-        shell.override_redirect_windows.iter().for_each(|or| {
-            if let Some(wl_surface) = or.wl_surface()
-                && let Some(feedback) =
-                    advertised_node_for_surface(&wl_surface, &self.display_handle)
-                        .and_then(&mut dmabuf_feedback)
-            {
-                send_dmabuf_feedback_surface_tree(
-                    &wl_surface,
-                    output,
-                    surface_primary_scanout_output,
-                    |surface, _| {
-                        select_dmabuf_feedback(
-                            surface,
-                            render_element_states,
-                            &feedback.render_feedback,
-                            feedback
-                                .overlay_scanout_feedback
-                                .as_ref()
-                                .unwrap_or(&feedback.render_feedback),
-                        )
-                    },
-                )
-            }
-        });
-
-        let map = smithay::desktop::layer_map_for_output(output);
-        for layer_surface in map.layers() {
-            if let Some(feedback) =
-                advertised_node_for_surface(layer_surface.wl_surface(), &self.display_handle)
+                OutputSurface::Layer(layer_surface, _namespace) => {
+                    if let Some(feedback) = advertised_node_for_surface(
+                        layer_surface.wl_surface(),
+                        &self.display_handle,
+                    )
                     .and_then(&mut dmabuf_feedback)
-            {
-                layer_surface.send_dmabuf_feedback(
-                    output,
-                    surface_primary_scanout_output,
-                    |surface, _| {
-                        select_dmabuf_feedback(
-                            surface,
-                            render_element_states,
-                            &feedback.render_feedback,
-                            feedback
-                                .overlay_scanout_feedback
-                                .as_ref()
-                                .unwrap_or(&feedback.render_feedback),
+                    {
+                        let overlay = feedback
+                            .overlay_scanout_feedback
+                            .as_ref()
+                            .unwrap_or(&feedback.render_feedback);
+                        layer_surface.send_dmabuf_feedback(
+                            output,
+                            surface_primary_scanout_output,
+                            |surface, _| {
+                                select_dmabuf_feedback(
+                                    surface,
+                                    render_element_states,
+                                    &feedback.render_feedback,
+                                    overlay,
+                                    overlay,
+                                )
+                            },
+                        );
+                    }
+                }
+                OutputSurface::Surface(wl_surface) => {
+                    if let Some(feedback) =
+                        advertised_node_for_surface(&wl_surface, &self.display_handle)
+                            .and_then(&mut dmabuf_feedback)
+                    {
+                        let overlay = feedback
+                            .overlay_scanout_feedback
+                            .as_ref()
+                            .unwrap_or(&feedback.render_feedback);
+                        send_dmabuf_feedback_surface_tree(
+                            &wl_surface,
+                            output,
+                            surface_primary_scanout_output,
+                            |surface, _| {
+                                select_dmabuf_feedback(
+                                    surface,
+                                    render_element_states,
+                                    &feedback.render_feedback,
+                                    overlay,
+                                    overlay,
+                                )
+                            },
                         )
-                    },
-                );
-            }
-        }
+                    }
+                }
+            });
     }
 
     #[profiling::function]
@@ -1336,113 +1305,33 @@ impl Common {
             }
         }
 
-        let shell = self.shell.read();
-
-        if let Some(session_lock) = shell.session_lock.as_ref()
-            && let Some(lock_surface) = session_lock.surfaces.get(output)
-        {
-            send_frames_surface_tree(lock_surface.wl_surface(), output, time, None, should_send);
-        }
-
-        for seat in shell
-            .seats
-            .iter()
-            .filter(|seat| &seat.active_output() == output)
-        {
-            let cursor_status = seat.cursor_image_status();
-
-            if let CursorImageStatus::Surface(wl_surface) = cursor_status {
-                send_frames_surface_tree(
+        self.shell
+            .read()
+            .for_each_surface_on_output(output, |toplevel| match toplevel {
+                OutputSurface::Session(wl_surface) => {
+                    send_frames_surface_tree(&wl_surface, output, time, None, should_send)
+                }
+                OutputSurface::Cursor(wl_surface) => send_frames_surface_tree(
                     &wl_surface,
                     output,
                     time,
                     Some(Duration::ZERO),
                     should_send,
-                )
-            }
-
-            if let Some(move_grab) = seat.user_data().get::<SeatMoveGrabState>()
-                && let Some(grab_state) = move_grab.lock().unwrap().as_ref()
-            {
-                for (window, _) in grab_state.element().windows() {
-                    window.send_frame(output, time, throttle(&window), should_send);
+                ),
+                OutputSurface::Window(window, space, active, _is_fullscreen) => {
+                    let throttle = if !active && let Some(space) = space {
+                        min(throttle(space), throttle(window))
+                    } else {
+                        throttle(window)
+                    };
+                    window.send_frame(output, time, throttle, should_send);
                 }
-            }
-
-            if let Some(icon) = get_dnd_icon(seat) {
-                send_frames_surface_tree(
-                    &icon.surface,
-                    output,
-                    time,
-                    Some(Duration::ZERO),
-                    should_send,
-                )
-            }
-        }
-
-        shell
-            .workspaces
-            .sets
-            .get(output)
-            .unwrap()
-            .sticky_layer
-            .mapped()
-            .for_each(|mapped| {
-                for (window, _) in mapped.windows() {
-                    window.send_frame(output, time, throttle(&window), should_send);
+                OutputSurface::Layer(layer_surface, _namespace) => {
+                    layer_surface.send_frame(output, time, THROTTLE, should_send);
+                }
+                OutputSurface::Surface(wl_surface) => {
+                    send_frames_surface_tree(&wl_surface, output, time, THROTTLE, should_send)
                 }
             });
-
-        if let Some(active) = shell.active_space(output) {
-            if let Some(fs) = active.get_fullscreen(shell.seats.last_active()) {
-                fs.surface
-                    .send_frame(output, time, throttle(&fs.surface), should_send);
-            }
-            active.mapped().for_each(|mapped| {
-                for (window, _) in mapped.windows() {
-                    window.send_frame(output, time, throttle(&window), should_send);
-                }
-            });
-
-            // other (throttled) windows
-            active.minimized_windows.iter().for_each(|m| {
-                for window in m.windows() {
-                    window.send_frame(output, time, throttle(&window), |_, _| None);
-                }
-            });
-
-            for space in shell
-                .workspaces
-                .spaces_for_output(output)
-                .filter(|w| w.handle != active.handle)
-            {
-                if let Some(fs) = space.get_fullscreen(shell.seats.last_active()) {
-                    let throttle = min(throttle(space), throttle(&fs.surface));
-                    fs.surface.send_frame(output, time, throttle, |_, _| None);
-                }
-                space.mapped().for_each(|mapped| {
-                    for (window, _) in mapped.windows() {
-                        let throttle = min(throttle(space), throttle(&window));
-                        window.send_frame(output, time, throttle, |_, _| None);
-                    }
-                });
-                space.minimized_windows.iter().for_each(|m| {
-                    for window in m.windows() {
-                        window.send_frame(output, time, throttle(&window), |_, _| None);
-                    }
-                })
-            }
-        }
-
-        shell.override_redirect_windows.iter().for_each(|or| {
-            if let Some(wl_surface) = or.wl_surface() {
-                send_frames_surface_tree(&wl_surface, output, time, THROTTLE, should_send);
-            }
-        });
-
-        let map = smithay::desktop::layer_map_for_output(output);
-        for layer_surface in map.layers() {
-            layer_surface.send_frame(output, time, THROTTLE, should_send);
-        }
     }
 }

@@ -6,14 +6,65 @@ use smithay::{
 };
 use tracing::{debug, error};
 
-const BASE_SAFETY_MARGIN: Duration = Duration::from_millis(3);
+const BASE_SAFETY_MARGIN: Duration = Duration::from_millis(2);
 const SAMPLE_TIME_WINDOW: usize = 5;
 
+#[inline]
+fn mix(new_val: Duration, old_val: Duration, ratio: f64) -> Duration {
+    let nanos = old_val.as_nanos() as f64 * ratio + new_val.as_nanos() as f64 * (1.0 - ratio);
+    Duration::from_nanos(nanos.round() as u64)
+}
+
+#[derive(Debug, Default)]
+pub struct RenderJournal {
+    result: Duration,
+    variance: Duration,
+    last_presentation_ts: Option<Duration>,
+}
+
+impl RenderJournal {
+    const TIME_CONSTANT: Duration = Duration::from_millis(500);
+    const VARIANCE_TIME_CONSTANT: Duration = Duration::from_secs(6);
+
+    pub fn add(&mut self, render_time: Duration, presentation_ts: Duration) {
+        let time_diff = self
+            .last_presentation_ts
+            .map(|last| presentation_ts.saturating_sub(last))
+            // First sample: pretend 10 s have passed so we start fresh.
+            .unwrap_or(Duration::from_secs(10));
+        self.last_presentation_ts = Some(presentation_ts);
+
+        let variance_ratio = (time_diff.as_nanos() as f64
+            / Self::VARIANCE_TIME_CONSTANT.as_nanos() as f64)
+            .clamp(0.001, 0.1);
+        let render_time_diff = render_time.saturating_sub(self.result);
+        let mixed_variance = mix(render_time_diff, self.variance, variance_ratio);
+        self.variance = mixed_variance.max(render_time_diff);
+
+        let ratio =
+            (time_diff.as_nanos() as f64 / Self::TIME_CONSTANT.as_nanos() as f64).clamp(0.01, 1.0);
+        self.result = mix(render_time, self.result, ratio);
+    }
+
+    pub fn estimate(&self) -> Duration {
+        self.result + self.variance * 2
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 pub struct Timings {
-    refresh_interval_ns: Option<NonZeroU64>,
+    pub refresh_interval_ns: Option<NonZeroU64>,
+    pub origin_refresh_interval_ns: Option<NonZeroU64>,
+    pub vrr_target_rate_internal_ns: Option<NonZeroU64>,
     min_refresh_interval_ns: Option<NonZeroU64>,
     vrr: bool,
+    pub session_lock: bool,
     vendor: Option<u32>,
+
+    pub journal: RenderJournal,
 
     pub pending_frame: Option<PendingFrame>,
     pub previous_frames: VecDeque<Frame>,
@@ -84,9 +135,14 @@ impl Timings {
 
         Self {
             refresh_interval_ns,
+            origin_refresh_interval_ns: refresh_interval_ns,
             min_refresh_interval_ns,
+            vrr_target_rate_internal_ns: refresh_interval_ns,
             vrr,
+            session_lock: false,
             vendor,
+
+            journal: RenderJournal::default(),
 
             pending_frame: None,
             previous_frames: VecDeque::new(),
@@ -104,8 +160,20 @@ impl Timings {
         self.refresh_interval_ns = interval
             .map(|duration| duration.subsec_nanos() as u64)
             .and_then(NonZeroU64::new);
+        self.origin_refresh_interval_ns = self.refresh_interval_ns;
 
         self.previous_frames.clear();
+        self.journal.reset();
+    }
+
+    pub fn set_vrr_target_rate_interval(&mut self, interval: Option<Duration>) {
+        self.vrr_target_rate_internal_ns = interval
+            .map(|duration| duration.subsec_nanos() as u64)
+            .and_then(NonZeroU64::new);
+
+        if self.vrr {
+            self.refresh_interval_ns = self.vrr_target_rate_internal_ns;
+        }
     }
 
     pub fn set_min_refresh_interval(&mut self, min_interval: Option<Duration>) {
@@ -115,6 +183,13 @@ impl Timings {
     }
 
     pub fn set_vrr(&mut self, vrr: bool) {
+        if self.vrr != vrr {
+            if vrr {
+                self.refresh_interval_ns = self.vrr_target_rate_internal_ns;
+            } else {
+                self.refresh_interval_ns = self.origin_refresh_interval_ns;
+            }
+        }
         self.vrr = vrr;
     }
 
@@ -167,6 +242,10 @@ impl Timings {
                     new_frame.frame_time().as_millis()
                 );
             }
+
+            // Feed the journal before pushing so render_time() is available.
+            self.journal.add(new_frame.render_time(), value.into());
+
             self.previous_frames.push_back(new_frame);
 
             if let Some(overflow) = self.previous_frames.len().checked_sub(Self::CLEANUP * 2) {
@@ -230,6 +309,41 @@ impl Timings {
             .unwrap_or(Duration::ZERO)
     }
 
+    pub fn sample_rendertime(&self, window: usize) -> Option<Duration> {
+        if self.previous_frames.len() < window || window == 0 {
+            return None;
+        }
+        let Some(sum_rendertime) = self
+            .previous_frames
+            .iter()
+            .rev()
+            .take(window)
+            .map(|f| f.render_time())
+            .try_fold(Duration::ZERO, |acc, x| acc.checked_add(x))
+        else {
+            return None;
+        };
+
+        Some(
+            sum_rendertime
+                .checked_div(window as u32)
+                .unwrap_or(Duration::ZERO),
+        )
+    }
+
+    pub fn max_submittime(&self, window: usize) -> Option<Duration> {
+        if self.previous_frames.len() < window || window == 0 {
+            return None;
+        }
+
+        self.previous_frames
+            .iter()
+            .rev()
+            .take(window)
+            .map(|f| f.submit_time())
+            .max()
+    }
+
     pub fn avg_submittime(&self, window: usize) -> Option<Duration> {
         if self.previous_frames.len() < window || window == 0 {
             return None;
@@ -280,7 +394,7 @@ impl Timings {
     }
 
     pub fn next_presentation_time(&self, clock: &Clock<Monotonic>) -> Duration {
-        let mut now = clock.now().into();
+        let mut now: Duration = clock.now().into();
 
         let Some(refresh_interval_ns) = self.refresh_interval_ns else {
             return Duration::ZERO;
@@ -294,33 +408,36 @@ impl Timings {
         };
         let refresh_interval_ns = refresh_interval_ns.get();
 
-        if now <= last_presentation_time {
-            // Got an early VBlank.
-            let orig_now = now;
-            now += Duration::from_nanos(refresh_interval_ns);
+        if self.vrr || self.session_lock {
+            let earliest_presentation =
+                last_presentation_time + Duration::from_nanos(refresh_interval_ns);
+            // let mut temp: Duration = now.clone();
+            // while temp <= last_presentation_time {
+            //     temp += Duration::from_nanos(refresh_interval_ns);
+            //     earliest_presentation += Duration::from_nanos(refresh_interval_ns);
+            // }
 
-            if now < last_presentation_time {
-                // Not sure when this can happen.
-                error!(
-                    now = ?orig_now,
-                    ?last_presentation_time,
-                    "got a 2+ early VBlank, {:?} until presentation",
-                    last_presentation_time - now,
-                );
-                now = last_presentation_time + Duration::from_nanos(refresh_interval_ns);
-            }
-        }
-
-        let since_last = now - last_presentation_time;
-        let since_last_ns =
-            since_last.as_secs() * 1_000_000_000 + u64::from(since_last.subsec_nanos());
-        let to_next_ns = (since_last_ns / refresh_interval_ns + 1) * refresh_interval_ns;
-
-        // If VRR is enabled and more than one frame passed since last presentation, assume that we
-        // can present immediately.
-        if self.vrr && to_next_ns > refresh_interval_ns {
-            Duration::ZERO
+            earliest_presentation.saturating_sub(now)
         } else {
+            if now <= last_presentation_time {
+                // Got an early VBlank.
+                let orig_now = now;
+                now += Duration::from_nanos(refresh_interval_ns);
+
+                if now < last_presentation_time {
+                    // Not sure when this can happen.
+                    error!(
+                        now = ?orig_now,
+                        ?last_presentation_time,
+                        "got a 2+ early VBlank, {:?} until presentation",
+                        last_presentation_time - now,
+                    );
+                    now = last_presentation_time + Duration::from_nanos(refresh_interval_ns);
+                }
+            }
+            let since_last = now - last_presentation_time;
+            let since_last_ns = since_last.as_nanos() as u64;
+            let to_next_ns = (since_last_ns / refresh_interval_ns + 1) * refresh_interval_ns;
             last_presentation_time + Duration::from_nanos(to_next_ns) - now
         }
     }
@@ -364,28 +481,17 @@ impl Timings {
     }
 
     pub fn next_render_time(&self, clock: &Clock<Monotonic>) -> Duration {
-        let Some(refresh_interval) = self.refresh_interval_ns else {
+        let Some(_refresh_interval) = self.refresh_interval_ns else {
             return Duration::ZERO; // we don't know what to expect, so render immediately.
         };
-
-        const MIN_MARGIN: Duration = Duration::from_millis(3);
-        let baseline = MIN_MARGIN.max(Duration::from_nanos(refresh_interval.get() / 2));
 
         let estimated_presentation_time = self.next_presentation_time(clock);
         if estimated_presentation_time.is_zero() {
             return Duration::ZERO;
         }
 
-        // HACK: Nvidia returns `page_flip`/`commit` early, so we have no information to optimize latency on submission.
-        if self.vendor == Some(0x10de) {
-            return Duration::ZERO;
-        }
+        let margin = self.journal.estimate();
 
-        let Some(avg_submittime) = self.avg_submittime(SAMPLE_TIME_WINDOW) else {
-            return estimated_presentation_time.saturating_sub(baseline + BASE_SAFETY_MARGIN);
-        };
-
-        let margin = avg_submittime + BASE_SAFETY_MARGIN;
         estimated_presentation_time.saturating_sub(margin)
     }
 }

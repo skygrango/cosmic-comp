@@ -4,7 +4,8 @@ use grabs::{MenuAlignment, SeatMoveGrabState};
 use indexmap::IndexMap;
 use layout::TilingExceptions;
 use std::{
-    collections::HashMap,
+    cell::RefCell,
+    collections::{HashMap, HashSet},
     sync::{Mutex, atomic::Ordering},
     thread,
     time::{Duration, Instant},
@@ -39,6 +40,7 @@ use smithay::{
         utils::{
             OutputPresentationFeedback, surface_presentation_feedback_flags_from_states,
             surface_primary_scanout_output, take_presentation_feedback_surface_tree,
+            with_surfaces_surface_tree,
         },
     },
     input::{
@@ -54,7 +56,7 @@ use smithay::{
     },
     utils::{IsAlive, Logical, Point, Rectangle, Serial, Size},
     wayland::{
-        compositor::{SurfaceAttributes, get_parent, with_states},
+        compositor::{SurfaceAttributes, SurfaceData, get_parent, with_states},
         seat::WaylandFocus,
         session_lock::LockSurface,
         shell::{
@@ -96,7 +98,9 @@ pub mod layout;
 mod seats;
 mod workspace;
 pub mod zoom;
-pub use self::element::{CosmicMapped, CosmicMappedRenderElement, CosmicSurface};
+pub use self::element::{
+    CosmicMapped, CosmicMappedRenderElement, CosmicSurface, WeakCosmicSurface,
+};
 pub use self::seats::*;
 pub use self::workspace::*;
 use self::zoom::{OutputZoomState, ZoomState};
@@ -1657,7 +1661,7 @@ impl Common {
 
             for seat in shell.seats.iter() {
                 if let Some(move_grab) = seat.user_data().get::<SeatMoveGrabState>()
-                    && let Some(grab_state) = move_grab.lock().unwrap().as_ref()
+                    && let Some(grab_state) = move_grab.read().as_ref()
                 {
                     let mapped = grab_state.element();
                     if mapped.active_window().wl_surface().as_deref() == Some(surface) {
@@ -1706,6 +1710,41 @@ impl Common {
         }
         self.popups.commit(surface);
     }
+}
+
+pub enum OutputSurface<'a> {
+    Window(&'a CosmicSurface, Option<&'a Workspace>, bool, bool),
+    Layer(&'a LayerSurface, usize),
+    Surface(&'a WlSurface),
+    Cursor(&'a WlSurface),
+    Session(&'a WlSurface),
+}
+
+impl<'a> OutputSurface<'a> {
+    pub fn with_surfaces<F>(&self, processor: F)
+    where
+        F: FnMut(&WlSurface, &SurfaceData),
+    {
+        match self {
+            OutputSurface::Session(s) => with_surfaces_surface_tree(s, processor),
+            OutputSurface::Cursor(s) => with_surfaces_surface_tree(s, processor),
+            OutputSurface::Window(w, _space, active, _is_fullscreen) => {
+                if *active {
+                    w.with_surfaces(processor)
+                }
+            }
+            OutputSurface::Layer(l, _namespace) => l.with_surfaces(processor),
+            OutputSurface::Surface(s) => with_surfaces_surface_tree(s, processor),
+        }
+    }
+}
+
+thread_local! {
+    static OUTPUT_SURFACE_SET: RefCell<(HashSet<CosmicSurface>, HashSet<WlSurface>)> =
+        RefCell::new((
+            HashSet::with_capacity(128),
+            HashSet::with_capacity(128),
+        ));
 }
 
 impl Shell {
@@ -1931,8 +1970,7 @@ impl Shell {
                     .get::<SeatMoveGrabState>()
                     .is_some_and(|state| {
                         state
-                            .lock()
-                            .unwrap()
+                            .read()
                             .as_ref()
                             .is_some_and(|state| state.element() == elem)
                     })
@@ -2119,7 +2157,7 @@ impl Shell {
                             }
 
                             if let Some(move_grab) = seat.user_data().get::<SeatMoveGrabState>()
-                                && let Some(grab_state) = move_grab.lock().unwrap().as_ref()
+                                && let Some(grab_state) = move_grab.read().as_ref()
                             {
                                 for (window, _) in grab_state.element().windows() {
                                     let mut matches = false;
@@ -5051,40 +5089,25 @@ impl Shell {
     ) -> OutputPresentationFeedback {
         let mut output_presentation_feedback = OutputPresentationFeedback::new(output);
 
-        if let Some(active) = self.active_space(output) {
-            for fs in active.get_fullscreen_surfaces() {
-                fs.surface.take_presentation_feedback(
-                    &mut output_presentation_feedback,
-                    surface_primary_scanout_output,
-                    |surface, _| {
-                        surface_presentation_feedback_flags_from_states(
-                            surface,
-                            None,
-                            render_element_states,
-                        )
-                    },
-                );
+        self.for_each_surface_on_output(output, |toplevel| match toplevel {
+            OutputSurface::Window(window, _space, active, _is_fullscreen) => {
+                if active {
+                    window.take_presentation_feedback(
+                        &mut output_presentation_feedback,
+                        surface_primary_scanout_output,
+                        |surface, _| {
+                            surface_presentation_feedback_flags_from_states(
+                                surface,
+                                None,
+                                render_element_states,
+                            )
+                        },
+                    );
+                }
             }
-
-            active.mapped().for_each(|mapped| {
-                mapped.active_window().take_presentation_feedback(
-                    &mut output_presentation_feedback,
-                    surface_primary_scanout_output,
-                    |surface, _| {
-                        surface_presentation_feedback_flags_from_states(
-                            surface,
-                            None,
-                            render_element_states,
-                        )
-                    },
-                );
-            });
-        }
-
-        self.override_redirect_windows.iter().for_each(|or| {
-            if let Some(wl_surface) = or.wl_surface() {
+            OutputSurface::Surface(wl_surface) => {
                 take_presentation_feedback_surface_tree(
-                    &wl_surface,
+                    wl_surface,
                     &mut output_presentation_feedback,
                     surface_primary_scanout_output,
                     |surface, _| {
@@ -5094,25 +5117,23 @@ impl Shell {
                             render_element_states,
                         )
                     },
-                )
+                );
             }
+            OutputSurface::Layer(layer_surface, namespace) => {
+                layer_surface.take_presentation_feedback(
+                    &mut output_presentation_feedback,
+                    surface_primary_scanout_output,
+                    |surface, _| {
+                        surface_presentation_feedback_flags_from_states(
+                            surface,
+                            Some(namespace),
+                            render_element_states,
+                        )
+                    },
+                );
+            }
+            _ => {}
         });
-
-        let map = smithay::desktop::layer_map_for_output(output);
-        for layer_surface in map.layers() {
-            let namespace = self.workspaces.active_num(output).1;
-            layer_surface.take_presentation_feedback(
-                &mut output_presentation_feedback,
-                surface_primary_scanout_output,
-                |surface, _| {
-                    surface_presentation_feedback_flags_from_states(
-                        surface,
-                        Some(namespace),
-                        render_element_states,
-                    )
-                },
-            );
-        }
 
         output_presentation_feedback
     }
@@ -5127,6 +5148,167 @@ impl Shell {
                         .chain(w.minimized_windows.iter().flat_map(|m| m.mapped()))
                 }))
         })
+    }
+
+    pub fn for_each_surface_on_output(
+        &self,
+        output: &Output,
+        mut f: impl FnMut(OutputSurface<'_>),
+    ) {
+        OUTPUT_SURFACE_SET.with(|output_surface_set| {
+            let mut output_surface_set = output_surface_set.borrow_mut();
+            let (window_set, surface_set) = &mut *output_surface_set;
+            window_set.clear();
+            surface_set.clear();
+            if let Some(session_lock) = self.session_lock.as_ref() {
+                if let Some(lock_surface) = session_lock.surfaces.get(output) {
+                    if surface_set.insert(lock_surface.wl_surface().clone()) {
+                        f(OutputSurface::Session(lock_surface.wl_surface()));
+                    }
+                }
+            }
+
+            for seat in self
+                .seats
+                .iter()
+                .filter(|seat| &seat.active_output() == output)
+            {
+                let cursor_status = seat.cursor_image_status();
+
+                if let CursorImageStatus::Surface(wl_surface) = cursor_status {
+                    if surface_set.insert(wl_surface.clone()) {
+                        f(OutputSurface::Cursor(&wl_surface));
+                    }
+                }
+
+                if let Some(move_grab) = seat.user_data().get::<SeatMoveGrabState>() {
+                    if let Some(grab_state) = move_grab.read().as_ref() {
+                        for (window, _) in grab_state.element().windows() {
+                            if window_set.insert(window.clone()) {
+                                f(OutputSurface::Window(&window, None, true, false));
+                            }
+                        }
+                    }
+                }
+
+                if let Some(icon) = get_dnd_icon(seat) {
+                    if surface_set.insert(icon.surface.clone()) {
+                        f(OutputSurface::Cursor(&icon.surface));
+                    }
+                }
+
+                if let Some(active) = self.active_space(output) {
+                    if let Some(window) = active.get_fullscreen(seat) {
+                        if window_set.insert(window.surface.clone()) {
+                            f(OutputSurface::Window(
+                                &window.surface,
+                                Some(active),
+                                true,
+                                true,
+                            ));
+                        }
+                    }
+
+                    for space in self
+                        .workspaces
+                        .spaces_for_output(output)
+                        .filter(|w| w.handle != active.handle)
+                    {
+                        if let Some(window) = space.get_fullscreen(seat) {
+                            if window_set.insert(window.surface.clone()) {
+                                f(OutputSurface::Window(
+                                    &window.surface,
+                                    Some(active),
+                                    false,
+                                    true,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
+            self.workspaces
+                .sets
+                .get(output)
+                .unwrap()
+                .sticky_layer
+                .mapped()
+                .for_each(|mapped| {
+                    for (window, _) in mapped.windows() {
+                        if window_set.insert(window.clone()) {
+                            f(OutputSurface::Window(&window, None, true, false));
+                        }
+                    }
+                });
+
+            if let Some(active) = self.active_space(output) {
+                active.mapped().for_each(|mapped| {
+                    for (window, _) in mapped.windows() {
+                        if window_set.insert(window.clone()) {
+                            f(OutputSurface::Window(&window, Some(active), true, false));
+                        }
+                    }
+                });
+
+                // other (throttled) windows
+                active.minimized_windows.iter().for_each(|m| {
+                    for window in m.windows() {
+                        if window_set.insert(window.clone()) {
+                            f(OutputSurface::Window(&window, Some(active), false, false));
+                        }
+                    }
+                });
+
+                for space in self
+                    .workspaces
+                    .spaces_for_output(output)
+                    .filter(|w| w.handle != active.handle)
+                {
+                    space.mapped().for_each(|mapped| {
+                        for (window, _) in mapped.windows() {
+                            if window_set.insert(window.clone()) {
+                                f(OutputSurface::Window(&window, Some(active), false, false));
+                            }
+                        }
+                    });
+                    space.minimized_windows.iter().for_each(|m| {
+                        for window in m.windows() {
+                            if window_set.insert(window.clone()) {
+                                f(OutputSurface::Window(&window, Some(active), false, false));
+                            }
+                        }
+                    })
+                }
+            }
+
+            {
+                let map = smithay::desktop::layer_map_for_output(output);
+                let namespace = self.workspaces.active_num(output).1;
+                for layer_surface in map.layers() {
+                    if surface_set.insert(layer_surface.wl_surface().clone()) {
+                        f(OutputSurface::Layer(layer_surface, namespace));
+                    }
+                }
+            }
+
+            self.override_redirect_windows.iter().for_each(|or| {
+                // Find output the override redirect window overlaps the most with
+                let or_geo = or.geometry().as_global();
+                let max_intersect_output = self
+                    .outputs()
+                    .filter_map(|o| Some((o, o.geometry().intersection(or_geo)?)))
+                    .max_by_key(|(_, intersection)| intersection.size.w * intersection.size.h)
+                    .map(|(o, _)| o);
+                if max_intersect_output == Some(output) {
+                    if let Some(wl_surface) = or.wl_surface() {
+                        if surface_set.insert(wl_surface.clone()) {
+                            f(OutputSurface::Surface(&wl_surface));
+                        }
+                    }
+                }
+            });
+        });
     }
 }
 
