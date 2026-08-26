@@ -87,6 +87,8 @@ futures-util = "0.3.32"
 glam = { version = "0.33", default-features = false, features = ["std"] }
 smallvec = "1.15.2"
 
+libc = "0.2.186"
+
 [dependencies.id_tree]
 branch = "feature/copy_clone"
 git = "https://github.com/Drakulix/id-tree.git"
@@ -143,7 +145,8 @@ inherits = "release"
 lto = "fat"
 
 [patch."https://github.com/pop-os/cosmic-protocols"]
-cosmic-protocols = { git = "https://github.com/pop-os//cosmic-protocols", branch = "main" }
+cosmic-protocols = { git = "https://github.com/skygrango/cosmic-protocols", branch = "vrr_target_rate_v2" }
+cosmic-client-toolkit = { git = "https://github.com/skygrango/cosmic-protocols", branch = "vrr_target_rate_v2" }
 
 [patch.crates-io]
-smithay = { git = "https://github.com/skygrango/smithay.git", rev = "2b03835" }
+smithay = { git = "https://github.com/skygrango/smithay.git", rev = "5ee22b1" }
