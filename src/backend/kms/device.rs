@@ -526,7 +526,6 @@ impl State {
                                     crtc,
                                     conn,
                                     backend.primary_node.clone(),
-                                    new_device.inner.dev_node,
                                     new_device.inner.render_node,
                                     &self.common.event_loop_handle,
                                     self.common.config.dynamic_conf.screen_filter().clone(),
@@ -978,7 +977,7 @@ impl LockedDevice<'_> {
                 continue;
             };
             let comp = comp.lock().unwrap();
-            surface.primary_plane_formats = if flag {
+            let primary_plane_formats = if flag {
                 comp.surface().plane_info().formats.clone()
             } else {
                 // This certainly isn't perfect and might still miss the happy path,
@@ -990,7 +989,7 @@ impl LockedDevice<'_> {
                     modifier: *mo,
                 }))
             };
-            surface.feedback.clear();
+            surface.update_plane_formats(primary_plane_formats, None);
         }
 
         Ok(())
@@ -1075,7 +1074,6 @@ impl InnerDevice {
                     crtc,
                     conn,
                     primary_node,
-                    self.dev_node,
                     self.render_node,
                     evlh,
                     screen_filter,

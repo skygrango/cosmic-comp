@@ -62,7 +62,7 @@ impl DmabufHandler for State {
             .drm_devices
             .values()
             .find_map(|device| device.inner.surfaces.values().find(|s| s.output == output))?;
-        let feedback = kms_surface.feedback.get(&node)?.clone();
+        let feedback = kms_surface.feedback.read().unwrap().get(&node)?.clone();
 
         Some(with_states(surface, |data| {
             if is_fullscreen {

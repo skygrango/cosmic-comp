@@ -8,7 +8,10 @@ use crate::{
     },
     config::ScreenFilter,
     shell::{CosmicSurface, OutputSurface, Shell},
-    state::{SurfaceDmabufFeedback, SurfaceFrameThrottlingState},
+    state::{
+        SurfaceDmabufFeedback, SurfaceFrameThrottlingState, send_dmabuf_feedback,
+        update_primary_output,
+    },
     utils::prelude::*,
     wayland::handlers::{
         compositor::{
@@ -133,9 +136,7 @@ pub struct Surface {
     known_nodes: HashSet<DrmNode>,
 
     active: Arc<AtomicBool>,
-    pub feedback: HashMap<DrmNode, SurfaceDmabufFeedback>,
-    pub(super) primary_plane_formats: FormatSet,
-    overlay_plane_formats: Option<FormatSet>,
+    pub feedback: Arc<RwLock<HashMap<DrmNode, SurfaceDmabufFeedback>>>,
 
     loop_handle: LoopHandle<'static, State>,
     thread_command: Sender<ThreadCommand>,
@@ -157,6 +158,10 @@ pub struct SurfaceThreadState {
     vrr_target_rate: u32,
     frame_flags: FrameFlags,
     compositor: Option<GbmDrmOutput>,
+
+    feedback: Arc<RwLock<HashMap<DrmNode, SurfaceDmabufFeedback>>>,
+    primary_plane_formats: FormatSet,
+    overlay_plane_formats: Option<FormatSet>,
 
     state: QueueState,
     timings: Timings,
@@ -228,6 +233,8 @@ pub enum ThreadCommand {
     Suspend(SyncSender<()>),
     Resume {
         compositor: GbmDrmOutput,
+        primary_plane_formats: FormatSet,
+        overlay_plane_formats: Option<FormatSet>,
     },
     NodeAdded {
         node: DrmNode,
@@ -248,6 +255,10 @@ pub enum ThreadCommand {
     UpdateVrrTargetRate(u32),
     UpdateSessionLock(bool),
     AllowFrameFlags(bool, FrameFlags),
+    UpdatePlaneFormats {
+        primary_plane_formats: FormatSet,
+        overlay_plane_formats: Option<FormatSet>,
+    },
     End,
     DpmsOff,
 }
@@ -255,7 +266,6 @@ pub enum ThreadCommand {
 #[derive(Debug)]
 pub enum SurfaceCommand {
     SendFrames(usize),
-    RenderStates(RenderElementStates),
     ClientBlockerCleared(HashMap<ClientId, Client>),
 }
 
@@ -274,7 +284,6 @@ impl Surface {
         crtc: crtc::Handle,
         connector: connector::Handle,
         primary_node: Arc<RwLock<Option<DrmNode>>>,
-        dev_node: DrmNode,
         target_node: DrmNode,
         evlh: &LoopHandle<'static, State>,
         screen_filter: ScreenFilter,
@@ -285,11 +294,13 @@ impl Surface {
         let (tx, rx) = channel::<ThreadCommand>();
         let (tx2, rx2) = channel::<SurfaceCommand>();
         let active = Arc::new(AtomicBool::new(false));
+        let feedback = Arc::new(RwLock::new(HashMap::new()));
 
         let _ = kms_thread.send(KmsMessage::RegisterSurface(crtc, tx.clone()));
 
         let active_clone = active.clone();
         let output_clone = output.clone();
+        let feedback_clone = feedback.clone();
 
         let thread = std::thread::Builder::new()
             .name(format!("surface-{}", output.name()))
@@ -305,6 +316,7 @@ impl Surface {
                     rx,
                     startup_done,
                     display_handle,
+                    feedback_clone,
                 ) {
                     error!("Surface thread crashed: {}", err);
                 }
@@ -320,50 +332,6 @@ impl Surface {
                     }
 
                     state.common.send_frames(&output_clone, Some(sequence));
-                }
-                Event::Msg(SurfaceCommand::RenderStates(states)) => {
-                    if output_clone.mirroring().is_some() {
-                        return;
-                    }
-                    state.common.update_primary_output(&output_clone, &states);
-                    let kms = state.backend.kms();
-                    let surface = &mut kms
-                        .drm_devices
-                        .get_mut(&dev_node)
-                        .unwrap()
-                        .inner
-                        .surfaces
-                        .get_mut(&crtc)
-                        .unwrap();
-
-                    state
-                        .common
-                        .send_dmabuf_feedback(&output_clone, &states, |source_node| {
-                            if let Some(cached_feedback) = surface.feedback.get(&source_node) {
-                                Some(cached_feedback.clone())
-                            } else {
-                                // If we have freed the node, because it didn't have any active buffers/surfaces,
-                                // we might not be able to evaluate surface feedback yet.
-                                let render_formats =
-                                    kms.api.single_renderer(&source_node).ok()?.dmabuf_formats();
-                                // In contrast we must have the target node, if we have an active surface
-                                let target_formats = kms
-                                    .api
-                                    .single_renderer(&target_node)
-                                    .unwrap()
-                                    .dmabuf_formats();
-                                let feedback = get_surface_dmabuf_feedback(
-                                    source_node,
-                                    target_node,
-                                    render_formats,
-                                    target_formats,
-                                    surface.primary_plane_formats.clone(),
-                                    surface.overlay_plane_formats.clone(),
-                                );
-                                surface.feedback.insert(source_node, feedback.clone());
-                                Some(feedback)
-                            }
-                        });
                 }
                 Event::Msg(SurfaceCommand::ClientBlockerCleared(clients)) => {
                     let dh = state.common.display_handle.clone();
@@ -383,9 +351,7 @@ impl Surface {
             output: output.clone(),
             known_nodes: HashSet::new(),
             active,
-            feedback: HashMap::new(),
-            primary_plane_formats: FormatSet::default(),
-            overlay_plane_formats: None,
+            feedback,
             loop_handle: evlh.clone(),
             thread_command: tx,
             thread_token,
@@ -417,7 +383,6 @@ impl Surface {
 
     pub fn remove_node(&mut self, node: DrmNode) {
         self.known_nodes.remove(&node);
-        self.feedback.remove(&node);
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let _ = self
             .thread_command
@@ -483,6 +448,17 @@ impl Surface {
             .send(ThreadCommand::AllowFrameFlags(flag, flags));
     }
 
+    pub fn update_plane_formats(
+        &mut self,
+        primary_plane_formats: FormatSet,
+        overlay_plane_formats: Option<FormatSet>,
+    ) {
+        let _ = self.thread_command.send(ThreadCommand::UpdatePlaneFormats {
+            primary_plane_formats,
+            overlay_plane_formats,
+        });
+    }
+
     pub fn suspend(&mut self) {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let _ = self.thread_command.send(ThreadCommand::Suspend(tx));
@@ -495,15 +471,14 @@ impl Surface {
         primary_plane_formats: FormatSet,
         overlay_plane_formats: Option<FormatSet>,
     ) {
-        self.primary_plane_formats = primary_plane_formats;
-        self.overlay_plane_formats = overlay_plane_formats;
-        self.feedback.clear();
         self.active.store(true, Ordering::SeqCst);
         self.dpms = true;
 
-        let _ = self
-            .thread_command
-            .send(ThreadCommand::Resume { compositor });
+        let _ = self.thread_command.send(ThreadCommand::Resume {
+            compositor,
+            primary_plane_formats,
+            overlay_plane_formats,
+        });
     }
 
     pub fn get_dpms(&mut self) -> bool {
@@ -562,6 +537,7 @@ fn surface_thread(
     thread_receiver: Channel<ThreadCommand>,
     startup_done: Arc<AtomicBool>,
     display_handle: DisplayHandle,
+    feedback: Arc<RwLock<HashMap<DrmNode, SurfaceDmabufFeedback>>>,
 ) -> Result<()> {
     // if let Ok(rtkit) = RTKit::new() {
     //     if let Ok(rr_max) = rtkit.max_realtime_priority() {
@@ -623,6 +599,10 @@ fn surface_thread(
             .map(|m| m.refresh as u32)
             .unwrap_or(60000),
 
+        feedback,
+        primary_plane_formats: FormatSet::default(),
+        overlay_plane_formats: None,
+
         state: QueueState::Idle,
         timings: Timings::new(None, None, false, target_node),
         frame_callback_seq: 0,
@@ -656,8 +636,18 @@ fn surface_thread(
         .handle()
         .insert_source(thread_receiver, move |command, _, state| match command {
             Event::Msg(ThreadCommand::Suspend(tx)) => state.suspend(tx),
-            Event::Msg(ThreadCommand::Resume { compositor }) => {
-                state.resume(compositor);
+            Event::Msg(ThreadCommand::Resume {
+                compositor,
+                primary_plane_formats,
+                overlay_plane_formats,
+            }) => {
+                state.resume(compositor, primary_plane_formats, overlay_plane_formats);
+            }
+            Event::Msg(ThreadCommand::UpdatePlaneFormats {
+                primary_plane_formats,
+                overlay_plane_formats,
+            }) => {
+                state.update_plane_formats(primary_plane_formats, overlay_plane_formats);
             }
             Event::Msg(ThreadCommand::NodeAdded {
                 node,
@@ -817,7 +807,16 @@ impl SurfaceThreadState {
         let _ = tx.send(());
     }
 
-    fn resume(&mut self, compositor: GbmDrmOutput) {
+    fn resume(
+        &mut self,
+        compositor: GbmDrmOutput,
+        primary_plane_formats: FormatSet,
+        overlay_plane_formats: Option<FormatSet>,
+    ) {
+        self.primary_plane_formats = primary_plane_formats;
+        self.overlay_plane_formats = overlay_plane_formats;
+        self.feedback.write().unwrap().clear();
+
         let (mode, min_hz) = compositor.with_compositor(|c| {
             (
                 c.surface().pending_mode(),
@@ -854,6 +853,18 @@ impl SurfaceThreadState {
         self.compositor = Some(compositor);
     }
 
+    fn update_plane_formats(
+        &mut self,
+        primary_plane_formats: FormatSet,
+        overlay_plane_formats: Option<FormatSet>,
+    ) {
+        self.primary_plane_formats = primary_plane_formats;
+        if let Some(overlay) = overlay_plane_formats {
+            self.overlay_plane_formats = Some(overlay);
+        }
+        self.feedback.write().unwrap().clear();
+    }
+
     fn node_added(
         &mut self,
         node: DrmNode,
@@ -870,6 +881,7 @@ impl SurfaceThreadState {
     }
 
     fn node_removed(&mut self, node: DrmNode) {
+        self.feedback.write().unwrap().remove(&node);
         self.api.as_mut().remove_node(&node);
         // force enumeration
         let _ = self.api.devices();
@@ -1136,6 +1148,21 @@ impl SurfaceThreadState {
         let render_start = if is_fullscreen_skip_other {
             // To prevent the fullscreen surface from unexpectedly stopping updates, register a fallback redraw request.
             // If the fullscreen surface commits an update within the min_vrr interval, it will replace this fallback request.
+            //
+            // However, only schedule this fallback if the last presentation was more than 500ms ago.
+            // If the fullscreen surface is still actively updating, skip the fallback entirely to avoid
+            // unnecessary wakeups on low-refresh-rate displays.
+            let last_presented = self
+                .timings
+                .previous_frames
+                .back()
+                .map(|f| f.presentation_presented);
+            let now = self.clock.now();
+            if let Some(last) = last_presented {
+                if Time::elapsed(&last, now) < Duration::from_millis(500) {
+                    return;
+                }
+            }
             let min_vrr = self
                 .min_vrr_frame_time
                 .unwrap_or(Duration::from_nanos(1_000_000_000 / 30));
@@ -1694,9 +1721,39 @@ impl SurfaceThreadState {
     }
 
     fn send_dmabuf_feedback(&mut self, states: RenderElementStates) {
-        let _ = self
-            .thread_sender
-            .send(SurfaceCommand::RenderStates(states));
+        let shell = self.shell.read();
+        update_primary_output(&shell, &self.output, &states);
+
+        let target_node = self.target_node;
+        let primary_plane_formats = &self.primary_plane_formats;
+        let overlay_plane_formats = &self.overlay_plane_formats;
+        let feedback = &mut self.feedback;
+        let api = &mut self.api;
+
+        send_dmabuf_feedback(
+            &shell,
+            &self.display_handle,
+            &self.output,
+            &states,
+            |source_node| {
+                if let Some(cached_feedback) = feedback.read().unwrap().get(&source_node) {
+                    Some(cached_feedback.clone())
+                } else {
+                    let render_formats = api.single_renderer(&source_node).ok()?.dmabuf_formats();
+                    let target_formats = api.single_renderer(&target_node).ok()?.dmabuf_formats();
+                    let fb = get_surface_dmabuf_feedback(
+                        source_node,
+                        target_node,
+                        render_formats,
+                        target_formats,
+                        primary_plane_formats.clone(),
+                        overlay_plane_formats.clone(),
+                    );
+                    feedback.write().unwrap().insert(source_node, fb.clone());
+                    Some(fb)
+                }
+            },
+        );
     }
 
     pub fn send_frames(&self, output: &Output, sequence: Option<usize>) {

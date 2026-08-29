@@ -281,7 +281,7 @@ pub struct Common {
     pub data_device_state: DataDeviceState,
     pub dmabuf_state: DmabufState,
     pub fractional_scale_state: FractionalScaleManagerState,
-    pub commit_timing_manager_state: CommitTimingManagerState,
+    //pub commit_timing_manager_state: CommitTimingManagerState,
     pub fifo_manager_state: FifoManagerState,
     pub keyboard_shortcuts_inhibit_state: KeyboardShortcutsInhibitState,
     pub output_state: OutputManagerState,
@@ -699,7 +699,7 @@ impl State {
         let data_device_state = DataDeviceState::new::<Self>(dh);
         let dmabuf_state = DmabufState::new();
         let fractional_scale_state = FractionalScaleManagerState::new::<State>(dh);
-        let commit_timing_manager_state = CommitTimingManagerState::new::<State>(dh);
+        //let commit_timing_manager_state = CommitTimingManagerState::new::<State>(dh);
         let fifo_manager_state = FifoManagerState::new::<State>(dh);
         let keyboard_shortcuts_inhibit_state = KeyboardShortcutsInhibitState::new::<Self>(dh);
         let output_state = OutputManagerState::new_with_xdg_output::<Self>(dh);
@@ -821,7 +821,7 @@ impl State {
                 data_device_state,
                 dmabuf_state,
                 fractional_scale_state,
-                commit_timing_manager_state,
+                //commit_timing_manager_state,
                 fifo_manager_state,
                 idle_notifier_state,
                 idle_inhibit_manager_state,
@@ -993,6 +993,228 @@ fn primary_scanout_output_compare<'a>(
     default_primary_scanout_output_compare(current_output, current_state, next_output, next_state)
 }
 
+#[profiling::function]
+pub fn update_primary_output(
+    shell: &Shell,
+    output: &Output,
+    render_element_states: &RenderElementStates,
+) {
+    let processor = |namespace: Option<usize>| {
+        move |surface: &WlSurface, states: &SurfaceData| {
+            let primary_scanout_output = update_surface_primary_scanout_output(
+                surface,
+                output,
+                states,
+                namespace,
+                render_element_states,
+                primary_scanout_output_compare,
+            );
+            if let Some(output) = primary_scanout_output {
+                with_fractional_scale(states, |fraction_scale| {
+                    // The 1.0 clamp is a workaround for Chromium
+                    // TODO: remove if Chromium ever gets fixed
+                    fraction_scale
+                        .set_preferred_scale(output.current_scale().fractional_scale().max(1.0));
+                });
+            }
+        }
+    };
+
+    // lock surface
+    if let Some(session_lock) = shell.session_lock.as_ref()
+        && let Some(lock_surface) = session_lock.surfaces.get(output)
+    {
+        with_surfaces_surface_tree(lock_surface.wl_surface(), processor(None))
+    }
+
+    for seat in shell
+        .seats
+        .iter()
+        .filter(|seat| &seat.active_output() == output)
+    {
+        let cursor_status = seat.cursor_image_status();
+
+        // cursor ...
+        if let CursorImageStatus::Surface(wl_surface) = cursor_status {
+            with_surfaces_surface_tree(&wl_surface, processor(None));
+        }
+
+        // grabs
+        if let Some(move_grab) = seat.user_data().get::<SeatMoveGrabState>()
+            && let Some(grab_state) = move_grab.read().as_ref()
+        {
+            for (window, _) in grab_state.element().windows() {
+                window.with_surfaces(processor(None));
+            }
+        }
+
+        if let Some(icon) = get_dnd_icon(seat) {
+            with_surfaces_surface_tree(&icon.surface, processor(None));
+        }
+    }
+
+    // sticky window
+    for set in shell.workspaces.sets.values() {
+        set.sticky_layer.mapped().for_each(|mapped| {
+            for (window, _) in mapped.windows() {
+                window.with_surfaces(processor(None));
+            }
+        });
+    }
+
+    // normal windows
+    for space in shell.workspaces.spaces() {
+        if let Some(fs) = space.get_fullscreen(shell.seats.last_active()) {
+            fs.surface.with_surfaces(processor(None));
+        }
+        space.mapped().for_each(|mapped| {
+            for (window, _) in mapped.windows() {
+                window.with_surfaces(processor(None));
+            }
+        });
+        space.minimized_windows.iter().for_each(|m| {
+            for window in m.windows() {
+                window.with_surfaces(processor(None));
+            }
+        })
+    }
+
+    // OR windows
+    shell.override_redirect_windows.iter().for_each(|or| {
+        if let Some(wl_surface) = or.wl_surface() {
+            with_surfaces_surface_tree(&wl_surface, processor(None));
+        }
+    });
+
+    // layer surfaces
+    for o in shell.outputs() {
+        let namespace = shell.workspaces.active_num(o).1;
+        let map = smithay::desktop::layer_map_for_output(o);
+        for layer_surface in map.layers() {
+            layer_surface.with_surfaces(processor(Some(namespace)));
+        }
+    }
+}
+
+#[profiling::function]
+pub fn send_dmabuf_feedback(
+    shell: &Shell,
+    display_handle: &DisplayHandle,
+    output: &Output,
+    render_element_states: &RenderElementStates,
+    mut dmabuf_feedback: impl FnMut(DrmNode) -> Option<SurfaceDmabufFeedback>,
+) {
+    shell.for_each_surface_on_output(output, |toplevel| match toplevel {
+        OutputSurface::Session(wl_surface) => {
+            if let Some(feedback) = advertised_node_for_surface(wl_surface, display_handle)
+                .and_then(&mut dmabuf_feedback)
+            {
+                send_dmabuf_feedback_surface_tree(
+                    wl_surface,
+                    output,
+                    surface_primary_scanout_output,
+                    |surface, _| {
+                        select_dmabuf_feedback(
+                            surface,
+                            render_element_states,
+                            &feedback.render_feedback,
+                            &feedback.primary_scanout_feedback,
+                            &feedback.primary_scanout_feedback,
+                        )
+                    },
+                )
+            }
+        }
+        OutputSurface::Cursor(wl_surface) => {
+            if let Some(feedback) = advertised_node_for_surface(&wl_surface, display_handle)
+                .and_then(&mut dmabuf_feedback)
+            {
+                let overlay = feedback
+                    .overlay_scanout_feedback
+                    .as_ref()
+                    .unwrap_or(&feedback.render_feedback);
+                send_dmabuf_feedback_surface_tree(
+                    &wl_surface,
+                    output,
+                    surface_primary_scanout_output,
+                    |surface, _| {
+                        select_dmabuf_feedback(
+                            surface,
+                            render_element_states,
+                            &feedback.render_feedback,
+                            overlay,
+                            overlay,
+                        )
+                    },
+                );
+            }
+        }
+        OutputSurface::Window(window, _space, active, _is_fullscreen) => {
+            if active
+                && let Some(feedback) = window
+                    .wl_surface()
+                    .and_then(|wl_surface| advertised_node_for_surface(&wl_surface, display_handle))
+                    .and_then(&mut dmabuf_feedback)
+            {
+                window.send_dmabuf_feedback(
+                    output,
+                    &feedback,
+                    render_element_states,
+                    surface_primary_scanout_output,
+                );
+            }
+        }
+        OutputSurface::Layer(layer_surface, _namespace) => {
+            if let Some(feedback) =
+                advertised_node_for_surface(layer_surface.wl_surface(), display_handle)
+                    .and_then(&mut dmabuf_feedback)
+            {
+                let overlay = feedback
+                    .overlay_scanout_feedback
+                    .as_ref()
+                    .unwrap_or(&feedback.render_feedback);
+                layer_surface.send_dmabuf_feedback(
+                    output,
+                    surface_primary_scanout_output,
+                    |surface, _| {
+                        select_dmabuf_feedback(
+                            surface,
+                            render_element_states,
+                            &feedback.render_feedback,
+                            overlay,
+                            overlay,
+                        )
+                    },
+                );
+            }
+        }
+        OutputSurface::Surface(wl_surface) => {
+            if let Some(feedback) = advertised_node_for_surface(&wl_surface, display_handle)
+                .and_then(&mut dmabuf_feedback)
+            {
+                let overlay = feedback
+                    .overlay_scanout_feedback
+                    .as_ref()
+                    .unwrap_or(&feedback.render_feedback);
+                send_dmabuf_feedback_surface_tree(
+                    &wl_surface,
+                    output,
+                    surface_primary_scanout_output,
+                    |surface, _| {
+                        select_dmabuf_feedback(
+                            surface,
+                            render_element_states,
+                            &feedback.render_feedback,
+                            overlay,
+                            overlay,
+                        )
+                    },
+                )
+            }
+        }
+    });
+}
+
 impl Common {
     #[profiling::function]
     pub fn update_primary_output(
@@ -1000,103 +1222,7 @@ impl Common {
         output: &Output,
         render_element_states: &RenderElementStates,
     ) {
-        let shell = self.shell.read();
-        let processor = |namespace: Option<usize>| {
-            move |surface: &WlSurface, states: &SurfaceData| {
-                let primary_scanout_output = update_surface_primary_scanout_output(
-                    surface,
-                    output,
-                    states,
-                    namespace,
-                    render_element_states,
-                    primary_scanout_output_compare,
-                );
-                if let Some(output) = primary_scanout_output {
-                    with_fractional_scale(states, |fraction_scale| {
-                        // The 1.0 clamp is a workaround for Chromium
-                        // TODO: remove if Chromium ever gets fixed
-                        fraction_scale.set_preferred_scale(
-                            output.current_scale().fractional_scale().max(1.0),
-                        );
-                    });
-                }
-            }
-        };
-
-        // lock surface
-        if let Some(session_lock) = shell.session_lock.as_ref()
-            && let Some(lock_surface) = session_lock.surfaces.get(output)
-        {
-            with_surfaces_surface_tree(lock_surface.wl_surface(), processor(None))
-        }
-
-        for seat in shell
-            .seats
-            .iter()
-            .filter(|seat| &seat.active_output() == output)
-        {
-            let cursor_status = seat.cursor_image_status();
-
-            // cursor ...
-            if let CursorImageStatus::Surface(wl_surface) = cursor_status {
-                with_surfaces_surface_tree(&wl_surface, processor(None));
-            }
-
-            // grabs
-            if let Some(move_grab) = seat.user_data().get::<SeatMoveGrabState>()
-                && let Some(grab_state) = move_grab.read().as_ref()
-            {
-                for (window, _) in grab_state.element().windows() {
-                    window.with_surfaces(processor(None));
-                }
-            }
-
-            if let Some(icon) = get_dnd_icon(seat) {
-                with_surfaces_surface_tree(&icon.surface, processor(None));
-            }
-        }
-
-        // sticky window
-        for set in shell.workspaces.sets.values() {
-            set.sticky_layer.mapped().for_each(|mapped| {
-                for (window, _) in mapped.windows() {
-                    window.with_surfaces(processor(None));
-                }
-            });
-        }
-
-        // normal windows
-        for space in shell.workspaces.spaces() {
-            if let Some(fs) = space.get_fullscreen(shell.seats.last_active()) {
-                fs.surface.with_surfaces(processor(None));
-            }
-            space.mapped().for_each(|mapped| {
-                for (window, _) in mapped.windows() {
-                    window.with_surfaces(processor(None));
-                }
-            });
-            space.minimized_windows.iter().for_each(|m| {
-                for window in m.windows() {
-                    window.with_surfaces(processor(None));
-                }
-            })
-        }
-
-        // OR windows
-        shell.override_redirect_windows.iter().for_each(|or| {
-            if let Some(wl_surface) = or.wl_surface() {
-                with_surfaces_surface_tree(&wl_surface, processor(None));
-            }
-        });
-
-        // layer surfaces
-        for o in shell.outputs() {
-            let namespace = shell.workspaces.active_num(o).1;
-            let map = smithay::desktop::layer_map_for_output(o);
-            for layer_surface in map.layers() {
-                layer_surface.with_surfaces(processor(Some(namespace)));
-            }
-        }
+        update_primary_output(&self.shell.read(), output, render_element_states);
     }
 
     #[profiling::function]
@@ -1104,126 +1230,15 @@ impl Common {
         &self,
         output: &Output,
         render_element_states: &RenderElementStates,
-        mut dmabuf_feedback: impl FnMut(DrmNode) -> Option<SurfaceDmabufFeedback>,
+        dmabuf_feedback: impl FnMut(DrmNode) -> Option<SurfaceDmabufFeedback>,
     ) {
-        self.shell
-            .read()
-            .for_each_surface_on_output(output, |toplevel| match toplevel {
-                OutputSurface::Session(wl_surface) => {
-                    if let Some(feedback) =
-                        advertised_node_for_surface(wl_surface, &self.display_handle)
-                            .and_then(&mut dmabuf_feedback)
-                    {
-                        send_dmabuf_feedback_surface_tree(
-                            wl_surface,
-                            output,
-                            surface_primary_scanout_output,
-                            |surface, _| {
-                                select_dmabuf_feedback(
-                                    surface,
-                                    render_element_states,
-                                    &feedback.render_feedback,
-                                    &feedback.primary_scanout_feedback,
-                                    &feedback.primary_scanout_feedback,
-                                )
-                            },
-                        )
-                    }
-                }
-                OutputSurface::Cursor(wl_surface) => {
-                    if let Some(feedback) =
-                        advertised_node_for_surface(&wl_surface, &self.display_handle)
-                            .and_then(&mut dmabuf_feedback)
-                    {
-                        let overlay = feedback
-                            .overlay_scanout_feedback
-                            .as_ref()
-                            .unwrap_or(&feedback.render_feedback);
-                        send_dmabuf_feedback_surface_tree(
-                            &wl_surface,
-                            output,
-                            surface_primary_scanout_output,
-                            |surface, _| {
-                                select_dmabuf_feedback(
-                                    surface,
-                                    render_element_states,
-                                    &feedback.render_feedback,
-                                    overlay,
-                                    overlay,
-                                )
-                            },
-                        );
-                    }
-                }
-                OutputSurface::Window(window, _space, active, _is_fullscreen) => {
-                    if active
-                        && let Some(feedback) = window
-                            .wl_surface()
-                            .and_then(|wl_surface| {
-                                advertised_node_for_surface(&wl_surface, &self.display_handle)
-                            })
-                            .and_then(&mut dmabuf_feedback)
-                    {
-                        window.send_dmabuf_feedback(
-                            output,
-                            &feedback,
-                            render_element_states,
-                            surface_primary_scanout_output,
-                        );
-                    }
-                }
-                OutputSurface::Layer(layer_surface, _namespace) => {
-                    if let Some(feedback) = advertised_node_for_surface(
-                        layer_surface.wl_surface(),
-                        &self.display_handle,
-                    )
-                    .and_then(&mut dmabuf_feedback)
-                    {
-                        let overlay = feedback
-                            .overlay_scanout_feedback
-                            .as_ref()
-                            .unwrap_or(&feedback.render_feedback);
-                        layer_surface.send_dmabuf_feedback(
-                            output,
-                            surface_primary_scanout_output,
-                            |surface, _| {
-                                select_dmabuf_feedback(
-                                    surface,
-                                    render_element_states,
-                                    &feedback.render_feedback,
-                                    overlay,
-                                    overlay,
-                                )
-                            },
-                        );
-                    }
-                }
-                OutputSurface::Surface(wl_surface) => {
-                    if let Some(feedback) =
-                        advertised_node_for_surface(&wl_surface, &self.display_handle)
-                            .and_then(&mut dmabuf_feedback)
-                    {
-                        let overlay = feedback
-                            .overlay_scanout_feedback
-                            .as_ref()
-                            .unwrap_or(&feedback.render_feedback);
-                        send_dmabuf_feedback_surface_tree(
-                            &wl_surface,
-                            output,
-                            surface_primary_scanout_output,
-                            |surface, _| {
-                                select_dmabuf_feedback(
-                                    surface,
-                                    render_element_states,
-                                    &feedback.render_feedback,
-                                    overlay,
-                                    overlay,
-                                )
-                            },
-                        )
-                    }
-                }
-            });
+        send_dmabuf_feedback(
+            &self.shell.read(),
+            &self.display_handle,
+            output,
+            render_element_states,
+            dmabuf_feedback,
+        );
     }
 
     #[profiling::function]
