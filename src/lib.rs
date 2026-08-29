@@ -214,7 +214,7 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
         {
             let dh = state.common.display_handle.clone();
             for client in clients.values() {
-                client_compositor_state(client).blocker_cleared(&dh);
+                client_compositor_state(client).blocker_cleared_async(&dh);
             }
         }
 
@@ -457,7 +457,7 @@ fn refresh(state: &mut State) {
 //         });
 
 //     for (_client_id, client) in clients {
-//         client_compositor_state(&client).blocker_cleared(&dh);
+//         client_compositor_state(&client).blocker_cleared_async(&dh);
 //     }
 //     next_deadline
 // }

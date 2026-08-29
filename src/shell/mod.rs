@@ -1728,11 +1728,7 @@ impl<'a> OutputSurface<'a> {
         match self {
             OutputSurface::Session(s) => with_surfaces_surface_tree(s, processor),
             OutputSurface::Cursor(s) => with_surfaces_surface_tree(s, processor),
-            OutputSurface::Window(w, _space, active, _is_fullscreen) => {
-                if *active {
-                    w.with_surfaces(processor)
-                }
-            }
+            OutputSurface::Window(w, _space, _active, _is_fullscreen) => w.with_surfaces(processor),
             OutputSurface::Layer(l, _namespace) => l.with_surfaces(processor),
             OutputSurface::Surface(s) => with_surfaces_surface_tree(s, processor),
         }

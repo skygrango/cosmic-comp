@@ -368,7 +368,9 @@ impl Surface {
                 Event::Msg(SurfaceCommand::ClientBlockerCleared(clients)) => {
                     let dh = state.common.display_handle.clone();
                     for (_client_id, client) in clients {
-                        state.client_compositor_state(&client).blocker_cleared(&dh);
+                        state
+                            .client_compositor_state(&client)
+                            .blocker_cleared_async(&dh);
                     }
                 }
                 Event::Closed => {}
@@ -1874,7 +1876,7 @@ impl SurfaceThreadState {
             });
 
         for (_client_id, client) in clients {
-            client_compositor_state(&client).blocker_cleared(&dh);
+            client_compositor_state(&client).blocker_cleared_async(&dh);
         }
 
         if let Some(next_deadline) = next_deadline {
@@ -1883,7 +1885,8 @@ impl SurfaceThreadState {
             self.loop_handle
                 .insert_source(next_deadline, move |_time, _, state| {
                     for client in fullscreen_clients.values() {
-                        client_compositor_state(client).blocker_cleared(&state.display_handle);
+                        client_compositor_state(client)
+                            .blocker_cleared_async(&state.display_handle);
                     }
                     TimeoutAction::Drop
                 })
@@ -1912,7 +1915,7 @@ fn signal_fifos(shell: &Arc<parking_lot::RwLock<Shell>>, output: &Output, dh: &D
     });
 
     for (_client_id, client) in clients {
-        client_compositor_state(&client).blocker_cleared(&dh);
+        client_compositor_state(&client).blocker_cleared_async(&dh);
     }
 }
 
