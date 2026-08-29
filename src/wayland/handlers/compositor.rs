@@ -2,6 +2,7 @@
 
 use crate::{shell::grabs::SeatMoveGrabState, state::ClientState, utils::prelude::*};
 use calloop::Interest;
+use calloop::timer::{TimeoutAction, Timer};
 use smithay::{
     backend::{
         input::InputTime,
@@ -14,6 +15,7 @@ use smithay::{
     reexports::wayland_server::{Client, Resource, protocol::wl_surface::WlSurface},
     utils::{Clock, Logical, Monotonic, SERIAL_COUNTER, Size, Time},
     wayland::{
+        commit_timing::CommitTimerBarrierStateUserData,
         compositor::{
             BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
             SurfaceAttributes, SurfaceData, TraversalAction, add_blocker, add_post_commit_hook,
@@ -216,7 +218,9 @@ impl CompositorHandler for State {
                             .event_loop_handle
                             .insert_source(source, move |_, _, state| {
                                 let dh = state.common.display_handle.clone();
-                                state.client_compositor_state(&client).blocker_cleared(&dh);
+                                state
+                                    .client_compositor_state(&client)
+                                    .blocker_cleared_async(&dh);
                                 Ok(())
                             });
                     if res.is_ok() {
@@ -232,7 +236,9 @@ impl CompositorHandler for State {
                             .event_loop_handle
                             .insert_source(source, move |_, _, state| {
                                 let dh = state.common.display_handle.clone();
-                                state.client_compositor_state(&client).blocker_cleared(&dh);
+                                state
+                                    .client_compositor_state(&client)
+                                    .blocker_cleared_async(&dh);
                                 Ok(())
                             });
                     if res.is_ok() {
@@ -386,6 +392,48 @@ impl CompositorHandler for State {
                 shell.workspaces.recalculate();
             }
         }
+    }
+
+    fn blocker_added(&mut self, surface: &WlSurface, client: &Client) {
+        // Check if this surface has a pending commit-timer deadline.
+        let next_deadline = with_states(surface, |states| {
+            states
+                .data_map
+                .get::<CommitTimerBarrierStateUserData>()
+                .and_then(|s| s.lock().unwrap().next_deadline())
+        });
+
+        let Some(deadline) = next_deadline else {
+            // No commit-timer deadline; nothing to schedule.
+            return;
+        };
+
+        let duration = Time::<Monotonic>::elapsed(&self.common.clock.now(), deadline.into());
+        let timer = Timer::from_duration(duration);
+        let client = client.clone();
+        let dh = self.common.display_handle.clone();
+        // Downgrade to Weak so the surface can be captured in the 'static closure.
+        let weak_surface = surface.downgrade();
+
+        self.common
+            .event_loop_handle
+            .insert_source(timer, move |_instant, _, state| {
+                let Ok(surface) = weak_surface.upgrade() else {
+                    return TimeoutAction::Drop;
+                };
+                // Signal all barriers that are now past their deadline.
+                let signaled = with_states(&surface, |states| {
+                    states
+                        .data_map
+                        .get::<CommitTimerBarrierStateUserData>()
+                        .is_some_and(|s| s.lock().unwrap().signal_until(deadline))
+                });
+                if signaled {
+                    client_compositor_state(&client).blocker_cleared(state, &dh);
+                }
+                TimeoutAction::Drop
+            })
+            .expect("Failed to schedule commit-timer blocker");
     }
 }
 
