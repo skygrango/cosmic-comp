@@ -3,6 +3,10 @@
 use crate::{shell::grabs::SeatMoveGrabState, state::ClientState, utils::prelude::*};
 use calloop::Interest;
 use calloop::timer::{TimeoutAction, Timer};
+use smithay::desktop::utils::with_surfaces_surface_tree;
+use smithay::reexports::wayland_server::Weak;
+use smithay::wayland::commit_timing::Timestamp;
+use smithay::wayland::fifo::FifoBarrierCachedState;
 use smithay::{
     backend::{
         input::InputTime,
@@ -33,7 +37,9 @@ use smithay::{
     },
     xwayland::XWaylandClientData,
 };
+use std::collections::HashMap;
 use std::{collections::VecDeque, sync::LazyLock, sync::Mutex, time::Duration};
+use wayland_backend::server::ClientId;
 
 pub static FULLSCREEN_IMMEDIATE_RENDER: LazyLock<bool> = LazyLock::new(|| {
     crate::utils::env::bool_var("COSMIC_FULLSCREEN_IMMEDIATE_RENDER").unwrap_or(true)
@@ -394,8 +400,7 @@ impl CompositorHandler for State {
         }
     }
 
-    fn blocker_added(&mut self, surface: &WlSurface, client: &Client) {
-        // Check if this surface has a pending commit-timer deadline.
+    fn blocker_added(&mut self, surface: &WlSurface, _client: &Client) {
         let next_deadline = with_states(surface, |states| {
             states
                 .data_map
@@ -408,12 +413,19 @@ impl CompositorHandler for State {
             return;
         };
 
+        let weak_surface = surface.downgrade();
+
+        self.schedule_commit_timing(weak_surface, deadline);
+
+    }
+}
+
+
+
+impl State {
+    fn schedule_commit_timing(&self, weak_surface: Weak<WlSurface>, deadline: Timestamp) {
         let duration = Time::<Monotonic>::elapsed(&self.common.clock.now(), deadline.into());
         let timer = Timer::from_duration(duration);
-        let client = client.clone();
-        let dh = self.common.display_handle.clone();
-        // Downgrade to Weak so the surface can be captured in the 'static closure.
-        let weak_surface = surface.downgrade();
 
         self.common
             .event_loop_handle
@@ -421,23 +433,35 @@ impl CompositorHandler for State {
                 let Ok(surface) = weak_surface.upgrade() else {
                     return TimeoutAction::Drop;
                 };
-                // Signal all barriers that are now past their deadline.
-                let signaled = with_states(&surface, |states| {
-                    states
+                let timer_result = with_states(&surface, |states| {
+                    if let Some(commit_timer) = states
                         .data_map
                         .get::<CommitTimerBarrierStateUserData>()
-                        .is_some_and(|s| s.lock().unwrap().signal_until(deadline))
+                    {
+                        let mut timer = commit_timer.lock().unwrap();
+                        Some((timer.signal_until(deadline), timer.next_deadline()))
+                    } else {
+                        None
+                    }
                 });
-                if signaled {
-                    client_compositor_state(&client).blocker_cleared(state, &dh);
+
+                if let Some((signaled, next_deadline)) = timer_result {
+                    if signaled
+                        && let Some(client) = surface.client()
+                    {
+                        let dh = state.common.display_handle.clone();
+                        client_compositor_state(&client).blocker_cleared(state, &dh);
+                    }
+                    if let Some(deadline) = next_deadline {
+                        state.schedule_commit_timing(surface.downgrade(), deadline);
+                    }
                 }
+
                 TimeoutAction::Drop
             })
             .expect("Failed to schedule commit-timer blocker");
     }
-}
 
-impl State {
     fn send_initial_configure_and_map(&mut self, surface: &WlSurface) -> bool {
         let mut shell = self.common.shell.write();
 
