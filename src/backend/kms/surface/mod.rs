@@ -72,10 +72,11 @@ use smithay::{
             linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_v1,
             presentation_time::server::wp_presentation_feedback,
         },
-        wayland_server::protocol::wl_surface::WlSurface,
+        wayland_server::{Client, protocol::wl_surface::WlSurface},
     },
     utils::{Clock, IsAlive, Monotonic, Physical, Point, Rectangle, Transform},
     wayland::{
+        compositor::CompositorHandler,
         dmabuf::{DmabufFeedbackBuilder, get_dmabuf},
         image_copy_capture::{
             CaptureFailureReason, Frame as ScreencopyFrame, SessionRef as ScreencopySessionRef,
@@ -86,6 +87,7 @@ use smithay::{
     },
 };
 use tracing::{error, info, trace, warn};
+use wayland_backend::server::ClientId;
 
 use std::{
     borrow::{Borrow, BorrowMut},
@@ -241,6 +243,7 @@ pub enum ThreadCommand {
 
 #[derive(Debug)]
 pub enum SurfaceCommand {
+    BlockerCleared(HashMap<ClientId, Client>),
     SendFrames(usize),
     RenderStates(RenderElementStates),
 }
@@ -295,6 +298,14 @@ impl Surface {
         let output_clone = output.clone();
         let thread_token = evlh
             .insert_source(rx2, move |command, _, state| match command {
+                Event::Msg(SurfaceCommand::BlockerCleared(signaled_clients)) => {
+                    let dh = &state.common.display_handle.clone();
+                    for (_id, client) in signaled_clients {
+                        state
+                            .client_compositor_state(&client)
+                            .blocker_cleared(state, dh);
+                    }
+                }
                 Event::Msg(SurfaceCommand::SendFrames(sequence)) => {
                     if output_clone.mirroring().is_some() {
                         return;
@@ -1120,13 +1131,6 @@ impl SurfaceThreadState {
             vrr = has_active_fullscreen;
         }
 
-        // TODO commit timing `signal_until`
-        {
-            let shell = self.shell.read();
-            // XXX correct way to set time?
-            shell.signal_commit_timing(&self.output, self.clock.now() + estimated_presentation);
-        }
-
         let mut elements = output_elements(
             Some(&render_node),
             &mut renderer,
@@ -1444,7 +1448,9 @@ impl SurfaceThreadState {
                             self.send_dmabuf_feedback(states);
 
                             let shell = self.shell.read();
-                            shell.signal_fifos(&self.output);
+                            let signaled_clients = shell.signal_fifos(&self.output);
+                            drop(shell);
+                            self.send_blocker_cleared_callbacks(signaled_clients);
                         }
 
                         if x.is_ok() {
@@ -1530,6 +1536,14 @@ impl SurfaceThreadState {
     fn update_screen_filter(&mut self, filter_config: ScreenFilter) {
         self.screen_filter = filter_config;
         self.postprocess_textures.clear();
+    }
+
+    fn send_blocker_cleared_callbacks(&mut self, signaled_clients: HashMap<ClientId, Client>) {
+        if self.mirroring.is_none() {
+            let _ = self
+                .thread_sender
+                .send(SurfaceCommand::BlockerCleared(signaled_clients));
+        }
     }
 
     fn send_frame_callbacks(&mut self) {
