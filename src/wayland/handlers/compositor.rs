@@ -400,32 +400,26 @@ impl CompositorHandler for State {
         }
     }
 
-    fn blocker_added(&mut self, surface: &WlSurface, _client: &Client) {
-        let next_deadline = with_states(surface, |states| {
-            states
-                .data_map
-                .get::<CommitTimerBarrierStateUserData>()
-                .and_then(|s| s.lock().unwrap().next_deadline())
+    fn schedule_barrier(&mut self, surface: &WlSurface, _client: &Client) {
+        with_surfaces_surface_tree(surface, |surface, states| {
+            let Some(commit_timer_barrier_state) =
+                states.data_map.get::<CommitTimerBarrierStateUserData>()
+            else {
+                return;
+            };
+            if let Some(next_deadline) = commit_timer_barrier_state.lock().unwrap().next_deadline()
+            {
+                self.schedule_commit_timing(surface, next_deadline);
+            };
         });
-
-        let Some(deadline) = next_deadline else {
-            // No commit-timer deadline; nothing to schedule.
-            return;
-        };
-
-        let weak_surface = surface.downgrade();
-
-        self.schedule_commit_timing(weak_surface, deadline);
-
     }
 }
 
-
-
 impl State {
-    fn schedule_commit_timing(&self, weak_surface: Weak<WlSurface>, deadline: Timestamp) {
+    fn schedule_commit_timing(&self, surface: &WlSurface, deadline: Timestamp) {
         let duration = Time::<Monotonic>::elapsed(&self.common.clock.now(), deadline.into());
         let timer = Timer::from_duration(duration);
+        let weak_surface = surface.downgrade();
 
         self.common
             .event_loop_handle
@@ -434,9 +428,8 @@ impl State {
                     return TimeoutAction::Drop;
                 };
                 let timer_result = with_states(&surface, |states| {
-                    if let Some(commit_timer) = states
-                        .data_map
-                        .get::<CommitTimerBarrierStateUserData>()
+                    if let Some(commit_timer) =
+                        states.data_map.get::<CommitTimerBarrierStateUserData>()
                     {
                         let mut timer = commit_timer.lock().unwrap();
                         Some((timer.signal_until(deadline), timer.next_deadline()))
@@ -446,14 +439,12 @@ impl State {
                 });
 
                 if let Some((signaled, next_deadline)) = timer_result {
-                    if signaled
-                        && let Some(client) = surface.client()
-                    {
+                    if signaled && let Some(client) = surface.client() {
                         let dh = state.common.display_handle.clone();
                         client_compositor_state(&client).blocker_cleared(state, &dh);
                     }
                     if let Some(deadline) = next_deadline {
-                        state.schedule_commit_timing(surface.downgrade(), deadline);
+                        state.schedule_commit_timing(&surface, deadline);
                     }
                 }
 
