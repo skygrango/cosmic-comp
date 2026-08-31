@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use crate::{shell::grabs::SeatMoveGrabState, state::ClientState, utils::prelude::*};
-use calloop::Interest;
+use calloop::{
+    Interest,
+    timer::{TimeoutAction, Timer},
+};
 use smithay::{
     backend::{
         input::InputTime,
@@ -10,10 +13,14 @@ use smithay::{
             utils::{on_commit_buffer_handler, with_renderer_surface_state},
         },
     },
-    desktop::{LayerSurface, PopupKind, WindowSurfaceType, layer_map_for_output},
+    desktop::{
+        LayerSurface, PopupKind, WindowSurfaceType, layer_map_for_output,
+        utils::with_surfaces_surface_tree,
+    },
     reexports::wayland_server::{Client, Resource, protocol::wl_surface::WlSurface},
     utils::{Clock, Logical, Monotonic, SERIAL_COUNTER, Size, Time},
     wayland::{
+        commit_timing::{CommitTimerStateUserData, Timestamp},
         compositor::{
             BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
             SurfaceAttributes, SurfaceData, TraversalAction, add_blocker, add_post_commit_hook,
@@ -31,7 +38,7 @@ use smithay::{
     },
     xwayland::XWaylandClientData,
 };
-use std::{collections::VecDeque, sync::Mutex, time::Duration};
+use std::{cell::RefCell, collections::VecDeque, sync::Mutex, time::Duration};
 
 fn toplevel_ensure_initial_configure(
     toplevel: &ToplevelSurface,
@@ -261,6 +268,10 @@ impl CompositorHandler for State {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
+        if self.pre_schedule_commit_timing(surface) {
+            return;
+        }
+
         // first load the buffer for various smithay helper functions (which also initializes the RendererSurfaceState)
         on_commit_buffer_handler::<Self>(surface);
 
@@ -378,6 +389,52 @@ impl CompositorHandler for State {
 }
 
 impl State {
+    fn pre_schedule_commit_timing(&mut self, surface: &WlSurface) -> bool {
+        if let Some(timestamp) = with_states(&surface, |states| {
+            states
+                .data_map
+                .get::<CommitTimerStateUserData>()
+                .and_then(|state| state.borrow_mut().timestamp.take())
+        }) {
+            self.schedule_commit_timing(surface, timestamp);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn schedule_commit_timing(&mut self, surface: &WlSurface, deadline: Timestamp) {
+        // TODO: further improve the timing based on render time and vblank timing
+        let next_deadline = Time::elapsed(&self.common.clock.now(), deadline.into());
+        let timer = Timer::from_duration(next_deadline);
+        let week_surface = surface.downgrade();
+
+        let _ = self
+            .common
+            .event_loop_handle
+            .insert_source(timer, move |_instant, _, state| {
+                let Ok(surface) = week_surface.upgrade() else {
+                    return TimeoutAction::Drop;
+                };
+
+                let timestamp = with_states(&surface, |states| {
+                    states
+                        .data_map
+                        .get::<CommitTimerStateUserData>()
+                        .and_then(|state| state.borrow_mut().timestamp.take())
+                });
+
+                state.commit(&surface);
+
+                if let Some(timestamp) = timestamp {
+                    state.schedule_commit_timing(&surface, timestamp);
+                }
+
+                TimeoutAction::Drop
+            })
+            .expect("failed to register commit-timing timer");
+    }
+
     fn send_initial_configure_and_map(&mut self, surface: &WlSurface) -> bool {
         let mut shell = self.common.shell.write();
 
