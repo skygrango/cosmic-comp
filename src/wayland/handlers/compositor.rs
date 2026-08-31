@@ -13,7 +13,10 @@ use smithay::{
             utils::{on_commit_buffer_handler, with_renderer_surface_state},
         },
     },
-    desktop::{LayerSurface, PopupKind, WindowSurfaceType, layer_map_for_output},
+    desktop::{
+        LayerSurface, PopupKind, WindowSurfaceType, layer_map_for_output,
+        utils::with_surfaces_surface_tree,
+    },
     reexports::wayland_server::{Client, Resource, protocol::wl_surface::WlSurface},
     utils::{Clock, Logical, Monotonic, SERIAL_COUNTER, Size, Time},
     wayland::{
@@ -381,20 +384,17 @@ impl CompositorHandler for State {
     }
 
     fn schedule_barrier(&mut self, surface: &WlSurface) {
-        let next_deadline = with_states(surface, |states| {
+        with_surfaces_surface_tree(surface, |surface, states| {
             let Some(commit_timer_barrier_state) =
                 states.data_map.get::<CommitTimerBarrierStateUserData>()
             else {
-                return None;
+                return;
             };
-            commit_timer_barrier_state.lock().unwrap().next_deadline()
+            if let Some(next_deadline) = commit_timer_barrier_state.lock().unwrap().next_deadline()
+            {
+                self.schedule_commit_timing(&surface, next_deadline);
+            };
         });
-
-        let Some(deadline) = next_deadline else {
-            return;
-        };
-
-        self.schedule_commit_timing(surface, deadline);
     }
 }
 
