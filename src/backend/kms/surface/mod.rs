@@ -42,8 +42,8 @@ use smithay::{
         },
         egl::EGLContext,
         renderer::{
-            Bind, Blit, BufferType, Frame, ImportDma, Offscreen, Renderer, RendererSuper, Texture,
-            TextureFilter, buffer_dimensions, buffer_type,
+            Bind, Blit, BufferType, Frame, ImportDma, Offscreen, PresentationMode, Renderer,
+            RendererSuper, Texture, TextureFilter, buffer_dimensions, buffer_type,
             damage::Error as RenderError,
             element::{
                 Element, Kind, RenderElementStates,
@@ -132,6 +132,7 @@ pub struct Surface {
     pub feedback: HashMap<DrmNode, SurfaceDmabufFeedback>,
     pub(super) primary_plane_formats: FormatSet,
     overlay_plane_formats: Option<FormatSet>,
+    pub(super) async_planes_formats: Option<FormatSet>,
 
     loop_handle: LoopHandle<'static, State>,
     thread_command: Sender<ThreadCommand>,
@@ -346,6 +347,7 @@ impl Surface {
                                     target_formats,
                                     surface.primary_plane_formats.clone(),
                                     surface.overlay_plane_formats.clone(),
+                                    surface.async_planes_formats.clone(),
                                 );
                                 surface.feedback.insert(source_node, feedback.clone());
                                 Some(feedback)
@@ -365,6 +367,7 @@ impl Surface {
             feedback: HashMap::new(),
             primary_plane_formats: FormatSet::default(),
             overlay_plane_formats: None,
+            async_planes_formats: None,
             loop_handle: evlh.clone(),
             thread_command: tx,
             thread_token,
@@ -460,9 +463,11 @@ impl Surface {
         compositor: GbmDrmOutput,
         primary_plane_formats: FormatSet,
         overlay_plane_formats: Option<FormatSet>,
+        async_planes_formats: Option<FormatSet>,
     ) {
         self.primary_plane_formats = primary_plane_formats;
         self.overlay_plane_formats = overlay_plane_formats;
+        self.async_planes_formats = async_planes_formats;
         self.feedback.clear();
         self.active.store(true, Ordering::SeqCst);
         self.dpms = true;
@@ -815,7 +820,7 @@ impl SurfaceThreadState {
         let _ = self.vblank_frame.take();
 
         // mark last frame completed
-        if let Ok(Some(Some((mut feedback, frames, estimated_presentation_time)))) =
+        if let Ok(Some((mut feedback, frames, estimated_presentation_time))) =
             compositor.frame_submitted()
             && self.mirroring.is_none()
         {
@@ -1348,6 +1353,14 @@ impl SurfaceThreadState {
             if let Err(err) = compositor.with_compositor(|c| c.use_vrr(vrr)) {
                 warn!("Unable to set adaptive VRR state: {}", err);
             }
+
+            let presentation_mode = if self.output.is_foreground_fullscreen_occupied().is_some() {
+                additional_frame_flags |= FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY;
+                PresentationMode::Async
+            } else {
+                PresentationMode::VSync
+            };
+
             compositor.render_frame(
                 &mut renderer,
                 &elements,
@@ -1355,11 +1368,20 @@ impl SurfaceThreadState {
                 self.frame_flags
                     .union(additional_frame_flags)
                     .difference(remove_frame_flags),
+                presentation_mode,
             )
         } else {
             if let Err(err) = compositor.with_compositor(|c| c.use_vrr(vrr)) {
                 warn!("Unable to set adaptive VRR state: {}", err);
             }
+
+            let presentation_mode = if self.output.is_foreground_fullscreen_occupied().is_some() {
+                additional_frame_flags |= FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY;
+                PresentationMode::Async
+            } else {
+                PresentationMode::VSync
+            };
+
             compositor.render_frame(
                 &mut renderer,
                 &elements,
@@ -1367,6 +1389,7 @@ impl SurfaceThreadState {
                 self.frame_flags
                     .union(additional_frame_flags)
                     .difference(remove_frame_flags),
+                presentation_mode,
             )
         };
         self.timings.draw_done(&self.clock);
@@ -1601,6 +1624,7 @@ fn get_surface_dmabuf_feedback(
     target_formats: FormatSet,
     primary_plane_formats: FormatSet,
     overlay_plane_formats: Option<FormatSet>,
+    async_planes_formats: Option<FormatSet>,
 ) -> SurfaceDmabufFeedback {
     // We limit the scan-out trache to formats we can also render from
     // so that there is always a fallback render path available in case
@@ -1641,6 +1665,7 @@ fn get_surface_dmabuf_feedback(
         .unwrap();
     let overlay_scanout_feedback = overlay_plane_formats.map(|formats| {
         builder
+            .clone()
             .add_preference_tranche(
                 target_node.dev_id(),
                 zwp_linux_dmabuf_feedback_v1::TrancheFlags::Scanout,
@@ -1651,10 +1676,29 @@ fn get_surface_dmabuf_feedback(
             .unwrap()
     });
 
+    let async_feedback = async_planes_formats
+        .map(|formats| {
+            let async_formats = formats
+                .intersection(&render_formats)
+                .cloned()
+                .collect::<FormatSet>();
+            builder
+                .add_preference_tranche(
+                    target_node.dev_id(),
+                    zwp_linux_dmabuf_feedback_v1::TrancheFlags::Scanout,
+                    async_formats,
+                    4..=6,
+                )
+                .build()
+                .unwrap()
+        })
+        .unwrap_or_else(|| primary_scanout_feedback.clone());
+
     SurfaceDmabufFeedback {
         render_feedback,
         overlay_scanout_feedback,
         primary_scanout_feedback,
+        async_feedback,
     }
 }
 

@@ -27,7 +27,7 @@ use smithay::{
             output::{DrmOutputManager, LockedDrmOutputManager},
         },
         egl::{EGLContext, EGLDevice, EGLDisplay, context::ContextPriority},
-        renderer::glow::GlowRenderer,
+        renderer::{PresentationMode, glow::GlowRenderer},
         session::{Session, libseat::LibSeatSession},
     },
     desktop::utils::OutputPresentationFeedback,
@@ -923,7 +923,13 @@ impl LockedDevice<'_> {
                 };
 
                 let mut compositor = compositor.lock().unwrap();
-                compositor.render_frame(renderer, &elements, CLEAR_COLOR, FrameFlags::empty())?;
+                compositor.render_frame(
+                    renderer,
+                    &elements,
+                    CLEAR_COLOR,
+                    FrameFlags::empty(),
+                    PresentationMode::VSync,
+                )?;
                 if let Err(err) = compositor.commit_frame()
                     && !matches!(err, FrameError::EmptyFrame)
                 {
@@ -982,6 +988,26 @@ impl LockedDevice<'_> {
                     code,
                     modifier: *mo,
                 }))
+            };
+            surface.async_planes_formats = if flag {
+                let plane_info = comp.surface().plane_info();
+                let planes = comp.surface().planes();
+                let async_formats = plane_info
+                    .formats_async
+                    .as_ref()
+                    .unwrap_or(&plane_info.formats)
+                    .iter()
+                    .cloned()
+                    .chain(
+                        planes
+                            .overlay
+                            .iter()
+                            .flat_map(|p| p.formats_async.clone().unwrap_or_default()),
+                    )
+                    .collect::<FormatSet>();
+                Some(async_formats).filter(|f| !f.indexset().is_empty())
+            } else {
+                None
             };
             surface.feedback.clear();
         }

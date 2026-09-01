@@ -1154,10 +1154,25 @@ impl KmsGuard<'_> {
                             .iter()
                             .flat_map(|p| p.formats.iter().cloned())
                             .collect::<FormatSet>();
+                        let plane_info = compositor_ref.surface().plane_info();
+                        let async_formats = plane_info
+                            .formats_async
+                            .as_ref()
+                            .unwrap_or(&plane_info.formats)
+                            .iter()
+                            .cloned()
+                            .chain(
+                                planes
+                                    .overlay
+                                    .iter()
+                                    .flat_map(|p| p.formats_async.clone().unwrap_or_default()),
+                            )
+                            .collect::<FormatSet>();
                         surface.resume(
                             compositor,
                             primary_formats,
                             Some(overlay_formats).filter(|f| !f.indexset().is_empty()),
+                            Some(async_formats).filter(|f| !f.indexset().is_empty()),
                         );
 
                         surface.output.set_adaptive_sync_support(vrr_support);

@@ -24,7 +24,9 @@ use smithay::{
         input::InputTime,
         renderer::{
             ImportAll, Renderer, buffer_has_alpha,
-            element::{Kind, RenderElementStates, surface::KindEvaluation},
+            element::{
+                Kind, RenderElementStates, surface::KindEvaluation, utils::select_dmabuf_feedback,
+            },
             utils::RendererSurfaceStateUserData,
         },
     },
@@ -829,7 +831,7 @@ impl CosmicSurface {
         &self,
         output: &Output,
         feedback: &SurfaceDmabufFeedback,
-        _render_element_states: &RenderElementStates,
+        render_element_states: &RenderElementStates,
         primary_scan_out_output: F1,
     ) where
         F1: FnMut(&WlSurface, &SurfaceData) -> Option<Output> + Copy,
@@ -837,14 +839,27 @@ impl CosmicSurface {
         let is_fullscreen = self.is_fullscreen(false);
 
         self.0
-            .send_dmabuf_feedback(output, primary_scan_out_output, |_, data| {
+            .send_dmabuf_feedback(output, primary_scan_out_output, |surface, data| {
                 if is_fullscreen {
-                    &feedback.primary_scanout_feedback
+                    select_dmabuf_feedback(
+                        surface,
+                        render_element_states,
+                        &feedback.render_feedback,
+                        &feedback.primary_scanout_feedback,
+                        &feedback.async_feedback,
+                    )
                 } else if frame_time_filter_fn(data) == Kind::ScanoutCandidate {
-                    feedback
+                    let scanout = feedback
                         .overlay_scanout_feedback
                         .as_ref()
-                        .unwrap_or(&feedback.render_feedback)
+                        .unwrap_or(&feedback.render_feedback);
+                    select_dmabuf_feedback(
+                        surface,
+                        render_element_states,
+                        &feedback.render_feedback,
+                        scanout,
+                        &feedback.async_feedback,
+                    )
                 } else {
                     &feedback.render_feedback
                 }
