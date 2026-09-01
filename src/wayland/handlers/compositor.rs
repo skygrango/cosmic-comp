@@ -40,6 +40,9 @@ use smithay::{
 };
 use std::{cell::RefCell, collections::VecDeque, sync::Mutex, time::Duration};
 
+struct CommitTimerScheduler;
+struct CommitTimerScheduled(bool);
+
 fn toplevel_ensure_initial_configure(
     toplevel: &ToplevelSurface,
     size: Option<Size<i32, Logical>>,
@@ -268,7 +271,7 @@ impl CompositorHandler for State {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
-        if self.pre_schedule_commit_timing(surface) {
+        if self.has_commit_timing_scheduler(surface) {
             return;
         }
 
@@ -389,18 +392,42 @@ impl CompositorHandler for State {
 }
 
 impl State {
-    fn pre_schedule_commit_timing(&mut self, surface: &WlSurface) -> bool {
-        if let Some(timestamp) = with_states(&surface, |states| {
-            states
-                .data_map
-                .get::<CommitTimerStateUserData>()
-                .and_then(|state| state.borrow_mut().timestamp.take())
-        }) {
-            self.schedule_commit_timing(surface, timestamp);
-            true
-        } else {
-            false
-        }
+    fn has_commit_timing_scheduler(&mut self, surface: &WlSurface) -> bool {
+        with_states(&surface, |states| {
+            if states.data_map.get::<CommitTimerStateUserData>().is_some() {
+                if states.data_map.insert_if_missing(|| CommitTimerScheduler) {
+                    add_pre_commit_hook::<Self, _>(surface, move |state, _dh, surface| {
+                        with_states(&surface, |states| {
+                            if let Some(timestamp) = states
+                                .data_map
+                                .get::<CommitTimerStateUserData>()
+                                .and_then(|state| state.borrow_mut().timestamp.take())
+                            {
+                                state.schedule_commit_timing(surface, timestamp);
+                                states
+                                    .data_map
+                                    .get_or_insert(|| RefCell::new(CommitTimerScheduled(false)))
+                                    .borrow_mut()
+                                    .0 = true;
+                            }
+                        });
+                    });
+                    states
+                        .data_map
+                        .get_or_insert(|| RefCell::new(CommitTimerScheduled(false)))
+                        .borrow_mut()
+                        .0 = false;
+                }
+                states
+                    .data_map
+                    .get::<RefCell<CommitTimerScheduled>>()
+                    .unwrap()
+                    .borrow()
+                    .0
+            } else {
+                false
+            }
+        })
     }
 
     fn schedule_commit_timing(&mut self, surface: &WlSurface, deadline: Timestamp) {
@@ -417,18 +444,16 @@ impl State {
                     return TimeoutAction::Drop;
                 };
 
-                let timestamp = with_states(&surface, |states| {
+                with_states(&surface, |states| {
                     states
                         .data_map
-                        .get::<CommitTimerStateUserData>()
-                        .and_then(|state| state.borrow_mut().timestamp.take())
+                        .get::<RefCell<CommitTimerScheduled>>()
+                        .unwrap()
+                        .borrow_mut()
+                        .0 = false;
                 });
 
                 state.commit(&surface);
-
-                if let Some(timestamp) = timestamp {
-                    state.schedule_commit_timing(&surface, timestamp);
-                }
 
                 TimeoutAction::Drop
             })
