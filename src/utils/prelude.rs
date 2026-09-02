@@ -3,7 +3,9 @@ use parking_lot::RwLock;
 use smithay::{
     backend::drm::VrrSupport as Support,
     output::{Output, WeakOutput},
+    reexports::wayland_server::Client,
     utils::Rectangle,
+    wayland::compositor::{Barrier, CompositorHandler},
 };
 
 pub use super::geometry::*;
@@ -43,12 +45,25 @@ pub trait OutputExt {
 
     fn set_fullscreen_occupied(&self, surface: Option<CosmicSurface>);
     fn is_foreground_fullscreen_occupied(&self) -> Option<CosmicSurface>;
+
+    fn init_fifo(&self);
+    fn fifo_barrier(&self, barrier: Barrier, client: Client);
+    fn signal_fifo(&self, state: &mut State);
 }
 
 struct Vrr(AtomicU8);
 struct VrrSupport(AtomicU8);
 struct Mirroring(Mutex<Option<WeakOutput>>);
 struct FullscreenOccupied(RwLock<Option<WeakCosmicSurface>>);
+
+#[derive(Debug, Clone)]
+pub struct FifoBarrierItem {
+    pub barrier: Barrier,
+    pub client: Client,
+}
+
+#[derive(Default)]
+struct FifoBarriers(Mutex<Vec<FifoBarrierItem>>);
 
 impl OutputExt for Output {
     fn is_internal(&self) -> bool {
@@ -191,5 +206,34 @@ impl OutputExt for Output {
         self.user_data()
             .get::<FullscreenOccupied>()
             .and_then(|state| state.0.read().as_ref().and_then(|weak| weak.upgrade()))
+    }
+
+    fn init_fifo(&self) {
+        self.user_data()
+            .insert_if_missing_threadsafe(|| FifoBarriers(Mutex::new(Vec::new())));
+    }
+
+    fn fifo_barrier(&self, barrier: Barrier, client: Client) {
+        let user_data = self.user_data();
+        user_data.insert_if_missing_threadsafe(|| FifoBarriers(Mutex::new(Vec::new())));
+        if let Some(barriers) = user_data.get::<FifoBarriers>()
+            && let Ok(mut barriers_vec) = barriers.0.lock()
+        {
+            barriers_vec.push(FifoBarrierItem { barrier, client });
+        }
+    }
+
+    fn signal_fifo(&self, state: &mut State) {
+        let Some(fifo_barriers) = self.user_data().get::<FifoBarriers>() else {
+            return;
+        };
+
+        let dh = &state.common.display_handle.clone();
+        fifo_barriers.0.lock().unwrap().drain(..).for_each(|item| {
+            item.barrier.signal();
+            state
+                .client_compositor_state(&item.client)
+                .blocker_cleared(state, dh);
+        });
     }
 }
