@@ -519,7 +519,7 @@ impl State {
                     let dh = &state.common.display_handle.clone();
                     state
                         .client_compositor_state(&client)
-                        .blocker_cleared(state, dh);
+                        .blocker_cleared(dh);
                 }
 
                 if let Some(deadline) = next_deadline {

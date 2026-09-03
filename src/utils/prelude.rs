@@ -215,7 +215,7 @@ impl OutputExt for Output {
             item.barrier.signal();
             state
                 .client_compositor_state(&item.client)
-                .blocker_cleared(state, dh);
+                .blocker_cleared(dh);
         });
     }
 
