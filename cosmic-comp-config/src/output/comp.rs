@@ -51,6 +51,8 @@ pub struct OutputConfig {
     pub max_bpc: Option<u32>,
     #[serde(default)]
     pub xwayland_primary: bool,
+    #[serde(default)]
+    pub vrr_target_rate: Option<u32>,
 }
 
 impl Default for OutputConfig {
@@ -64,6 +66,7 @@ impl Default for OutputConfig {
             enabled: OutputState::Enabled,
             max_bpc: None,
             xwayland_primary: false,
+            vrr_target_rate: None,
         }
     }
 }

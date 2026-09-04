@@ -148,5 +148,5 @@ lto = "fat"
 cosmic-protocols = { git = "https://github.com/skygrango/cosmic-protocols", branch = "vrr_target_rate_v2" }
 
 [patch.crates-io]
-smithay = { git = "https://github.com/smithay/smithay.git", rev = "e3d461a" }
 smithay-egui = { git = "https://github.com/Smithay/smithay-egui.git", rev = "6511552" }
+smithay = { git = "https://github.com/skygrango/smithay.git", rev = "7f8a08f" }
