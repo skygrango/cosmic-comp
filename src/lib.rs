@@ -203,7 +203,7 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
         {
             let dh = state.common.display_handle.clone();
             for client in clients.values() {
-                client_compositor_state(client).blocker_cleared(&dh);
+                client_compositor_state(client).blocker_cleared(state, &dh);
             }
         }
 

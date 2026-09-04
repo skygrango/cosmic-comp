@@ -688,7 +688,7 @@ impl State {
 
         let clock = Clock::new();
         let config = Config::load(&handle);
-        let compositor_state = CompositorState::new::<Self>(dh, &handle);
+        let compositor_state = CompositorState::new::<Self>(dh);
         let corner_radius_state = CornerRadiusState::new::<Self>(dh);
         let data_device_state = DataDeviceState::new::<Self>(dh);
         let dmabuf_state = DmabufState::new();
