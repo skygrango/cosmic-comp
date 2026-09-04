@@ -252,7 +252,7 @@ impl CompositorHandler for State {
                     output.fifo_barrier(barrier, client);
                 }
             }
-            
+
             let mut acquire_point = None;
             let maybe_dmabuf = with_states(surface, |surface_data| {
                 acquire_point = surface_data
@@ -354,7 +354,11 @@ impl CompositorHandler for State {
                     .is_some_and(|cosmic_surface| {
                         cosmic_surface.has_surface(surface, WindowSurfaceType::ALL)
                     });
-            self.backend.schedule_render(output, is_fullscreen);
+            if is_fullscreen {
+                self.backend.schedule_render_fullscreen(output);
+            } else {
+                self.backend.schedule_render(output);
+            }
         }
 
         if mapped {

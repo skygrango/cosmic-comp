@@ -426,7 +426,15 @@ impl Surface {
         let _ = self.thread_command.send(ThreadCommand::VBlank(metadata));
     }
 
-    pub fn schedule_render(&self, is_fullscreen: bool) {
+    pub fn schedule_render(&self) {
+        self.schedule_backend(false);
+    }
+
+    pub fn schedule_render_fullscreen(&self) {
+        self.schedule_backend(true);
+    }
+
+    pub fn schedule_backend(&self, is_fullscreen: bool) {
         if self.dpms {
             let _ = self
                 .thread_command
@@ -499,7 +507,7 @@ impl Surface {
         if self.dpms != on {
             self.dpms = on;
             if on {
-                self.schedule_render(false);
+                self.schedule_render();
             } else {
                 let _ = self.thread_command.send(ThreadCommand::DpmsOff);
             }
