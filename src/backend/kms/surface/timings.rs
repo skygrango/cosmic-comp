@@ -396,7 +396,7 @@ impl Timings {
                 return estimated_presentation_time.saturating_sub(baseline + BASE_SAFETY_MARGIN);
             };
             avg_frametime
-        }else{
+        } else {
             let Some(avg_submittime) = self.avg_submittime(SAMPLE_TIME_WINDOW) else {
                 return estimated_presentation_time.saturating_sub(baseline + BASE_SAFETY_MARGIN);
             };
