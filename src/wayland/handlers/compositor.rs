@@ -238,9 +238,7 @@ impl CompositorHandler for State {
                     }
                 }
             }
-        });
 
-        add_pre_commit_hook::<Self, _>(surface, move |state, _dh, surface| {
             let timestamp = with_states(surface, |states| {
                 states
                     .data_map
@@ -256,12 +254,9 @@ impl CompositorHandler for State {
                     barrier_state.lock().unwrap().register(timestamp)
                 });
 
-                add_blocker(surface, barrier);
-                state.schedule_commit_timing(surface, timestamp);
+                state.schedule_commit_timing(surface, timestamp, Some(barrier));
             }
-        });
 
-        add_pre_commit_hook::<Self, _>(surface, move |state, _dh, surface| {
             let fifo_barrier = with_states(surface, |states| {
                 let fifo_state = *states.cached_state.get::<FifoCachedState>().pending();
 
@@ -457,8 +452,12 @@ impl CompositorHandler for State {
 }
 
 impl State {
-    fn schedule_commit_timing(&self, surface: &WlSurface, deadline: Timestamp) {
-        const SAFE_MARGE: Duration = Duration::from_millis(1);
+    fn schedule_commit_timing(
+        &self,
+        surface: &WlSurface,
+        deadline: Timestamp,
+        barrier: Option<Barrier>,
+    ) {
         let next_deadline = Time::elapsed(&self.common.clock.now(), deadline.into());
 
         let target_deadline = if let Some(output) =
@@ -466,10 +465,19 @@ impl State {
             && let Some(avg_frametime) = output.get_avg_frametime()
         {
             // content update should be presented as closely as possible to, but not before, a specified time
-            next_deadline.saturating_sub(avg_frametime.saturating_sub(SAFE_MARGE))
+            next_deadline.saturating_sub(avg_frametime)
         } else {
             next_deadline
         };
+
+        if !target_deadline.is_zero()
+            && let Some(barrier) = barrier
+        {
+            add_blocker(surface, barrier);
+        } else if target_deadline.is_zero() && barrier.is_some() {
+            // let it go
+            return;
+        }
 
         let timer: Timer = Timer::from_duration(target_deadline);
         let weak_surface = surface.downgrade();
@@ -509,7 +517,7 @@ impl State {
                 }
 
                 if let Some(deadline) = next_deadline {
-                    state.schedule_commit_timing(&surface, deadline);
+                    state.schedule_commit_timing(&surface, deadline, None);
                 }
 
                 TimeoutAction::Drop
