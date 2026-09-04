@@ -1151,6 +1151,7 @@ impl KmsGuard<'_> {
                         }
 
                         let vrr = output_config.0.vrr;
+                        let vrr_target_rate = output_config.0.vrr_target_rate;
                         std::mem::drop(output_config);
 
                         let compositor_ref = drm.compositors().get(crtc).unwrap().lock().unwrap();
@@ -1206,8 +1207,21 @@ impl KmsGuard<'_> {
                             surface.output.config_mut().vrr = AdaptiveSync::Disabled;
                             surface.output.set_adaptive_sync(AdaptiveSync::Disabled);
                         }
+
+                        if let Some(rate) = vrr_target_rate {
+                            surface.set_vrr_target_rate(rate);
+                        } else {
+                            surface.set_vrr_target_rate(
+                                surface
+                                    .output
+                                    .current_mode()
+                                    .map(|m| m.refresh as u32)
+                                    .unwrap_or(60000),
+                            );
+                        }
                     } else {
                         let vrr = output_config.0.vrr;
+                        let vrr_target_rate = output_config.0.vrr_target_rate;
                         std::mem::drop(output_config);
                         if vrr != surface.output.adaptive_sync() {
                             if match surface.output.adaptive_sync_support() {
@@ -1224,6 +1238,18 @@ impl KmsGuard<'_> {
 
                             surface.use_adaptive_sync(vrr);
                             surface.output.set_adaptive_sync(vrr);
+                        }
+
+                        if let Some(rate) = vrr_target_rate {
+                            surface.set_vrr_target_rate(rate);
+                        } else {
+                            surface.set_vrr_target_rate(
+                                surface
+                                    .output
+                                    .current_mode()
+                                    .map(|m| m.refresh as u32)
+                                    .unwrap_or(60000),
+                            );
                         }
 
                         let mut renderer = self

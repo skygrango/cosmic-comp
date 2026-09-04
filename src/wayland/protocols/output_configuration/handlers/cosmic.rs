@@ -309,6 +309,20 @@ where
                     };
                 }
             }
+            zcosmic_output_configuration_head_v1::Request::SetVrrTargetRate { vrr_target_rate } => {
+                if let Ok(obj) = obj.upgrade() {
+                    let data = obj.data::<PendingOutputConfiguration>().unwrap();
+                    let mut pending = data.lock().unwrap();
+                    if pending.vrr_target_rate.is_some() {
+                        obj.post_error(
+                            zwlr_output_configuration_head_v1::Error::AlreadySet,
+                            format!("{:?} already had a vrr_target_rate configured", obj),
+                        );
+                        return;
+                    }
+                    pending.vrr_target_rate = Some(vrr_target_rate);
+                }
+            }
             _ => {}
         }
     }

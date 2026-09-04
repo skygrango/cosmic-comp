@@ -149,6 +149,7 @@ pub struct SurfaceThreadState {
     target_node: DrmNode,
     active: Arc<AtomicBool>,
     vrr_mode: AdaptiveSync,
+    vrr_target_rate: u32,
     frame_flags: FrameFlags,
     compositor: Option<GbmDrmOutput>,
 
@@ -238,6 +239,7 @@ pub enum ThreadCommand {
     ScheduleRender(bool),
     AdaptiveSyncAvailable(SyncSender<Result<VrrSupport>>),
     UseAdaptiveSync(AdaptiveSync),
+    UpdateVrrTargetRate(u32),
     AllowFrameFlags(bool, FrameFlags),
     End,
     DpmsOff,
@@ -468,6 +470,12 @@ impl Surface {
             .send(ThreadCommand::UseAdaptiveSync(vrr));
     }
 
+    pub fn set_vrr_target_rate(&mut self, rate: u32) {
+        let _ = self
+            .thread_command
+            .send(ThreadCommand::UpdateVrrTargetRate(rate));
+    }
+
     pub fn allow_frame_flags(&mut self, flag: bool, flags: FrameFlags) {
         let _ = self
             .thread_command
@@ -588,6 +596,10 @@ fn surface_thread(
         compositor: None,
         frame_flags: FrameFlags::DEFAULT,
         vrr_mode: AdaptiveSync::Disabled,
+        vrr_target_rate: output
+            .current_mode()
+            .map(|m| m.refresh as u32)
+            .unwrap_or(60000),
 
         state: QueueState::Idle,
         timings: Timings::new(None, None, false, target_node),
@@ -671,6 +683,18 @@ fn surface_thread(
             }
             Event::Msg(ThreadCommand::UseAdaptiveSync(vrr)) => {
                 state.vrr_mode = vrr;
+            }
+            Event::Msg(ThreadCommand::UpdateVrrTargetRate(rate)) => {
+                state.vrr_target_rate = rate;
+                state
+                    .timings
+                    .set_vrr_target_rate_interval(Some(Duration::from_secs_f64(
+                        1000. / rate as f64,
+                    )));
+                if state.timings.vrr() {
+                    state.timings.refresh_interval_ns = state.timings.vrr_target_rate_internal_ns;
+                    state.timings.previous_frames.clear();
+                }
             }
             Event::Msg(ThreadCommand::DpmsOff) => {
                 if let Some(compositor) = state.compositor.as_mut() {
