@@ -280,6 +280,8 @@ impl Timings {
     }
 
     pub fn next_presentation_time(&self, clock: &Clock<Monotonic>) -> Duration {
+        let mut now = clock.now().into();
+
         let Some(refresh_interval_ns) = self.refresh_interval_ns else {
             return Duration::ZERO;
         };
@@ -292,21 +294,6 @@ impl Timings {
         };
         let refresh_interval_ns = refresh_interval_ns.get();
 
-        if self.vrr {
-            if let Some(last_presentation_time) = self
-                .previous_frames
-                .back()
-                .map(|frame| frame.presentation_presented)
-            {
-                let now = clock.now().into();
-                let earliest_presentation = last_presentation_time + self.refresh_interval();
-                return Time::elapsed(&now, earliest_presentation);
-            } else {
-                return self.refresh_interval();
-            }
-        }
-
-        let mut now = clock.now().into();
         if now <= last_presentation_time {
             // Got an early VBlank.
             let orig_now = now;
@@ -331,8 +318,11 @@ impl Timings {
 
         // If VRR is enabled and more than one frame passed since last presentation, assume that we
         // can present immediately.
-
-        last_presentation_time + Duration::from_nanos(to_next_ns) - now
+        if self.vrr && to_next_ns > refresh_interval_ns {
+            Duration::ZERO
+        } else {
+            last_presentation_time + Duration::from_nanos(to_next_ns) - now
+        }
     }
 
     pub fn past_min_render_time(&self, clock: &Clock<Monotonic>) -> bool {
@@ -391,18 +381,11 @@ impl Timings {
             return Duration::ZERO;
         }
 
-        let margin = if self.vrr {
-            let Some(avg_frametime) = self.avg_frametime(SAMPLE_TIME_WINDOW) else {
-                return estimated_presentation_time.saturating_sub(baseline + BASE_SAFETY_MARGIN);
-            };
-            avg_frametime
-        } else {
-            let Some(avg_submittime) = self.avg_submittime(SAMPLE_TIME_WINDOW) else {
-                return estimated_presentation_time.saturating_sub(baseline + BASE_SAFETY_MARGIN);
-            };
-            avg_submittime + BASE_SAFETY_MARGIN
+        let Some(avg_submittime) = self.avg_submittime(SAMPLE_TIME_WINDOW) else {
+            return estimated_presentation_time.saturating_sub(baseline + BASE_SAFETY_MARGIN);
         };
 
+        let margin = avg_submittime + BASE_SAFETY_MARGIN;
         estimated_presentation_time.saturating_sub(margin)
     }
 }
