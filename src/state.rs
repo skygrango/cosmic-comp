@@ -664,6 +664,15 @@ impl State {
         with_xwayland: bool,
         kiosk_command: Option<Command>,
     ) -> State {
+        unsafe {
+            let min_priority = libc::sched_get_priority_min(libc::SCHED_RR);
+            let sp = libc::sched_param {
+                sched_priority: min_priority,
+            };
+            if libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_RR, &sp) != 0 {
+                tracing::warn!("Failed to gain real time thread priority (Check CAP_SYS_NICE)");
+            }
+        }
         let requested_languages = DesktopLanguageRequester::requested_languages();
         i18n_embed::select(&*LANG_LOADER, &Localizations, &requested_languages)
             .with_context(|| "Failed to load languages")

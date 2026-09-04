@@ -271,6 +271,20 @@ impl Surface {
         shell: Arc<parking_lot::RwLock<Shell>>,
         startup_done: Arc<AtomicBool>,
     ) -> Result<Self> {
+        unsafe {
+            let min_priority = libc::sched_get_priority_max(libc::SCHED_RR);
+            let sp = libc::sched_param {
+                sched_priority: min_priority,
+            };
+            if libc::pthread_setschedparam(
+                libc::pthread_self(),
+                libc::SCHED_RR | libc::SCHED_RESET_ON_FORK,
+                &sp,
+            ) != 0
+            {
+                tracing::warn!("Failed to gain real time thread priority (Check CAP_SYS_NICE)");
+            }
+        }
         let (tx, rx) = channel::<ThreadCommand>();
         let (tx2, rx2) = channel::<SurfaceCommand>();
         let active = Arc::new(AtomicBool::new(false));
