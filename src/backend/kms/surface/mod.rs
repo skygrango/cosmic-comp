@@ -1368,12 +1368,12 @@ impl SurfaceThreadState {
                 warn!("Unable to set adaptive VRR state: {}", err);
             }
 
-            let presentation_mode = if self.output.is_foreground_fullscreen_occupied().is_some() {
-                additional_frame_flags |= FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY;
-                PresentationMode::Async
-            } else {
-                PresentationMode::VSync
-            };
+            // let presentation_mode = if self.output.is_foreground_fullscreen_occupied().is_some() {
+            //     additional_frame_flags |= FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY;
+            //     PresentationMode::Async
+            // } else {
+            //     PresentationMode::VSync
+            // };
 
             compositor.render_frame(
                 &mut renderer,
@@ -1382,19 +1382,19 @@ impl SurfaceThreadState {
                 self.frame_flags
                     .union(additional_frame_flags)
                     .difference(remove_frame_flags),
-                presentation_mode,
+                PresentationMode::VSync,
             )
         } else {
             if let Err(err) = compositor.with_compositor(|c| c.use_vrr(vrr)) {
                 warn!("Unable to set adaptive VRR state: {}", err);
             }
 
-            let presentation_mode = if self.output.is_foreground_fullscreen_occupied().is_some() {
-                additional_frame_flags |= FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY;
-                PresentationMode::Async
-            } else {
-                PresentationMode::VSync
-            };
+            // let presentation_mode = if self.output.is_foreground_fullscreen_occupied().is_some() {
+            //     additional_frame_flags |= FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY;
+            //     PresentationMode::Async
+            // } else {
+            //     PresentationMode::VSync
+            // };
 
             compositor.render_frame(
                 &mut renderer,
@@ -1403,7 +1403,7 @@ impl SurfaceThreadState {
                 self.frame_flags
                     .union(additional_frame_flags)
                     .difference(remove_frame_flags),
-                presentation_mode,
+                PresentationMode::VSync,
             )
         };
         self.timings.draw_done(&self.clock);
