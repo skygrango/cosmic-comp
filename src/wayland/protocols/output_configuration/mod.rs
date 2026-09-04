@@ -106,6 +106,7 @@ pub struct PendingOutputConfigurationInner {
     transform: Option<Transform>,
     scale: Option<f64>,
     adaptive_sync: Option<AdaptiveSync>,
+    vrr_target_rate: Option<u32>,
 }
 pub type PendingOutputConfiguration = Mutex<PendingOutputConfigurationInner>;
 
@@ -118,6 +119,7 @@ pub enum OutputConfiguration {
         transform: Option<Transform>,
         scale: Option<f64>,
         adaptive_sync: Option<AdaptiveSync>,
+        vrr_target_rate: Option<u32>,
     },
     Disabled,
 }
@@ -146,6 +148,7 @@ impl<'a> TryFrom<&'a mut PendingOutputConfigurationInner> for OutputConfiguratio
             transform: pending.transform,
             scale: pending.scale,
             adaptive_sync: pending.adaptive_sync,
+            vrr_target_rate: pending.vrr_target_rate,
         })
     }
 }
@@ -189,7 +192,7 @@ where
         );
 
         let extension_global = dh.create_global::<D, ZcosmicOutputManagerV1, _>(
-            3,
+            4,
             OutputMngrGlobalData {
                 filter: Box::new(client_filter),
             },
@@ -492,6 +495,15 @@ where
                         }
                     },
                 );
+
+                if extension_obj.version() >= zcosmic_output_head_v1::EVT_VRR_TARGET_RATE_SINCE {
+                    extension_obj.vrr_target_rate(output.vrr_target_rate().unwrap_or_else(|| {
+                        output
+                            .current_mode()
+                            .map(|m| (m.refresh / 1000) as u32)
+                            .unwrap_or(60)
+                    }));
+                }
             }
         }
     }

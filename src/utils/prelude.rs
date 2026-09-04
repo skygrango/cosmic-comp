@@ -35,6 +35,8 @@ pub trait OutputExt {
     fn set_adaptive_sync(&self, vrr: AdaptiveSync);
     fn adaptive_sync_support(&self) -> Option<Support>;
     fn set_adaptive_sync_support(&self, vrr: Option<Support>);
+    fn vrr_target_rate(&self) -> Option<u32>;
+    fn set_vrr_target_rate(&self, rate: Option<u32>);
     fn mirroring(&self) -> Option<Output>;
     fn set_mirroring(&self, output: Option<Output>);
 
@@ -152,6 +154,14 @@ impl OutputExt for Output {
             },
             Ordering::SeqCst,
         );
+    }
+
+    fn vrr_target_rate(&self) -> Option<u32> {
+        self.config().vrr_target_rate
+    }
+
+    fn set_vrr_target_rate(&self, rate: Option<u32>) {
+        self.config_mut().vrr_target_rate = rate;
     }
 
     fn mirroring(&self) -> Option<Output> {

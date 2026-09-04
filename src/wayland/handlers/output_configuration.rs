@@ -107,6 +107,7 @@ impl State {
                     transform,
                     position,
                     adaptive_sync,
+                    vrr_target_rate,
                 } = conf
                 {
                     match mode {
@@ -139,6 +140,9 @@ impl State {
                     }
                     if let Some(vrr) = adaptive_sync {
                         current_config.vrr = *vrr;
+                    }
+                    if let Some(vrr_target_rate) = vrr_target_rate {
+                        current_config.vrr_target_rate = Some(*vrr_target_rate);
                     }
                     if let Some(mirror) = mirroring {
                         current_config.enabled = OutputState::Mirroring(mirror.name());
