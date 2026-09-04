@@ -184,61 +184,6 @@ impl CompositorHandler for State {
 
     fn new_surface(&mut self, surface: &WlSurface) {
         add_pre_commit_hook::<Self, _>(surface, move |state, _dh, surface| {
-            let mut acquire_point = None;
-            let maybe_dmabuf = with_states(surface, |surface_data| {
-                acquire_point = surface_data
-                    .cached_state
-                    .get::<DrmSyncobjCachedState>()
-                    .pending()
-                    .acquire_point
-                    .clone();
-                surface_data
-                    .cached_state
-                    .get::<SurfaceAttributes>()
-                    .pending()
-                    .buffer
-                    .as_ref()
-                    .and_then(|assignment| match assignment {
-                        BufferAssignment::NewBuffer(buffer) => get_dmabuf(buffer).ok().cloned(),
-                        _ => None,
-                    })
-            });
-            if let Some(dmabuf) = maybe_dmabuf {
-                if let Some(acquire_point) = acquire_point
-                    && let Ok((blocker, source)) = acquire_point.generate_blocker()
-                {
-                    let client = surface.client().unwrap();
-                    let res =
-                        state
-                            .common
-                            .event_loop_handle
-                            .insert_source(source, move |_, _, state| {
-                                let dh = state.common.display_handle.clone();
-                                state.client_compositor_state(&client).blocker_cleared(&dh);
-                                Ok(())
-                            });
-                    if res.is_ok() {
-                        add_blocker(surface, blocker);
-                        return;
-                    }
-                }
-                if let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ) {
-                    let client = surface.client().unwrap();
-                    let res =
-                        state
-                            .common
-                            .event_loop_handle
-                            .insert_source(source, move |_, _, state| {
-                                let dh = state.common.display_handle.clone();
-                                state.client_compositor_state(&client).blocker_cleared(&dh);
-                                Ok(())
-                            });
-                    if res.is_ok() {
-                        add_blocker(surface, blocker);
-                    }
-                }
-            }
-
             let timestamp = with_states(surface, |states| {
                 states
                     .data_map
@@ -305,6 +250,61 @@ impl CompositorHandler for State {
                 {
                     add_blocker(surface, barrier.clone());
                     output.fifo_barrier(barrier, client);
+                }
+            }
+            
+            let mut acquire_point = None;
+            let maybe_dmabuf = with_states(surface, |surface_data| {
+                acquire_point = surface_data
+                    .cached_state
+                    .get::<DrmSyncobjCachedState>()
+                    .pending()
+                    .acquire_point
+                    .clone();
+                surface_data
+                    .cached_state
+                    .get::<SurfaceAttributes>()
+                    .pending()
+                    .buffer
+                    .as_ref()
+                    .and_then(|assignment| match assignment {
+                        BufferAssignment::NewBuffer(buffer) => get_dmabuf(buffer).ok().cloned(),
+                        _ => None,
+                    })
+            });
+            if let Some(dmabuf) = maybe_dmabuf {
+                if let Some(acquire_point) = acquire_point
+                    && let Ok((blocker, source)) = acquire_point.generate_blocker()
+                {
+                    let client = surface.client().unwrap();
+                    let res =
+                        state
+                            .common
+                            .event_loop_handle
+                            .insert_source(source, move |_, _, state| {
+                                let dh = state.common.display_handle.clone();
+                                state.client_compositor_state(&client).blocker_cleared(&dh);
+                                Ok(())
+                            });
+                    if res.is_ok() {
+                        add_blocker(surface, blocker);
+                        return;
+                    }
+                }
+                if let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ) {
+                    let client = surface.client().unwrap();
+                    let res =
+                        state
+                            .common
+                            .event_loop_handle
+                            .insert_source(source, move |_, _, state| {
+                                let dh = state.common.display_handle.clone();
+                                state.client_compositor_state(&client).blocker_cleared(&dh);
+                                Ok(())
+                            });
+                    if res.is_ok() {
+                        add_blocker(surface, blocker);
+                    }
                 }
             }
         });
