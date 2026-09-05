@@ -3,7 +3,7 @@ use parking_lot::RwLock;
 use smithay::{
     backend::drm::VrrSupport as Support,
     output::{Output, WeakOutput},
-    reexports::wayland_server::Client,
+    reexports::wayland_server::{Client, protocol::wl_surface::WlSurface},
     utils::Rectangle,
     wayland::compositor::{Barrier, CompositorHandler},
 };
@@ -19,7 +19,6 @@ use crate::{
 
 use std::{
     cell::{Ref, RefCell, RefMut},
-    collections::HashMap,
     sync::{
         Mutex,
         atomic::{AtomicU8, Ordering},
@@ -47,7 +46,7 @@ pub trait OutputExt {
 
     fn edid(&self) -> Option<&EdidProduct>;
 
-    fn fifo_barrier(&self, barrier: Barrier, client: Client);
+    fn fifo_barrier(&self, barrier: Barrier, surface: WlSurface, client: Client);
     fn signal_fifo(&self, state: &mut State);
 
     fn set_avg_frametime(&self, duration: Option<Duration>);
@@ -65,6 +64,7 @@ struct FullscreenOccupied(RwLock<Option<WeakCosmicSurface>>);
 #[derive(Debug, Clone)]
 pub struct FifoBarrierItem {
     pub barrier: Barrier,
+    pub surface: WlSurface,
     pub client: Client,
 }
 
@@ -207,13 +207,17 @@ impl OutputExt for Output {
         self.user_data().get()
     }
 
-    fn fifo_barrier(&self, barrier: Barrier, client: Client) {
+    fn fifo_barrier(&self, barrier: Barrier, surface: WlSurface, client: Client) {
         self.user_data()
             .get_or_insert_threadsafe(|| FifoBarriers(Mutex::new(Vec::new())))
             .0
             .lock()
             .unwrap()
-            .push(FifoBarrierItem { barrier, client });
+            .push(FifoBarrierItem {
+                barrier,
+                surface,
+                client,
+            });
     }
 
     fn signal_fifo(&self, state: &mut State) {
@@ -221,17 +225,19 @@ impl OutputExt for Output {
             return;
         };
 
-        let mut clients = HashMap::new();
+        let mut items = Vec::new();
         fifo_barriers.0.lock().unwrap().drain(..).for_each(|item| {
             item.barrier.signal();
-            clients.insert(item.client.id(), item.client);
+            if !items.iter().any(|(s, _)| s == &item.surface) {
+                items.push((item.surface, item.client));
+            }
         });
 
-        let dh = &state.common.display_handle.clone();
-        for (_id, client) in clients {
+        let dh = state.common.display_handle.clone();
+        for (surface, client) in items {
             state
                 .client_compositor_state(&client)
-                .blocker_cleared(state, dh);
+                .surface_blocker_cleared(&surface, state, &dh);
         }
     }
 

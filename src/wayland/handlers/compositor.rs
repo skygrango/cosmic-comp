@@ -2,7 +2,7 @@
 
 use crate::{
     shell::grabs::SeatMoveGrabState,
-    state::{self, ClientState},
+    state::ClientState,
     utils::prelude::*,
 };
 use calloop::{
@@ -25,11 +25,11 @@ use smithay::{
         compositor::{
             Barrier, BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
             SurfaceAttributes, SurfaceData, TraversalAction, add_blocker, add_post_commit_hook,
-            add_pre_commit_hook, is_sync_subsurface, with_states, with_surface_tree_downward,
+            add_pre_commit_hook, with_states, with_surface_tree_downward,
         },
         dmabuf::get_dmabuf,
         drm_syncobj::DrmSyncobjCachedState,
-        fifo::{FifoBarrierCachedState, FifoCachedState},
+        fifo::FifoBarrierCachedState,
         seat::WaylandFocus,
         shell::{
             wlr_layer::LayerSurfaceAttributes,
@@ -230,6 +230,7 @@ impl CompositorHandler for State {
                     && let Ok((blocker, source)) = acquire_point.generate_blocker()
                 {
                     let client = surface.client().unwrap();
+                    let surface_clone = surface.clone();
                     let res =
                         state
                             .common
@@ -238,7 +239,7 @@ impl CompositorHandler for State {
                                 let dh = state.common.display_handle.clone();
                                 state
                                     .client_compositor_state(&client)
-                                    .blocker_cleared(state, &dh);
+                                    .surface_blocker_cleared(&surface_clone, state, &dh);
                                 Ok(())
                             });
                     if res.is_ok() {
@@ -248,6 +249,7 @@ impl CompositorHandler for State {
                 }
                 if let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ) {
                     let client = surface.client().unwrap();
+                    let surface_clone = surface.clone();
                     let res =
                         state
                             .common
@@ -256,7 +258,7 @@ impl CompositorHandler for State {
                                 let dh = state.common.display_handle.clone();
                                 state
                                     .client_compositor_state(&client)
-                                    .blocker_cleared(state, &dh);
+                                    .surface_blocker_cleared(&surface_clone, state, &dh);
                                 Ok(())
                             });
                     if res.is_ok() {
@@ -308,8 +310,9 @@ impl CompositorHandler for State {
                     .visible_output_for_surface(surface)
                     && !barrier.is_signaled()
                 {
-                    output.fifo_barrier(barrier, client);
+                    output.fifo_barrier(barrier, surface.clone(), client);
                 } else {
+                    let surface_clone = surface.clone();
                     let _ = state.common.event_loop_handle.insert_source(
                         Timer::immediate(),
                         move |_, _, state| {
@@ -317,7 +320,7 @@ impl CompositorHandler for State {
                             let dh = state.common.display_handle.clone();
                             state
                                 .client_compositor_state(&client)
-                                .blocker_cleared(state, &dh);
+                                .surface_blocker_cleared(&surface_clone, state, &dh);
                             TimeoutAction::Drop
                         },
                     );
@@ -515,7 +518,7 @@ impl State {
                     let dh = &state.common.display_handle.clone();
                     state
                         .client_compositor_state(&client)
-                        .blocker_cleared(state, dh);
+                        .surface_blocker_cleared(&surface, state, dh);
                 }
 
                 if let Some(deadline) = next_deadline {
