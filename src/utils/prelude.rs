@@ -341,12 +341,15 @@ impl OutputExt for Output {
         let Some(state) = self.user_data().get::<OutputFullscreenOccupied>() else {
             return;
         };
-        let mut guard = state.0.write();
-        let Some(weak_occ) = guard.as_mut() else {
-            return;
-        };
-        let Some(surface) = weak_occ.surface.upgrade() else {
-            return;
+        let (surface, current_hdr, current_async) = {
+            let guard = state.0.read();
+            let Some(weak_occ) = guard.as_ref() else {
+                return;
+            };
+            let Some(surface) = weak_occ.surface.upgrade() else {
+                return;
+            };
+            (surface, weak_occ.has_hdr, weak_occ.prefers_async)
         };
         let has_hdr = surface
             .wl_surface()
@@ -356,8 +359,17 @@ impl OutputExt for Output {
             .wl_surface()
             .as_deref()
             .is_some_and(surface_tree_prefers_async);
-        weak_occ.has_hdr = has_hdr;
-        weak_occ.prefers_async = prefers_async;
+        if current_hdr == has_hdr && current_async == prefers_async {
+            return;
+        }
+        let mut guard = state.0.write();
+        let Some(weak_occ) = guard.as_mut() else {
+            return;
+        };
+        if weak_occ.surface.upgrade().as_ref() == Some(&surface) {
+            weak_occ.has_hdr = has_hdr;
+            weak_occ.prefers_async = prefers_async;
+        }
     }
 }
 
