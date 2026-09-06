@@ -149,4 +149,4 @@ cosmic-protocols = { git = "https://github.com/skygrango/cosmic-protocols", bran
 
 [patch.crates-io]
 smithay-egui = { git = "https://github.com/Smithay/smithay-egui.git", rev = "6511552" }
-smithay = { git = "https://github.com/skygrango/smithay.git", rev = "7f8a08f" }
+smithay = { git = "https://github.com/skygrango/smithay.git", rev = "2491cba" }
