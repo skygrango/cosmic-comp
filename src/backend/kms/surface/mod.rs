@@ -141,34 +141,6 @@ fn describe_hdr_surface_tree(surface: &WlSurface) -> String {
     parts.join(" ")
 }
 
-/// Whether any surface in the tree asked for tearing presentation via
-/// `wp_tearing_control_v1`. Same locking rule as the description gates: read
-/// from `states` inside the traversal, never re-lock the surface.
-fn surface_tree_prefers_async(surface: &WlSurface) -> bool {
-    let mut found = false;
-    with_surfaces_surface_tree(surface, |_, states| {
-        if smithay::wayland::tearing_control::prefer_async_from_states(states) {
-            found = true;
-        }
-    });
-    found
-}
-
-fn surface_tree_has_hdr_client_description(surface: &WlSurface) -> bool {
-    let mut found = false;
-    // The traversal callback runs with each surface's state lock held, so the
-    // description must be read from `states`, never via `get_surface_description`.
-    with_surfaces_surface_tree(surface, |_, states| {
-        if smithay::wayland::color::management::surface_description_from_states(states)
-            .0
-            .is_some_and(|description| description.is_pq_bt2020() || description.windows_scrgb)
-        {
-            found = true;
-        }
-    });
-    found
-}
-
 use super::{drm_helpers, render::gles::GbmGlowBackend};
 
 static FULLSCREEN_SKIP_OTHER_SURFACE: LazyLock<bool> = LazyLock::new(|| {
@@ -1417,6 +1389,7 @@ impl SurfaceThreadState {
             fullscreen_drives_refresh_rate,
             animations_going,
             has_hdr_fullscreen,
+            prefers_async,
             hdr_candidate,
         ) = {
             let shell = self.shell.read();
@@ -1432,16 +1405,15 @@ impl SurfaceThreadState {
                     recursive_frame_time_estimation(&self.clock, &surface)
                         .is_some_and(|dur| dur <= min_vrr_frame_time)
                 });
-                let has_hdr = fullscreen_surface
-                    .wl_surface()
-                    .as_deref()
-                    .is_some_and(surface_tree_has_hdr_client_description);
+                let has_hdr = fullscreen_surface.has_hdr;
+                let prefers_async = fullscreen_surface.prefers_async;
                 let candidate = fullscreen_surface.wl_surface().as_deref().cloned();
                 (
                     true,
                     drives_refresh_rate,
                     animations_going,
                     has_hdr,
+                    prefers_async,
                     candidate,
                 )
             } else if self.hdr_enabled {
@@ -1480,15 +1452,19 @@ impl SurfaceThreadState {
                 let covering_hdr = covering_candidate
                     .as_ref()
                     .is_some_and(|surface| surface_tree_has_hdr_client_description(surface));
+                let covering_async = covering_candidate
+                    .as_ref()
+                    .is_some_and(|surface| surface_tree_prefers_async(surface));
                 (
                     covering_hdr,
                     false,
                     animations_going,
                     covering_hdr,
+                    covering_async,
                     covering_candidate,
                 )
             } else {
-                (false, false, animations_going, false, None)
+                (false, false, animations_going, false, false, None)
             }
         };
 
@@ -1529,9 +1505,7 @@ impl SurfaceThreadState {
         // to synchronized flips whenever the kernel refuses to tear.
         let tearing = crate::utils::env::tearing_allowed_for(&self.output.name())
             && has_active_fullscreen
-            && hdr_candidate
-                .as_ref()
-                .is_some_and(|surface| surface_tree_prefers_async(surface));
+            && prefers_async;
         if tearing != self.tearing_reported {
             self.tearing_reported = tearing;
             warn!(

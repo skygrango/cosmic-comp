@@ -346,6 +346,7 @@ impl CompositorHandler for State {
                         cosmic_surface.has_surface(surface, WindowSurfaceType::ALL)
                     });
             if is_fullscreen {
+                output.refresh_fullscreen_occupied_flags();
                 self.backend.schedule_render_fullscreen(output);
             } else {
                 self.backend.schedule_render(output);

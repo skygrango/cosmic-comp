@@ -364,7 +364,22 @@ impl Shell {
                             && (current_geo.size.h - output_geo.size.h).abs() <= 1;
 
                         if is_foreground && is_really_fullscreen {
-                            output.set_fullscreen_occupied(Some(fs.surface.clone()));
+                            let has_hdr = fs
+                                .surface
+                                .wl_surface()
+                                .as_deref()
+                                .is_some_and(surface_tree_has_hdr_client_description);
+                            let prefers_async = fs
+                                .surface
+                                .wl_surface()
+                                .as_deref()
+                                .is_some_and(surface_tree_prefers_async);
+
+                            output.set_fullscreen_occupied(Some(FullscreenOccupied {
+                                surface: fs.surface.clone(),
+                                has_hdr,
+                                prefers_async,
+                            }));
                             true
                         } else {
                             false
