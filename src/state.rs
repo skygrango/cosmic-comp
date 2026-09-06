@@ -11,9 +11,12 @@ use crate::{
     dbus::DBusState,
     input::{PointerFocusState, gestures::GestureState},
     shell::{CosmicSurface, SeatExt, Shell, grabs::SeatMoveGrabState},
-    utils::prelude::OutputExt,
+    utils::{env::hdr_policy, prelude::OutputExt},
     wayland::{
-        handlers::{data_device::get_dnd_icon, image_copy_capture::SessionHolder},
+        handlers::{
+            color_management::description_for_output, data_device::get_dnd_icon,
+            image_copy_capture::SessionHolder,
+        },
         protocols::{
             a11y::A11yState,
             corner_radius::CornerRadiusState,
@@ -74,6 +77,11 @@ use smithay::{
     wayland::{
         alpha_modifier::AlphaModifierState,
         background_effect::BackgroundEffectState,
+        color::management::{
+            ColorManagementState, Feature as ColorFeature, ImageDescription,
+            Primaries as ColorPrimaries, RenderIntent as ColorRenderIntent,
+            TransferFunction as ColorTransferFunction,
+        },
         commit_timing::CommitTimingManagerState,
         compositor::{CompositorClientState, CompositorState, SurfaceData},
         cursor_shape::CursorShapeManagerState,
@@ -109,6 +117,7 @@ use smithay::{
         shm::ShmState,
         single_pixel_buffer::SinglePixelBufferState,
         tablet_manager::TabletManagerState,
+        tearing_control::TearingControlState,
         text_input::TextInputManagerState,
         viewporter::ViewporterState,
         virtual_keyboard::VirtualKeyboardManagerState,
@@ -277,6 +286,7 @@ pub struct Common {
 
     // wayland state
     pub compositor_state: CompositorState,
+    pub color_management_state: ColorManagementState,
     pub corner_radius_state: CornerRadiusState,
     pub data_device_state: DataDeviceState,
     pub dmabuf_state: DmabufState,
@@ -689,6 +699,34 @@ impl State {
         let clock = Clock::new();
         let config = Config::load(&handle);
         let compositor_state = CompositorState::new::<Self>(dh);
+        let advertise_hdr = hdr_policy().experiment_enabled;
+        let color_management_state = ColorManagementState::new::<Self, _>(
+            dh,
+            [
+                ColorTransferFunction::St2084Pq,
+                ColorTransferFunction::Hlg,
+                ColorTransferFunction::ExtLinear,
+                ColorTransferFunction::CompoundPower24,
+                ColorTransferFunction::Srgb,
+                ColorTransferFunction::Bt1886,
+                ColorTransferFunction::Gamma22,
+            ],
+            [
+                ColorPrimaries::Bt2020,
+                ColorPrimaries::Srgb,
+                ColorPrimaries::DisplayP3,
+            ],
+            [
+                ColorFeature::WindowsScrgb,
+                ColorFeature::WindowsBt2100,
+                ColorFeature::SetLuminances,
+                ColorFeature::SetMasteringDisplayPrimaries,
+                ColorFeature::ExtendedTargetVolume,
+                ColorFeature::SetPrimaries,
+            ],
+            [ColorRenderIntent::Perceptual],
+            move |_| advertise_hdr,
+        );
         let corner_radius_state = CornerRadiusState::new::<Self>(dh);
         let data_device_state = DataDeviceState::new::<Self>(dh);
         let dmabuf_state = DmabufState::new();
@@ -731,6 +769,7 @@ impl State {
         TextInputManagerState::new::<Self>(dh);
         VirtualKeyboardManagerState::new::<State, _>(dh, client_not_sandboxed);
         AlphaModifierState::new::<Self>(dh);
+        //TearingControlState::new::<Self>(dh);
         SinglePixelBufferState::new::<Self>(dh);
         FixesState::new::<Self>(dh);
         let keyboard_layout_state = KeyboardLayoutState::new::<State, _>(dh, client_not_sandboxed);
@@ -813,6 +852,7 @@ impl State {
                 theme: cosmic::theme::system_preference(),
 
                 compositor_state,
+                color_management_state,
                 corner_radius_state,
                 data_device_state,
                 dmabuf_state,
@@ -989,6 +1029,9 @@ fn primary_scanout_output_compare<'a>(
     default_primary_scanout_output_compare(current_output, current_state, next_output, next_state)
 }
 
+#[derive(Debug, Default)]
+struct OutputColorDescriptionState(parking_lot::Mutex<Option<ImageDescription>>);
+
 impl Common {
     #[profiling::function]
     pub fn update_primary_output(
@@ -997,6 +1040,20 @@ impl Common {
         render_element_states: &RenderElementStates,
     ) {
         let shell = self.shell.read();
+        let color_management = &self.color_management_state;
+
+        let current_output_desc = description_for_output(output);
+        output
+            .user_data()
+            .insert_if_missing_threadsafe(OutputColorDescriptionState::default);
+        if let Some(desc_state) = output.user_data().get::<OutputColorDescriptionState>() {
+            let mut last_desc = desc_state.0.lock();
+            if *last_desc != Some(current_output_desc) {
+                *last_desc = Some(current_output_desc);
+                color_management.output_description_changed(output);
+            }
+        }
+
         let processor = |namespace: Option<usize>| {
             move |surface: &WlSurface, states: &SurfaceData| {
                 let primary_scanout_output = update_surface_primary_scanout_output(
@@ -1015,6 +1072,8 @@ impl Common {
                             output.current_scale().fractional_scale().max(1.0),
                         );
                     });
+                    color_management
+                        .preferred_changed_from_states(states, description_for_output(&output));
                 }
             }
         };

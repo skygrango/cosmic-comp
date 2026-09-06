@@ -7,13 +7,16 @@ use crate::{
             CLEAR_COLOR, CursorMode, GlMultiError, GlMultiRenderer, PostprocessOutputConfig,
             PostprocessShader, PostprocessState,
             element::{CosmicElement, DamageElement},
-            init_shaders, output_elements,
+            init_shaders, output_elements, postprocess_intermediate_format, set_hdr_client_blend,
         },
     },
     config::ScreenFilter,
     shell::Shell,
     state::SurfaceDmabufFeedback,
-    utils::prelude::*,
+    utils::{
+        env::{bool_var, hdr_policy, tearing_allowed_for},
+        prelude::*,
+    },
     wayland::handlers::{
         compositor::{FULLSCREEN_IMMEDIATE_RENDER, recursive_frame_time_estimation},
         image_copy_capture::{FrameHolder, PendingImageCopyData, SessionData, submit_buffer},
@@ -54,7 +57,8 @@ use smithay::{
                 },
             },
             gles::{
-                GlesRenderbuffer, GlesRenderer, GlesTexture, Uniform, element::TextureShaderElement,
+                GlesRenderbuffer, GlesRenderer, GlesTexture, HdrOutputConfig, Uniform,
+                element::TextureShaderElement,
             },
             glow::GlowRenderer,
             multigpu::{ApiDevice, Error as MultiError, GpuManager},
@@ -79,6 +83,7 @@ use smithay::{
     },
     utils::{Clock, IsAlive, Monotonic, Physical, Point, Rectangle, Transform},
     wayland::{
+        color::management::{Chromaticities, ImageDescription, get_surface_description},
         dmabuf::{DmabufFeedbackBuilder, get_dmabuf},
         image_copy_capture::{
             CaptureFailureReason, Frame as ScreencopyFrame, SessionRef as ScreencopySessionRef,
@@ -95,8 +100,8 @@ use std::{
     collections::{HashMap, HashSet, hash_map},
     mem,
     sync::{
-        Arc, LazyLock, RwLock,
-        atomic::{AtomicBool, Ordering},
+        Arc, LazyLock, Mutex, OnceLock, RwLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{Receiver, SyncSender},
     },
     thread::JoinHandle,
@@ -108,13 +113,11 @@ pub use self::timings::Timings;
 
 use super::{drm_helpers, render::gles::GbmGlowBackend};
 
-static FULLSCREEN_SKIP_OTHER_SURFACE: LazyLock<bool> = LazyLock::new(|| {
-    crate::utils::env::bool_var("COSMIC_FULLSCREEN_SKIP_OTHER_SURFACE").unwrap_or(true)
-});
+static FULLSCREEN_SKIP_OTHER_SURFACE: LazyLock<bool> =
+    LazyLock::new(|| bool_var("COSMIC_FULLSCREEN_SKIP_OTHER_SURFACE").unwrap_or(true));
 
-static FULLSCREEN_SKIP_OTHER_SURFACE_ALWAYS: LazyLock<bool> = LazyLock::new(|| {
-    crate::utils::env::bool_var("COSMIC_FULLSCREEN_SKIP_OTHER_SURFACE_ALWAYS").unwrap_or(false)
-});
+static FULLSCREEN_SKIP_OTHER_SURFACE_ALWAYS: LazyLock<bool> =
+    LazyLock::new(|| bool_var("COSMIC_FULLSCREEN_SKIP_OTHER_SURFACE_ALWAYS").unwrap_or(false));
 
 const _30_HZ: Duration = Duration::from_nanos(1_000_000_000 / 30);
 
@@ -138,8 +141,15 @@ pub struct Surface {
     thread_command: Sender<ThreadCommand>,
     thread_token: RegistrationToken,
     thread: Option<JoinHandle<()>>,
+    emergency_shutdown_id: Option<u64>,
 
     dpms: bool,
+    adaptive_sync_mode: AdaptiveSync,
+    hdr_enabled: bool,
+    pub(super) hdr_sink_capabilities: Option<drm_helpers::HdrSinkCapabilities>,
+    pub(super) native_primaries: Option<Chromaticities>,
+    hdr_reference_white: f32,
+    pub(crate) hdr_hardware_offload: bool,
 }
 
 pub struct SurfaceThreadState {
@@ -161,6 +171,11 @@ pub struct SurfaceThreadState {
     output: Output,
     mirroring: Option<Output>,
     screen_filter: ScreenFilter,
+    hdr_enabled: bool,
+    hdr_reference_white: f32,
+    hdr_max_luminance: f32,
+    hdr_hardware_offload: bool,
+    hdr_config: Option<HdrOutputConfig>,
     postprocess_textures: HashMap<DrmNode, PostprocessState>,
 
     shell: Arc<parking_lot::RwLock<Shell>>,
@@ -184,6 +199,59 @@ pub struct SurfaceThreadState {
     /// Plot name for the presentation misprediction plot.
     presentation_misprediction_plot_name: tracy_client::PlotName,
     sequence_delta_plot_name: tracy_client::PlotName,
+}
+
+static HDR_SURFACE_SENDERS: OnceLock<Mutex<HashMap<u64, Sender<ThreadCommand>>>> = OnceLock::new();
+static NEXT_HDR_SURFACE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn register_hdr_surface(sender: Sender<ThreadCommand>) -> u64 {
+    let id = NEXT_HDR_SURFACE_ID.fetch_add(1, Ordering::Relaxed);
+    HDR_SURFACE_SENDERS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(id, sender);
+    id
+}
+
+/// Stop strict-HDR surface threads without relying on the compositor's main
+/// event loop. A blocked Wayland/config callback must not prevent connector
+/// color state from being cleared before an external watchdog ends the process.
+pub fn emergency_shutdown_hdr_surfaces() {
+    let senders = HDR_SURFACE_SENDERS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    for sender in senders {
+        let _ = sender.send(ThreadCommand::End);
+    }
+}
+
+/// Receives from a surface-thread channel, bounded by the teardown timeout in
+/// strict HDR mode so a wedged thread cannot hang the compositor forever.
+fn recv_bounded<T>(rx: Receiver<T>) -> Result<T, String> {
+    rx.recv_timeout(hdr_policy().teardown_timeout)
+        .map_err(|err| err.to_string())
+}
+
+/// Determines whether a surface's color description matches the output's color state
+/// for direct primary plane scanout without shader composition, following KWin conventions.
+pub fn is_surface_scanout_compatible(
+    output_hdr_enabled: bool,
+    surface_desc: Option<&ImageDescription>,
+) -> bool {
+    if output_hdr_enabled {
+        // On an HDR output (configured for BT.2100 PQ in KMS), only content encoded
+        // in BT.2100 PQ matches the display hardware pipeline directly without
+        // requiring GPU shader tone-mapping or color space expansion.
+        surface_desc.is_some_and(|desc| desc.is_pq_bt2020())
+    } else {
+        // On an SDR output, standard SDR content (non-HDR) matches the display pipeline.
+        !surface_desc.is_some_and(|desc| desc.is_hdr())
+    }
 }
 
 pub type GbmDrmOutput = DrmOutput<
@@ -235,6 +303,12 @@ pub enum ThreadCommand {
     },
     UpdateMirroring(Option<Output>),
     UpdateScreenFilter(ScreenFilter),
+    UpdateHdr {
+        enabled: bool,
+        reference_white: f32,
+        max_luminance: f32,
+        hardware_offload: bool,
+    },
     VBlank(Option<DrmEventMetadata>),
     ScheduleRender(bool),
     AdaptiveSyncAvailable(SyncSender<Result<VrrSupport>>),
@@ -243,6 +317,7 @@ pub enum ThreadCommand {
     AllowFrameFlags(bool, FrameFlags),
     End,
     DpmsOff,
+    DpmsOn,
 }
 
 #[derive(Debug)]
@@ -250,6 +325,7 @@ pub enum SurfaceCommand {
     SignalFIFO,
     SendFrames(usize),
     RenderStates(RenderElementStates),
+    FatalRenderError(String),
 }
 
 #[derive(Debug, Default)]
@@ -370,9 +446,18 @@ impl Surface {
                             }
                         });
                 }
+
+                Event::Msg(SurfaceCommand::FatalRenderError(err)) => {
+                    error!(output = %output_clone.name(), %err, "strict HDR output failed after activation; ending session");
+                    state.common.should_stop = true;
+                    state.common.event_loop_signal.stop();
+                    state.common.event_loop_signal.wakeup();
+                }
                 Event::Closed => {}
             })
             .map_err(|_| anyhow::anyhow!("Failed to establish channel to surface thread"))?;
+
+        let emergency_shutdown_id = Some(register_hdr_surface(tx.clone()));
 
         Ok(Surface {
             connector,
@@ -388,7 +473,14 @@ impl Surface {
             thread_command: tx,
             thread_token,
             thread: Some(thread),
+            emergency_shutdown_id,
             dpms: true,
+            adaptive_sync_mode: AdaptiveSync::Disabled,
+            hdr_enabled: false,
+            hdr_sink_capabilities: None,
+            native_primaries: None,
+            hdr_reference_white: 203.0,
+            hdr_hardware_offload: false,
         })
     }
 
@@ -409,7 +501,7 @@ impl Surface {
             egl,
             sync: tx,
         });
-        let _ = rx.recv();
+        self.wait_for_surface_ack(rx, "adding renderer node");
     }
 
     pub fn remove_node(&mut self, node: DrmNode) {
@@ -421,7 +513,7 @@ impl Surface {
             .send(ThreadCommand::NodeRemoved { node, sync: tx });
         // Block so we can be sure the file descriptor is closed
         // (which is relevant for the udev device_removed callback).
-        let _ = rx.recv();
+        self.wait_for_surface_ack(rx, "removing renderer node");
     }
 
     pub fn on_vblank(&self, metadata: Option<DrmEventMetadata>) {
@@ -456,18 +548,55 @@ impl Surface {
             .send(ThreadCommand::UpdateScreenFilter(config));
     }
 
+    /// Queue HDR shader state before `resume`. FIFO command ordering ensures
+    /// that a newly resumed output cannot render before this state is applied.
+    pub fn prepare_hdr_rendering(
+        &mut self,
+        enabled: bool,
+        reference_white: f32,
+        hardware_offload: bool,
+    ) {
+        self.hdr_enabled = enabled;
+        self.hdr_reference_white = reference_white.clamp(80.0, 10_000.0);
+        self.hdr_hardware_offload = hardware_offload;
+        let max_luminance = self
+            .hdr_sink_capabilities
+            .map(|c| c.max_luminance as f32)
+            .unwrap_or(1000.0)
+            .max(self.hdr_reference_white);
+        let _ = self.thread_command.send(ThreadCommand::UpdateHdr {
+            enabled,
+            reference_white: self.hdr_reference_white,
+            max_luminance,
+            hardware_offload,
+        });
+    }
+
+    pub fn hdr_rendering(&self) -> (bool, f32) {
+        (self.hdr_enabled, self.hdr_reference_white)
+    }
+
     pub fn adaptive_sync_support(&self) -> Result<VrrSupport> {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let _ = self
             .thread_command
             .send(ThreadCommand::AdaptiveSyncAvailable(tx));
-        rx.recv().context("Surface thread died")?
+        recv_bounded(rx).map_err(|err| anyhow::anyhow!("surface thread VRR query failed: {err}"))?
     }
 
     pub fn use_adaptive_sync(&mut self, vrr: AdaptiveSync) {
-        let _ = self
+        if self
             .thread_command
-            .send(ThreadCommand::UseAdaptiveSync(vrr));
+            .send(ThreadCommand::UseAdaptiveSync(vrr))
+            .is_ok()
+        {
+            self.adaptive_sync_mode = vrr;
+        }
+    }
+
+    /// Whether the render thread still needs the requested adaptive-sync mode.
+    pub fn adaptive_sync_update_required(&self, requested: AdaptiveSync) -> bool {
+        adaptive_sync_update_required(requested, self.adaptive_sync_mode)
     }
 
     pub fn set_vrr_target_rate(&mut self, rate: u32) {
@@ -485,7 +614,7 @@ impl Surface {
     pub fn suspend(&mut self) {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let _ = self.thread_command.send(ThreadCommand::Suspend(tx));
-        let _ = rx.recv();
+        self.wait_for_surface_ack(rx, "suspending output");
     }
 
     pub fn resume(
@@ -515,7 +644,7 @@ impl Surface {
         if self.dpms != on {
             self.dpms = on;
             if on {
-                self.schedule_render();
+                let _ = self.thread_command.send(ThreadCommand::DpmsOn);
             } else {
                 let _ = self.thread_command.send(ThreadCommand::DpmsOff);
             }
@@ -527,14 +656,54 @@ impl Surface {
         std::mem::drop(self);
         if let Some(thread) = thread {
             let name = thread.thread().name().unwrap().to_string();
+            {
+                let deadline = std::time::Instant::now() + hdr_policy().teardown_timeout;
+                while !thread.is_finished() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                if !thread.is_finished() {
+                    warn!(
+                        output = %name,
+                        operation = "drop_and_join",
+                        "surface thread did not stop before the strict HDR deadline; detaching it"
+                    );
+                    return;
+                }
+            }
             let _ = thread.join();
             info!("Thread {} terminated.", name)
         }
+    }
+
+    fn wait_for_surface_ack(&self, rx: Receiver<()>, operation: &'static str) {
+        if let Err(err) = recv_bounded(rx) {
+            warn!(
+                output = %self.output.name(),
+                operation,
+                %err,
+                "surface-thread synchronization failed"
+            );
+        }
+    }
+
+    /// Ask the surface thread to stop and return its join handle without waiting.
+    ///
+    /// The compositor owned by that thread is dropped while the DRM device is still
+    /// active, allowing its atomic surface to clear persistent connector color state.
+    pub fn begin_shutdown(mut self) -> Option<JoinHandle<()>> {
+        let thread = self.thread.take();
+        std::mem::drop(self);
+        thread
     }
 }
 
 impl Drop for Surface {
     fn drop(&mut self) {
+        if let Some(id) = self.emergency_shutdown_id.take()
+            && let Some(senders) = HDR_SURFACE_SENDERS.get()
+        {
+            senders.lock().unwrap().remove(&id);
+        }
         let _ = self.thread_command.send(ThreadCommand::End);
         self.loop_handle.remove(self.thread_token);
         if let Some(thread) = self.thread.take() {
@@ -547,6 +716,13 @@ impl Drop for Surface {
             */
         }
     }
+}
+
+fn adaptive_sync_update_required(
+    requested: AdaptiveSync,
+    render_thread_mode: AdaptiveSync,
+) -> bool {
+    requested != render_thread_mode
 }
 
 fn surface_thread(
@@ -570,8 +746,7 @@ fn surface_thread(
 
     #[cfg(feature = "debug")]
     let egui = {
-        let state =
-            smithay_egui::EguiState::new(smithay::utils::Rectangle::from_size((400, 800).into()));
+        let state = smithay_egui::EguiState::new(Rectangle::from_size((400, 800).into()));
         let visuals = egui::style::Visuals {
             window_shadow: egui::Shadow::NONE,
             ..Default::default()
@@ -609,6 +784,11 @@ fn surface_thread(
         output,
         mirroring: None,
         screen_filter,
+        hdr_enabled: false,
+        hdr_reference_white: 203.0,
+        hdr_max_luminance: 1000.0,
+        hdr_hardware_offload: false,
+        hdr_config: None,
         postprocess_textures: HashMap::new(),
 
         shell,
@@ -628,6 +808,7 @@ fn surface_thread(
         presentation_misprediction_plot_name,
         sequence_delta_plot_name,
     };
+    state.update_hdr_config();
 
     let signal = event_loop.get_signal();
     event_loop
@@ -667,6 +848,38 @@ fn surface_thread(
             }
             Event::Msg(ThreadCommand::UpdateScreenFilter(filter_config)) => {
                 state.update_screen_filter(filter_config);
+            }
+            Event::Msg(ThreadCommand::UpdateHdr {
+                enabled,
+                reference_white,
+                max_luminance,
+                hardware_offload,
+            }) => {
+                state.hdr_enabled = enabled;
+                state.hdr_reference_white = reference_white.clamp(80.0, 10_000.0);
+                state.hdr_max_luminance = max_luminance.max(state.hdr_reference_white);
+                state.hdr_hardware_offload = hardware_offload;
+                state.update_hdr_config();
+                // Shader uniforms are not part of the texture's commit
+                // counter.  Recreate the post-process target so a live HDR
+                // policy change gets a fresh element identity and full redraw.
+                state.postprocess_textures.clear();
+                if let Some(compositor) = state.compositor.as_mut() {
+                    compositor.with_compositor(|c| c.reset_buffer_ages());
+                }
+                if enabled {
+                    state.frame_flags.remove(FrameFlags::ALLOW_SCANOUT);
+                } else {
+                    state.frame_flags.insert(FrameFlags::DEFAULT);
+                    if bool_var("COSMIC_DISABLE_DIRECT_SCANOUT").unwrap_or(false) {
+                        state.frame_flags.remove(FrameFlags::ALLOW_SCANOUT);
+                    } else if bool_var("COSMIC_DISABLE_OVERLAY_SCANOUT").unwrap_or(false) {
+                        state
+                            .frame_flags
+                            .remove(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
+                    }
+                }
+                state.queue_redraw(true, false);
             }
             Event::Msg(ThreadCommand::AdaptiveSyncAvailable(result)) => {
                 if let Some(compositor) = state.compositor.as_mut() {
@@ -720,11 +933,19 @@ fn surface_thread(
                     };
                 }
             }
+            Event::Msg(ThreadCommand::DpmsOn) => {
+                if let Some(compositor) = state.compositor.as_mut()
+                    && let Err(err) = compositor.with_compositor(|c| c.reset_state())
+                {
+                    error!(?err, "failed to restore output state after DPMS");
+                }
+                state.queue_redraw(false, false);
+            }
             Event::Msg(ThreadCommand::AllowFrameFlags(flag, mut flags)) => {
-                if crate::utils::env::bool_var("COSMIC_DISABLE_DIRECT_SCANOUT").unwrap_or(false) {
+                if state.hdr_enabled || bool_var("COSMIC_DISABLE_DIRECT_SCANOUT").unwrap_or(false) {
                     flags.remove(FrameFlags::ALLOW_SCANOUT);
                 }
-                if crate::utils::env::bool_var("COSMIC_DISABLE_OVERLAY_SCANOUT").unwrap_or(false) {
+                if bool_var("COSMIC_DISABLE_OVERLAY_SCANOUT").unwrap_or(false) {
                     flags.remove(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
                 }
 
@@ -732,6 +953,9 @@ fn surface_thread(
                     state.frame_flags.insert(flags);
                 } else {
                     state.frame_flags.remove(flags);
+                }
+                if state.hdr_enabled {
+                    state.frame_flags.remove(FrameFlags::ALLOW_SCANOUT);
                 }
             }
             Event::Closed | Event::Msg(ThreadCommand::End) => {
@@ -796,9 +1020,9 @@ impl SurfaceThreadState {
         self.timings
             .set_min_refresh_interval(self.min_vrr_frame_time);
 
-        if crate::utils::env::bool_var("COSMIC_DISABLE_DIRECT_SCANOUT").unwrap_or(false) {
+        if bool_var("COSMIC_DISABLE_DIRECT_SCANOUT").unwrap_or(false) {
             self.frame_flags.remove(FrameFlags::ALLOW_SCANOUT);
-        } else if crate::utils::env::bool_var("COSMIC_DISABLE_OVERLAY_SCANOUT").unwrap_or(false) {
+        } else if bool_var("COSMIC_DISABLE_OVERLAY_SCANOUT").unwrap_or(false) {
             self.frame_flags
                 .remove(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
         }
@@ -1074,6 +1298,12 @@ impl SurfaceThreadState {
                 if let Err(err) = state.redraw(estimated_presentation) {
                     let name = state.output.name();
                     warn!(?name, "Failed to submit rendering: {:?}", err);
+                    if hdr_policy().require_active {
+                        let _ = state
+                            .thread_sender
+                            .send(SurfaceCommand::FatalRenderError(format!("{err:#}")));
+                        return TimeoutAction::Drop;
+                    }
                     state.queue_redraw(true, false);
                 }
                 TimeoutAction::Drop
@@ -1142,7 +1372,13 @@ impl SurfaceThreadState {
         let mut additional_frame_flags = FrameFlags::empty();
         let mut remove_frame_flags = FrameFlags::empty();
 
-        let (has_active_fullscreen, fullscreen_drives_refresh_rate, animations_going) = {
+        let (
+            has_active_fullscreen,
+            fullscreen_drives_refresh_rate,
+            animations_going,
+            prefers_async,
+            is_fullscreen_scanout_compatible,
+        ) = {
             let shell = self.shell.read();
             let animations_going = shell.animations_going();
             let output = self.mirroring.as_ref().unwrap_or(&self.output);
@@ -1156,11 +1392,45 @@ impl SurfaceThreadState {
                     recursive_frame_time_estimation(&self.clock, &surface)
                         .is_some_and(|dur| dur <= min_vrr_frame_time)
                 });
-                (true, drives_refresh_rate, animations_going)
+                let surface_desc = fullscreen_surface
+                    .wl_surface()
+                    .and_then(|surface| get_surface_description(&surface).0);
+                let is_scanout_compatible =
+                    is_surface_scanout_compatible(self.hdr_enabled, surface_desc.as_ref());
+                let prefers_async = fullscreen_surface.prefers_async;
+                (
+                    true,
+                    drives_refresh_rate,
+                    animations_going,
+                    prefers_async,
+                    is_scanout_compatible,
+                )
             } else {
-                (false, false, animations_going)
+                (false, false, animations_going, false, false)
             }
         };
+
+        set_hdr_client_blend(&mut renderer, self.hdr_config);
+
+        let allow_primary_scanout = has_active_fullscreen
+            && is_fullscreen_scanout_compatible
+            && self.screen_filter.is_noop()
+            && self.mirroring.is_none()
+            && !bool_var("COSMIC_DISABLE_DIRECT_SCANOUT").unwrap_or(false);
+
+        if allow_primary_scanout {
+            additional_frame_flags |= FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
+                | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY;
+        } else {
+            remove_frame_flags |= FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
+                | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY;
+        }
+
+        // Tearing: honor the fullscreen/covering client's async hint with real
+        // async page flips when the user allows it. The KMS layer falls back
+        // to synchronized flips whenever the kernel refuses to tear.
+        let tearing =
+            tearing_allowed_for(&self.output.name()) && has_active_fullscreen && prefers_async;
 
         if has_active_fullscreen || animations_going {
             // skip overlay plane assign if we have a fullscreen surface or dynamic contents to save on tests
@@ -1207,14 +1477,15 @@ impl SurfaceThreadState {
         };
 
         // actual rendering
+        let postprocess = !self.screen_filter.is_noop();
         let source_output = self
             .mirroring
             .as_ref()
-            .or((!self.screen_filter.is_noop()).then_some(&self.output))
+            .or(postprocess.then_some(&self.output))
             .filter(|output| {
                 PostprocessOutputConfig::for_output_untransformed(output)
                     != PostprocessOutputConfig::for_output(&self.output)
-                    || !self.screen_filter.is_noop()
+                    || postprocess
             });
 
         let mut pre_postprocess_data = PrePostprocessData::default();
@@ -1222,14 +1493,19 @@ impl SurfaceThreadState {
         let res = if let Some(source_output) = source_output {
             let offscreen_output_config =
                 PostprocessOutputConfig::for_output_untransformed(source_output);
+            let intermediate_format =
+                postprocess_intermediate_format(compositor.format(), self.hdr_enabled);
             let postprocess_state = match self.postprocess_textures.entry(self.target_node) {
                 hash_map::Entry::Occupied(occupied) => {
                     let postprocess_state = occupied.into_mut();
-                    // If output config is different, re-create offscreen state
-                    if postprocess_state.output_config != offscreen_output_config {
+                    // If output config is different, or the offscreen buffer's
+                    // intermediate format changed.
+                    if postprocess_state.output_config != offscreen_output_config
+                        || postprocess_state.texture.format() != Some(intermediate_format)
+                    {
                         *postprocess_state = PostprocessState::new_with_renderer(
                             &mut renderer,
-                            compositor.format(),
+                            intermediate_format,
                             offscreen_output_config,
                         )?
                     }
@@ -1238,7 +1514,7 @@ impl SurfaceThreadState {
                 hash_map::Entry::Vacant(vacant) => {
                     vacant.insert(PostprocessState::new_with_renderer(
                         &mut renderer,
-                        compositor.format(),
+                        intermediate_format,
                         offscreen_output_config,
                     )?)
                 }
@@ -1394,18 +1670,20 @@ impl SurfaceThreadState {
                 &pre_postprocess_data,
                 postprocess_state,
                 &self.screen_filter,
+                self.hdr_enabled,
+                self.hdr_reference_white,
+                self.hdr_hardware_offload,
             );
 
             if let Err(err) = compositor.with_compositor(|c| c.use_vrr(vrr)) {
                 warn!("Unable to set adaptive VRR state: {}", err);
             }
 
-            // let presentation_mode = if self.output.is_foreground_fullscreen_occupied().is_some() {
-            //     additional_frame_flags |= FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY;
-            //     PresentationMode::Async
-            // } else {
-            //     PresentationMode::VSync
-            // };
+            let presentation_mode = if tearing {
+                PresentationMode::Async
+            } else {
+                PresentationMode::VSync
+            };
 
             compositor.render_frame(
                 &mut renderer,
@@ -1414,19 +1692,18 @@ impl SurfaceThreadState {
                 self.frame_flags
                     .union(additional_frame_flags)
                     .difference(remove_frame_flags),
-                PresentationMode::VSync,
+                presentation_mode,
             )
         } else {
             if let Err(err) = compositor.with_compositor(|c| c.use_vrr(vrr)) {
                 warn!("Unable to set adaptive VRR state: {}", err);
             }
 
-            // let presentation_mode = if self.output.is_foreground_fullscreen_occupied().is_some() {
-            //     additional_frame_flags |= FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY;
-            //     PresentationMode::Async
-            // } else {
-            //     PresentationMode::VSync
-            // };
+            let presentation_mode = if tearing {
+                PresentationMode::Async
+            } else {
+                PresentationMode::VSync
+            };
 
             compositor.render_frame(
                 &mut renderer,
@@ -1435,7 +1712,7 @@ impl SurfaceThreadState {
                 self.frame_flags
                     .union(additional_frame_flags)
                     .difference(remove_frame_flags),
-                PresentationMode::VSync,
+                presentation_mode,
             )
         };
         self.timings.draw_done(&self.clock);
@@ -1510,6 +1787,14 @@ impl SurfaceThreadState {
                         }
 
                         if x.is_ok() {
+                            if let Some(hdr_state) =
+                                self.output.user_data().get::<drm_helpers::HdrOutputState>()
+                            {
+                                // TEST_ONLY validation is not enough to advertise HDR to
+                                // clients. Publish it only after the real frame commit was
+                                // accepted by KMS.
+                                hdr_state.commit();
+                            }
                             if self.mirroring.is_none() {
                                 self.frame_callback_seq = self.frame_callback_seq.wrapping_add(1);
                                 self.send_frame_callbacks();
@@ -1584,13 +1869,34 @@ impl SurfaceThreadState {
         self.state = QueueState::WaitingForEstimatedVBlank(token);
     }
 
+    fn update_hdr_config(&mut self) {
+        let surface_hdr_active =
+            self.hdr_enabled && self.screen_filter.is_noop() && self.mirroring.is_none();
+        self.hdr_config = if surface_hdr_active {
+            Some(HdrOutputConfig {
+                reference_white: self.hdr_reference_white,
+                max_luminance: self.hdr_max_luminance,
+                sdr_gamma: hdr_policy().sdr_gamma,
+                gamut_stretch: hdr_policy().gamut_stretch,
+                hardware_offload: self.hdr_hardware_offload,
+                is_sdr: false,
+            })
+        } else if self.screen_filter.is_noop() && self.mirroring.is_none() {
+            Some(HdrOutputConfig::sdr_tonemapping())
+        } else {
+            None
+        };
+    }
+
     fn update_mirroring(&mut self, mirroring_output: Option<Output>) {
         self.mirroring = mirroring_output;
+        self.update_hdr_config();
         self.postprocess_textures.clear();
     }
 
     fn update_screen_filter(&mut self, filter_config: ScreenFilter) {
         self.screen_filter = filter_config;
+        self.update_hdr_config();
         self.postprocess_textures.clear();
     }
 
@@ -2021,12 +2327,36 @@ fn postprocess_elements<'a>(
     pre_postprocess_data: &PrePostprocessData,
     postprocess_state: &PostprocessState,
     screen_filter: &ScreenFilter,
+    hdr_enabled: bool,
+    hdr_reference_white: f32,
+    hdr_hardware_offload: bool,
 ) -> Vec<CosmicElement<GlMultiRenderer<'a>>> {
     let postprocess_texture_shader = Borrow::<GlesRenderer>::borrow(renderer.as_ref())
         .egl_context()
         .user_data()
         .get::<PostprocessShader>()
         .expect("OffscreenShader should be available through `init_shaders`");
+
+    let build_uniforms = || {
+        vec![
+            Uniform::new("invert", if screen_filter.inverted { 1. } else { 0. }),
+            Uniform::new(
+                "color_mode",
+                screen_filter
+                    .color_filter
+                    .map(|val| val as u8 as f32)
+                    .unwrap_or(0.),
+            ),
+            Uniform::new("hdr_enabled", if hdr_enabled { 1.0 } else { 0.0 }),
+            Uniform::new("hdr_reference_white", hdr_reference_white),
+            Uniform::new("hdr_sdr_gamma", hdr_policy().sdr_gamma),
+            Uniform::new("hdr_gamut_stretch", hdr_policy().gamut_stretch),
+            Uniform::new(
+                "hdr_hardware_offload",
+                if hdr_hardware_offload { 1.0 } else { 0.0 },
+            ),
+        ]
+    };
 
     let mut elements: [Option<TextureShaderElement>; 2] = [None, None];
     if let Some(cursor_texture) = postprocess_state.cursor_texture.as_ref() {
@@ -2052,16 +2382,7 @@ fn postprocess_elements<'a>(
         elements[0] = Some(TextureShaderElement::new(
             texture_elem,
             postprocess_texture_shader.0.clone(),
-            vec![
-                Uniform::new("invert", if screen_filter.inverted { 1. } else { 0. }),
-                Uniform::new(
-                    "color_mode",
-                    screen_filter
-                        .color_filter
-                        .map(|val| val as u8 as f32)
-                        .unwrap_or(0.),
-                ),
-            ],
+            build_uniforms(),
         ));
     }
 
@@ -2086,16 +2407,7 @@ fn postprocess_elements<'a>(
     elements[1] = Some(TextureShaderElement::new(
         texture_elem,
         postprocess_texture_shader.0.clone(),
-        vec![
-            Uniform::new("invert", if screen_filter.inverted { 1. } else { 0. }),
-            Uniform::new(
-                "color_mode",
-                screen_filter
-                    .color_filter
-                    .map(|val| val as u8 as f32)
-                    .unwrap_or(0.),
-            ),
-        ],
+        build_uniforms(),
     ));
 
     constrain_render_elements(
@@ -2115,4 +2427,80 @@ fn postprocess_elements<'a>(
     )
     .map(CosmicElement::<GlMultiRenderer>::Postprocess)
     .collect::<Vec<_>>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smithay::wayland::color::management::{Primaries, PrimariesOption, TransferFunction};
+
+    #[test]
+    fn sdr_surface_on_sdr_output_allows_scanout() {
+        assert!(is_surface_scanout_compatible(false, None));
+        assert!(is_surface_scanout_compatible(
+            false,
+            Some(&ImageDescription::SRGB)
+        ));
+    }
+
+    #[test]
+    fn hdr_surface_on_sdr_output_blocks_scanout() {
+        let pq_desc = ImageDescription {
+            transfer: TransferFunction::St2084Pq,
+            primaries: PrimariesOption {
+                named: Some(Primaries::Bt2020),
+                values: None,
+            },
+            ..ImageDescription::SRGB
+        };
+        assert!(!is_surface_scanout_compatible(false, Some(&pq_desc)));
+        assert!(!is_surface_scanout_compatible(
+            false,
+            Some(&ImageDescription::WINDOWS_SCRGB)
+        ));
+    }
+
+    #[test]
+    fn pq_bt2020_surface_on_hdr_output_allows_scanout() {
+        let pq_desc = ImageDescription {
+            transfer: TransferFunction::St2084Pq,
+            primaries: PrimariesOption {
+                named: Some(Primaries::Bt2020),
+                values: None,
+            },
+            ..ImageDescription::SRGB
+        };
+        assert!(is_surface_scanout_compatible(true, Some(&pq_desc)));
+        assert!(is_surface_scanout_compatible(
+            true,
+            Some(&ImageDescription::WINDOWS_BT2100)
+        ));
+    }
+
+    #[test]
+    fn non_pq_surface_on_hdr_output_blocks_scanout() {
+        // SDR on HDR output needs SDR->HDR expansion
+        assert!(!is_surface_scanout_compatible(true, None));
+        assert!(!is_surface_scanout_compatible(
+            true,
+            Some(&ImageDescription::SRGB)
+        ));
+
+        // Extended linear scRGB on HDR output needs linear->PQ conversion
+        assert!(!is_surface_scanout_compatible(
+            true,
+            Some(&ImageDescription::WINDOWS_SCRGB)
+        ));
+
+        // HLG on PQ HDR output needs HLG->PQ conversion
+        let hlg_desc = ImageDescription {
+            transfer: TransferFunction::Hlg,
+            primaries: PrimariesOption {
+                named: Some(Primaries::Bt2020),
+                values: None,
+            },
+            ..ImageDescription::SRGB
+        };
+        assert!(!is_surface_scanout_compatible(true, Some(&hlg_desc)));
+    }
 }

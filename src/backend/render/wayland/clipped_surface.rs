@@ -94,6 +94,28 @@ where
             transform_matrix * geo_scale * geo_translation * buf_scale * buf_translation,
         );
 
+        let hdr_config = Borrow::<GlesRenderer>::borrow(renderer.glow_renderer()).hdr_output();
+        let (hdr_enabled, ref_white, sdr_gamma, gamut_stretch, hw_offload, is_sdr, max_lum) =
+            if let Some(config) = hdr_config {
+                (
+                    1.0_f32,
+                    config.reference_white,
+                    config.sdr_gamma,
+                    config.gamut_stretch,
+                    if config.hardware_offload {
+                        1.0_f32
+                    } else {
+                        0.0_f32
+                    },
+                    if config.is_sdr { 1.0_f32 } else { 0.0_f32 },
+                    config.max_luminance,
+                )
+            } else {
+                (
+                    0.0_f32, 203.0_f32, 2.2_f32, 0.0_f32, 0.0_f32, 0.0_f32, 1000.0_f32,
+                )
+            };
+
         let uniforms = vec![
             Uniform::new("geo_size", (geometry.size.w as f32, geometry.size.h as f32)),
             Uniform::new(
@@ -113,6 +135,18 @@ where
                 },
             ),
             Uniform::new("noise", UniformValue::_1f(0.0)),
+            Uniform::new("hdr_enabled", UniformValue::_1f(hdr_enabled)),
+            Uniform::new("hdr_reference_white", UniformValue::_1f(ref_white)),
+            Uniform::new("hdr_sdr_gamma", UniformValue::_1f(sdr_gamma)),
+            Uniform::new("hdr_gamut_stretch", UniformValue::_1f(gamut_stretch)),
+            Uniform::new("hdr_hardware_offload", UniformValue::_1f(hw_offload)),
+            Uniform::new("hdr_target_is_sdr", UniformValue::_1f(is_sdr)),
+            Uniform::new("hdr_input_pq", UniformValue::_1f(0.0)),
+            Uniform::new("hdr_input_hlg", UniformValue::_1f(0.0)),
+            Uniform::new("hdr_input_primaries", UniformValue::_1f(0.0)),
+            Uniform::new("hdr_content_reference", UniformValue::_1f(203.0)),
+            Uniform::new("hdr_max_content_luminance", UniformValue::_1f(1000.0)),
+            Uniform::new("hdr_max_destination_luminance", UniformValue::_1f(max_lum)),
         ];
 
         Self {
@@ -259,12 +293,17 @@ where
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), R::Error> {
+        let previous_override =
+            BorrowMut::<GlesFrame>::borrow_mut(<R as AsGlowRenderer>::glow_frame_mut(frame))
+                .take_tex_program_override();
         BorrowMut::<GlesFrame>::borrow_mut(<R as AsGlowRenderer>::glow_frame_mut(frame))
             .override_default_tex_program(self.program.clone(), self.uniforms.clone());
-        self.inner
-            .draw(frame, src, dst, damage, opaque_regions, cache)?;
+        let res = self
+            .inner
+            .draw(frame, src, dst, damage, opaque_regions, cache);
         BorrowMut::<GlesFrame>::borrow_mut(<R as AsGlowRenderer>::glow_frame_mut(frame))
-            .clear_tex_program_override();
+            .set_tex_program_override(previous_override);
+        res?;
         Ok(())
     }
 

@@ -355,16 +355,17 @@ impl Shell {
                             is_focused
                         };
 
-                        let current_geo = SpaceElement::geometry(&fs.surface).as_local();
-                        let output_geo = output.geometry().to_local(&output);
+                        if is_foreground {
+                            let prefers_async = fs
+                                .surface
+                                .wl_surface()
+                                .as_deref()
+                                .is_some_and(surface_tree_prefers_async);
 
-                        let is_really_fullscreen = current_geo.loc.x <= 1
-                            && current_geo.loc.y <= 1
-                            && (current_geo.size.w - output_geo.size.w).abs() <= 1
-                            && (current_geo.size.h - output_geo.size.h).abs() <= 1;
-
-                        if is_foreground && is_really_fullscreen {
-                            output.set_fullscreen_occupied(Some(fs.surface.clone()));
+                            output.set_fullscreen_occupied(Some(FullscreenOccupied {
+                                surface: fs.surface.clone(),
+                                prefers_async,
+                            }));
                             true
                         } else {
                             false

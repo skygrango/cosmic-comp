@@ -261,6 +261,18 @@ impl BlurElement {
                 },
             ),
             Uniform::new("noise", UniformValue::_1f(NOISE)),
+            Uniform::new("hdr_enabled", UniformValue::_1f(0.0)),
+            Uniform::new("hdr_reference_white", UniformValue::_1f(203.0)),
+            Uniform::new("hdr_sdr_gamma", UniformValue::_1f(2.2)),
+            Uniform::new("hdr_gamut_stretch", UniformValue::_1f(0.0)),
+            Uniform::new("hdr_hardware_offload", UniformValue::_1f(0.0)),
+            Uniform::new("hdr_target_is_sdr", UniformValue::_1f(0.0)),
+            Uniform::new("hdr_input_pq", UniformValue::_1f(0.0)),
+            Uniform::new("hdr_input_hlg", UniformValue::_1f(0.0)),
+            Uniform::new("hdr_input_primaries", UniformValue::_1f(0.0)),
+            Uniform::new("hdr_content_reference", UniformValue::_1f(203.0)),
+            Uniform::new("hdr_max_content_luminance", UniformValue::_1f(1000.0)),
+            Uniform::new("hdr_max_destination_luminance", UniformValue::_1f(1000.0)),
         ];
 
         let geometry = extended_geo.to_logical(output_scale);
@@ -462,9 +474,12 @@ where
         let texture_ref = texture.lock().unwrap();
 
         if let Some(tex) = texture_ref.as_ref() {
+            let previous_override =
+                BorrowMut::<GlesFrame>::borrow_mut(<R as AsGlowRenderer>::glow_frame_mut(frame))
+                    .take_tex_program_override();
             BorrowMut::<GlesFrame>::borrow_mut(<R as AsGlowRenderer>::glow_frame_mut(frame))
                 .override_default_tex_program(self.render_shader.clone(), self.uniforms.clone());
-            frame.render_texture_from_to(
+            let res = frame.render_texture_from_to(
                 tex,
                 src,
                 dst,
@@ -472,9 +487,10 @@ where
                 opaque_regions,
                 Transform::Normal,
                 1.0,
-            )?;
+            );
             BorrowMut::<GlesFrame>::borrow_mut(<R as AsGlowRenderer>::glow_frame_mut(frame))
-                .clear_tex_program_override();
+                .set_tex_program_override(previous_override);
+            res?;
         }
         Ok(())
     }
