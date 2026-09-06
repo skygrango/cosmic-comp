@@ -153,3 +153,61 @@ fn shader_common_blocks_are_identical() {
         "HDR shader math drifted between offscreen.frag and hdr_sdr_texture.frag"
     );
 }
+
+fn hlg_to_scene(e: f64) -> f64 {
+    let a = 0.17883277;
+    let b = 0.28466892;
+    let c = 0.55991073;
+    let e = e.clamp(0.0, 1.0);
+    if e <= 0.5 {
+        (e * e) / 3.0
+    } else {
+        (((e - c) / a).exp() + b) / 12.0
+    }
+}
+
+fn hlg_to_nits(e: f64) -> f64 {
+    let scene = hlg_to_scene(e);
+    let ys = scene;
+    let gain = ys.max(1e-6).powf(0.2) * 1000.0;
+    scene * gain
+}
+
+#[test]
+fn hlg_matches_itu_bt2100_and_bt2408_levels() {
+    assert_eq!(hlg_to_scene(0.0), 0.0);
+    assert_eq!(hlg_to_nits(0.0), 0.0);
+    assert!((hlg_to_scene(0.5) - 0.25 / 3.0).abs() < 1e-6);
+
+    // Diffuse white (75% signal) corresponds to ~203 cd/m² per ITU-R BT.2408
+    let white_nits = hlg_to_nits(0.75);
+    assert!(
+        (white_nits - 203.0).abs() < 1.0,
+        "hlg 75% nits={white_nits}"
+    );
+
+    // Peak white (100% signal) corresponds to 1000 cd/m² nominal peak
+    let peak_nits = hlg_to_nits(1.0);
+    assert!(
+        (peak_nits - 1000.0).abs() < 1.0,
+        "hlg 100% nits={peak_nits}"
+    );
+}
+
+fn p3_to_bt2020(rgb: [f64; 3]) -> [f64; 3] {
+    [
+        0.7538330 * rgb[0] + 0.1985974 * rgb[1] + 0.0475696 * rgb[2],
+        0.0457438 * rgb[0] + 0.9417772 * rgb[1] + 0.0124789 * rgb[2],
+        -0.0012103 * rgb[0] + 0.0176017 * rgb[1] + 0.9836086 * rgb[2],
+    ]
+}
+
+#[test]
+fn display_p3_to_bt2020_preserves_neutral_white() {
+    let white = p3_to_bt2020([1.0, 1.0, 1.0]);
+    assert!(
+        white
+            .into_iter()
+            .all(|channel| (channel - 1.0).abs() < 2e-6)
+    );
+}

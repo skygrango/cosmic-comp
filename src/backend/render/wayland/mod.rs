@@ -98,9 +98,6 @@ pub fn push_render_elements_from_surface_tree<R>(
                             states,
                         )
                         .0;
-                    let pq_bt2020_content =
-                        description.is_some_and(|description| description.is_pq_bt2020());
-                    let scrgb_content = description.filter(|description| description.windows_scrgb);
                     match WaylandSurfaceRenderElement::from_surface(
                         renderer, surface, states, location, alpha, kind,
                     ) {
@@ -123,21 +120,56 @@ pub fn push_render_elements_from_surface_tree<R>(
                                     renderer, element, scale, geometry, radii,
                                 )
                                 .into()
-                            } else if pq_bt2020_content {
-                                HdrSurfaceRenderElement::new(
-                                    element,
-                                    description
-                                        .and_then(|d| d.luminances)
-                                        .map(|(_min, _max, reference)| reference.max(80) as f32)
-                                        .unwrap_or(203.0),
-                                )
-                                .into()
-                            } else if let Some(description) = scrgb_content {
-                                HdrSurfaceRenderElement::new_scrgb(
-                                    element,
-                                    scrgb_reference_scale(&description),
-                                )
-                                .into()
+                            } else if let Some(description) = description {
+                                use smithay::wayland::color::management::{
+                                    Primaries, TransferFunction,
+                                };
+                                if description.transfer == TransferFunction::Hlg {
+                                    HdrSurfaceRenderElement::new_hlg(
+                                        element,
+                                        description
+                                            .luminances
+                                            .map(|(_min, _max, reference)| reference.max(80) as f32)
+                                            .unwrap_or(203.0),
+                                    )
+                                    .into()
+                                } else if description.is_pq_bt2020() {
+                                    HdrSurfaceRenderElement::new(
+                                        element,
+                                        description
+                                            .luminances
+                                            .map(|(_min, _max, reference)| reference.max(80) as f32)
+                                            .unwrap_or(203.0),
+                                    )
+                                    .into()
+                                } else if description.windows_scrgb
+                                    || description.transfer == TransferFunction::ExtLinear
+                                {
+                                    HdrSurfaceRenderElement::new_scrgb(
+                                        element,
+                                        scrgb_reference_scale(&description),
+                                    )
+                                    .into()
+                                } else {
+                                    let sdr_gamma = match description.transfer {
+                                        TransferFunction::Bt1886 => 2.4,
+                                        TransferFunction::Gamma22 => 2.2,
+                                        TransferFunction::CompoundPower24
+                                        | TransferFunction::Srgb => 0.0,
+                                        _ => crate::utils::env::hdr_policy().sdr_gamma,
+                                    };
+                                    let primaries_mode = match description.primaries.named {
+                                        Some(Primaries::DisplayP3) => 1.0,
+                                        Some(Primaries::Bt2020) => 2.0,
+                                        _ => 0.0,
+                                    };
+                                    HdrSurfaceRenderElement::new_parametric_sdr(
+                                        element,
+                                        sdr_gamma,
+                                        primaries_mode,
+                                    )
+                                    .into()
+                                }
                             } else {
                                 element.into()
                             };

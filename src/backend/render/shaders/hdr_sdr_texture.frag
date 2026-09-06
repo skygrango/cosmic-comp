@@ -32,6 +32,30 @@ const mat3 rec709_to_bt2020 = mat3(
     0.0433136, 0.0113612, 0.8955950
 );
 
+// Linear Display P3 to linear BT.2020. GLSL constructors are column-major.
+const mat3 p3_to_bt2020 = mat3(
+    0.7538330, 0.0457438, -0.0012103,
+    0.1985974, 0.9417772, 0.0176017,
+    0.0475696, 0.0124789, 0.9836086
+);
+
+// Primaries selector: 0.0 = Rec.709 / sRGB, 1.0 = Display P3, 2.0 = BT.2020 (identity)
+uniform float hdr_input_primaries;
+
+vec3 convert_primaries(vec3 linear_rgb) {
+    if (hdr_input_primaries > 1.5) {
+        return linear_rgb;
+    } else if (hdr_input_primaries > 0.5) {
+        return p3_to_bt2020 * linear_rgb;
+    } else {
+        return mix(
+            rec709_to_bt2020 * linear_rgb,
+            linear_rgb,
+            clamp(hdr_gamut_stretch, 0.0, 1.0)
+        );
+    }
+}
+
 float decode_sdr(float value) {
     if (hdr_sdr_gamma > 0.0) {
         return pow(max(value, 0.0), hdr_sdr_gamma);
@@ -56,19 +80,12 @@ float encode_pq(float value) {
 // SDR (premultiplied handling done by callers) to PQ/BT.2020, with the
 // reference white defining where linear SDR 1.0 lands in absolute luminance.
 vec3 sdr_to_pq(vec3 rgb) {
-    vec3 linear_709 = vec3(
+    vec3 linear_rgb = vec3(
         decode_sdr(rgb.r),
         decode_sdr(rgb.g),
         decode_sdr(rgb.b)
     );
-    vec3 absolute = max(
-            mix(
-                rec709_to_bt2020 * linear_709,
-                linear_709,
-                clamp(hdr_gamut_stretch, 0.0, 1.0)
-            ),
-            0.0
-        )
+    vec3 absolute = max(convert_primaries(linear_rgb), 0.0)
         * (clamp(hdr_reference_white, 80.0, 10000.0) / 10000.0);
     return vec3(
         encode_pq(absolute.r),
@@ -82,6 +99,7 @@ vec3 sdr_to_pq(vec3 rgb) {
 // level with the desktop's, like KWin's reference-white mapping. Values above
 // the panel's peak are left for the panel to clip.
 uniform float hdr_input_pq;          // 1.0 = buffer holds PQ code values
+uniform float hdr_input_hlg;         // 1.0 = buffer holds HLG code values (BT.2100)
 uniform float hdr_content_reference; // content reference white in cd/m²
 
 // ST 2084 EOTF: PQ code value to luminance in the normalized 10000 cd/m^2
@@ -105,6 +123,38 @@ vec3 pq_rescale(vec3 code) {
         encode_pq(pq_to_linear(code.b) * gain)
     );
 }
+
+// HLG inverse OETF (ARIB STD-B67 / ITU-R BT.2100)
+float hlg_to_scene(float e) {
+    const float a = 0.17883277;
+    const float b = 0.28466892;
+    const float c = 0.55991073;
+    e = clamp(e, 0.0, 1.0);
+    if (e <= 0.5) {
+        return (e * e) / 3.0;
+    } else {
+        return (exp((e - c) / a) + b) / 12.0;
+    }
+}
+
+// HLG (BT.2020 primaries) to PQ/BT.2020 with OOTF and reference white scaling.
+vec3 hlg_to_pq(vec3 hlg) {
+    vec3 scene = vec3(
+        hlg_to_scene(hlg.r),
+        hlg_to_scene(hlg.g),
+        hlg_to_scene(hlg.b)
+    );
+    float ys = dot(scene, vec3(0.2627, 0.6780, 0.0593));
+    float gain = pow(max(ys, 1e-6), 0.2) * 0.10;
+    float ref_scale = clamp(hdr_reference_white, 80.0, 10000.0)
+        / max(hdr_content_reference, 80.0);
+    vec3 display = scene * (gain * ref_scale);
+    return vec3(
+        encode_pq(display.r),
+        encode_pq(display.g),
+        encode_pq(display.b)
+    );
+}
 // END HDR COMMON
 
 varying vec2 v_coords;
@@ -120,7 +170,14 @@ void main() {
 #endif
 
     vec3 rgb = color.a > 0.00001 ? color.rgb / color.a : vec3(0.0);
-    color.rgb = (hdr_input_pq > 0.5 ? pq_rescale(rgb) : sdr_to_pq(rgb)) * color.a;
+    if (hdr_input_pq > 0.5) {
+        rgb = pq_rescale(rgb);
+    } else if (hdr_input_hlg > 0.5) {
+        rgb = hlg_to_pq(rgb);
+    } else {
+        rgb = sdr_to_pq(rgb);
+    }
+    color.rgb = rgb * color.a;
     color *= alpha;
 
 #if defined(DEBUG_FLAGS)

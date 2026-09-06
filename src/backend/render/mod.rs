@@ -185,6 +185,8 @@ pub fn set_hdr_client_blend<R: AsGlowRenderer>(renderer: &mut R, reference_white
                     crate::utils::env::hdr_policy().gamut_stretch,
                 ),
                 Uniform::new("hdr_input_pq", 0.0_f32),
+                Uniform::new("hdr_input_hlg", 0.0_f32),
+                Uniform::new("hdr_input_primaries", 0.0_f32),
                 Uniform::new("hdr_content_reference", 203.0_f32),
             ],
         )));
@@ -529,6 +531,8 @@ pub fn init_shaders(renderer: &mut GlesRenderer) -> Result<(), GlesError> {
             UniformName::new("hdr_sdr_gamma", UniformType::_1f),
             UniformName::new("hdr_gamut_stretch", UniformType::_1f),
             UniformName::new("hdr_input_pq", UniformType::_1f),
+            UniformName::new("hdr_input_hlg", UniformType::_1f),
+            UniformName::new("hdr_input_primaries", UniformType::_1f),
             UniformName::new("hdr_content_reference", UniformType::_1f),
         ],
     )?;

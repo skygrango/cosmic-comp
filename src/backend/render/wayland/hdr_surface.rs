@@ -25,18 +25,21 @@ enum HdrSurfaceContent {
     /// on the output's reference white, like KWin's reference mapping;
     /// without it, PQ games look dim next to a brighter desktop.
     PqPassthrough { content_reference: f32 },
+    /// The buffer carries HLG (ARIB STD-B67 / BT.2100) electrical values in BT.2020 primaries.
+    Hlg { content_reference: f32 },
     /// A Windows-scRGB buffer: linear light, sRGB primaries, extended range.
     /// The factor rescales the frame's reference white so that the encoding's
     /// own reference (203 cd/m² per BT.2408) lands on the output's reference.
     ScrgbLinear { reference_scale: f32 },
+    /// Parametric SDR buffer with specific transfer function (gamma) and primaries.
+    ParametricSdr { sdr_gamma: f32, primaries_mode: f32 },
 }
 
 /// A client surface with an HDR image description attached.
 ///
 /// Ordinary compositor textures inherit an SDR-to-PQ shader during fullscreen
 /// HDR presentation. This wrapper suspends that shader for PQ content, and
-/// re-parameterizes it for scRGB content (no sRGB decode, no gamut stretch,
-/// rescaled reference white).
+/// re-parameterizes it for HLG, scRGB, and parametric color content.
 #[derive(Debug)]
 pub struct HdrSurfaceRenderElement<R: Renderer> {
     inner: WaylandSurfaceRenderElement<R>,
@@ -51,10 +54,31 @@ impl<R: Renderer> HdrSurfaceRenderElement<R> {
         }
     }
 
+    pub fn new_hlg(inner: WaylandSurfaceRenderElement<R>, content_reference: f32) -> Self {
+        Self {
+            inner,
+            content: HdrSurfaceContent::Hlg { content_reference },
+        }
+    }
+
     pub fn new_scrgb(inner: WaylandSurfaceRenderElement<R>, reference_scale: f32) -> Self {
         Self {
             inner,
             content: HdrSurfaceContent::ScrgbLinear { reference_scale },
+        }
+    }
+
+    pub fn new_parametric_sdr(
+        inner: WaylandSurfaceRenderElement<R>,
+        sdr_gamma: f32,
+        primaries_mode: f32,
+    ) -> Self {
+        Self {
+            inner,
+            content: HdrSurfaceContent::ParametricSdr {
+                sdr_gamma,
+                primaries_mode,
+            },
         }
     }
 }
@@ -128,6 +152,23 @@ where
                     for uniform in &mut uniforms {
                         match uniform.name.as_ref() {
                             "hdr_input_pq" => uniform.value = UniformValue::_1f(1.0),
+                            "hdr_input_hlg" => uniform.value = UniformValue::_1f(0.0),
+                            "hdr_content_reference" => {
+                                uniform.value = UniformValue::_1f(content_reference)
+                            }
+                            _ => {}
+                        }
+                    }
+                    (program.clone(), uniforms)
+                })
+            }
+            HdrSurfaceContent::Hlg { content_reference } => {
+                saved.as_ref().map(|(program, uniforms)| {
+                    let mut uniforms = uniforms.clone();
+                    for uniform in &mut uniforms {
+                        match uniform.name.as_ref() {
+                            "hdr_input_pq" => uniform.value = UniformValue::_1f(0.0),
+                            "hdr_input_hlg" => uniform.value = UniformValue::_1f(1.0),
                             "hdr_content_reference" => {
                                 uniform.value = UniformValue::_1f(content_reference)
                             }
@@ -142,6 +183,9 @@ where
                     let mut uniforms = uniforms.clone();
                     for uniform in &mut uniforms {
                         match uniform.name.as_ref() {
+                            "hdr_input_pq" => uniform.value = UniformValue::_1f(0.0),
+                            "hdr_input_hlg" => uniform.value = UniformValue::_1f(0.0),
+                            "hdr_input_primaries" => uniform.value = UniformValue::_1f(0.0),
                             // The buffer is already linear light.
                             "hdr_sdr_gamma" => uniform.value = UniformValue::_1f(1.0),
                             // scRGB escapes the sRGB gamut numerically; the
@@ -158,6 +202,27 @@ where
                     (program.clone(), uniforms)
                 })
             }
+            HdrSurfaceContent::ParametricSdr {
+                sdr_gamma,
+                primaries_mode,
+            } => saved.as_ref().map(|(program, uniforms)| {
+                let mut uniforms = uniforms.clone();
+                for uniform in &mut uniforms {
+                    match uniform.name.as_ref() {
+                        "hdr_input_pq" => uniform.value = UniformValue::_1f(0.0),
+                        "hdr_input_hlg" => uniform.value = UniformValue::_1f(0.0),
+                        "hdr_sdr_gamma" => uniform.value = UniformValue::_1f(sdr_gamma),
+                        "hdr_input_primaries" => uniform.value = UniformValue::_1f(primaries_mode),
+                        "hdr_gamut_stretch" => {
+                            if primaries_mode > 0.5 {
+                                uniform.value = UniformValue::_1f(0.0);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                (program.clone(), uniforms)
+            }),
         };
         {
             let gles = BorrowMut::<GlesFrame>::borrow_mut(R::glow_frame_mut(frame));
@@ -172,6 +237,9 @@ where
     }
 
     fn underlying_storage(&self, renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
-        self.inner.underlying_storage(renderer)
+        match self.content {
+            HdrSurfaceContent::PqPassthrough { .. } => self.inner.underlying_storage(renderer),
+            _ => None,
+        }
     }
 }

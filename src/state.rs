@@ -698,9 +698,25 @@ impl State {
         let advertise_hdr = crate::utils::env::hdr_policy().experiment_enabled;
         let color_management_state = ColorManagementState::new::<Self, _>(
             dh,
-            [ColorTransferFunction::St2084Pq],
-            [ColorPrimaries::Bt2020],
-            [ColorFeature::WindowsScrgb, ColorFeature::WindowsBt2100],
+            [
+                ColorTransferFunction::St2084Pq,
+                ColorTransferFunction::Hlg,
+                ColorTransferFunction::ExtLinear,
+                ColorTransferFunction::CompoundPower24,
+                ColorTransferFunction::Srgb,
+                ColorTransferFunction::Bt1886,
+                ColorTransferFunction::Gamma22,
+            ],
+            [
+                ColorPrimaries::Bt2020,
+                ColorPrimaries::Srgb,
+                ColorPrimaries::DisplayP3,
+            ],
+            [
+                ColorFeature::WindowsScrgb,
+                ColorFeature::WindowsBt2100,
+                ColorFeature::SetLuminances,
+            ],
             [ColorRenderIntent::Perceptual],
             move |_| advertise_hdr,
         );

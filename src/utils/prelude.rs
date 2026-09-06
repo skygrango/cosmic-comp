@@ -381,7 +381,7 @@ pub fn surface_tree_has_hdr_client_description(surface: &WlSurface) -> bool {
     smithay::desktop::utils::with_surfaces_surface_tree(surface, |_, states| {
         if smithay::wayland::color::management::surface_description_from_states(states)
             .0
-            .is_some_and(|description| description.is_pq_bt2020() || description.windows_scrgb)
+            .is_some_and(|description| description.is_hdr())
         {
             found = true;
         }
