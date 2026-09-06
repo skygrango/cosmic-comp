@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use calloop::timer::{TimeoutAction, Timer};
+use nix::sys::signal::{SigSet, Signal};
 use smithay::{
     reexports::{
         calloop::{EventLoop, Interest, Mode, PostAction, generic::Generic},
@@ -111,6 +112,27 @@ impl State {
 }
 
 pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
+    // Block termination signals before logger, state, or renderer setup can
+    // create threads. A dedicated waiter below can stop surface threads even if
+    // the main event loop is wedged in a client or configuration callback.
+    let hdr_policy = utils::env::hdr_policy();
+    // Clean SIGTERM shutdown through the event loop restores persistent KMS
+    // color state before the greeter takes over - correct for every session,
+    // not just HDR test runs.
+    let hdr_shutdown_signals = {
+        let mut signals = SigSet::empty();
+        signals.add(Signal::SIGTERM);
+        signals.add(Signal::SIGINT);
+        signals.thread_block()?;
+        // cosmic-session SIGKILLs its direct child at logout, skipping cleanup.
+        // The launcher interposes a wrapper process as that child; parent death
+        // then delivers our ordinary SIGTERM shutdown instead.
+        if let Err(err) = nix::sys::prctl::set_pdeathsig(Signal::SIGTERM) {
+            warn!(?err, "failed to arm parent-death SIGTERM cleanup");
+        }
+        Some(signals)
+    };
+
     let raw_args = RawArgs::from_args();
     let mut cursor = raw_args.cursor();
     raw_args.next_os(&mut cursor);
@@ -177,12 +199,80 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
         with_xwayland,
         kiosk_command,
     );
+    if let Some(hdr_shutdown_signals) = hdr_shutdown_signals {
+        let (signal_sender, signal_receiver) = calloop::channel::channel();
+        event_loop
+            .handle()
+            .insert_source(signal_receiver, |event, &mut (), state| {
+                let calloop::channel::Event::Msg(signal) = event else {
+                    return;
+                };
+                warn!(?signal, "ending experimental HDR session cleanly");
+                state.common.should_stop = true;
+                state.common.event_loop_signal.stop();
+                state.common.event_loop_signal.wakeup();
+            })
+            .map_err(|err| err.error)
+            .context("Failed to install experimental HDR shutdown signals")?;
+
+        std::thread::Builder::new()
+            .name("cosmic-hdr-shutdown".into())
+            .spawn(move || match hdr_shutdown_signals.wait() {
+                Ok(signal) => {
+                    // KMS cleanup starts immediately on the owning surface threads. The
+                    // main loop receives the same request for ordinary state teardown.
+                    backend::kms::emergency_shutdown_hdr_surfaces();
+                    let _ = signal_sender.send(signal);
+                }
+                Err(err) => error!(?err, "strict HDR signal waiter failed"),
+            })
+            .context("Failed to start experimental HDR shutdown waiter")?;
+    }
     // Set up the libei sender side before the backend spawns Xwayland.
     let ei_sender = libei::setup_ei(&event_loop.handle());
     state.common.dbus_state.set_ei_sender(ei_sender);
 
     // init backend
-    backend::init_backend_auto(&display, &mut event_loop, &mut state)?;
+    if let Err(err) = backend::init_backend_auto(&display, &mut event_loop, &mut state) {
+        if hdr_policy.require_active {
+            // cosmic-session restarts compositors that exit non-zero. A strict HDR
+            // preflight failure must instead announce the Wayland environment and end
+            // successfully. The announcement unblocks cosmic-session's startup handshake;
+            // the successful exit then asks it to end the session instead of restarting.
+            error!(
+                ?err,
+                "strict HDR preflight failed; returning safely to the display manager"
+            );
+            if let Err(session_err) =
+                session::run_socket(state.common.event_loop_handle.clone(), &state.common)
+            {
+                warn!(
+                    ?session_err,
+                    "failed to complete cosmic-session handshake during safe shutdown"
+                );
+            }
+            if std::env::var_os("COSMIC_SESSION_SOCK").is_some() {
+                // cosmic-session 1.7.0 has no acknowledgement for this handshake and can
+                // panic if the compositor exits while it is still launching components.
+                // Give it a bounded grace period to reach its request loop; then our status
+                // 0 is handled as SessionRequest::Exit. This only applies to strict HDR
+                // failure and never delays a running desktop.
+                let grace_ms = hdr_policy.safe_exit_grace.as_millis();
+                warn!(grace_ms, "waiting for cosmic-session safe-exit readiness");
+                let deadline = Instant::now() + hdr_policy.safe_exit_grace;
+                while !state.common.should_stop {
+                    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                        break;
+                    };
+                    // Dispatching keeps the signal source live during the grace period and
+                    // also lets cosmic-session finish its socket handshake.
+                    event_loop.dispatch(Some(remaining), &mut state)?;
+                }
+            }
+            return Ok(());
+        }
+        return Err(err.into());
+    }
 
     if let Err(err) = theme::watch_theme(event_loop.handle()) {
         warn!(?err, "Failed to watch theme");
@@ -255,14 +345,48 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
     // because the event loop has stopped; an unconditional join in Surface::Drop
     // would instead deadlock against apply_config_for_outputs.
     if let BackendData::Kms(kms) = &mut state.backend {
-        // Release master first so the surface drop path skips its blocking commit.
+        // Connector color properties are persistent KMS state regardless of how HDR
+        // was enabled. Stop every output while the device is active so surface drop can
+        // restore Colorspace=Default and HDR_OUTPUT_METADATA=0.
+        let mut surface_threads = Vec::new();
+        for device in kms.drm_devices.values_mut() {
+            for (_, surface) in device.inner.surfaces.drain() {
+                let name = surface.output.name();
+                if let Some(thread) = surface.begin_shutdown() {
+                    surface_threads.push((name, thread));
+                }
+            }
+        }
+
+        // A wedged driver must not turn compositor shutdown into an unbounded hang.
+        // All surfaces share this deadline; unfinished threads are detached after the
+        // device is paused, which makes subsequent DRM cleanup observe DeviceInactive.
+        let timeout_ms = hdr_policy.teardown_timeout.as_millis();
+        let deadline = Instant::now() + hdr_policy.teardown_timeout;
+        while !surface_threads.is_empty() && Instant::now() < deadline {
+            let mut index = 0;
+            while index < surface_threads.len() {
+                if surface_threads[index].1.is_finished() {
+                    let (name, thread) = surface_threads.swap_remove(index);
+                    if let Err(err) = thread.join() {
+                        warn!(output = %name, ?err, "surface thread panicked during shutdown");
+                    } else {
+                        info!(output = %name, "surface thread terminated after KMS cleanup");
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            if !surface_threads.is_empty() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
         for device in kms.drm_devices.values_mut() {
             device.drm.pause();
         }
-        for device in kms.drm_devices.values_mut() {
-            for (_, surface) in device.inner.surfaces.drain() {
-                surface.drop_and_join();
-            }
+        for (name, _thread) in surface_threads {
+            warn!(output = %name, timeout_ms, "KMS cleanup timed out; detached surface thread after pausing device");
         }
     }
 
