@@ -192,6 +192,16 @@ impl Config {
                 c
             });
 
+        crate::utils::env::set_hdr_reference_white_override(cosmic_comp_config.hdr_reference_white);
+        crate::utils::env::set_hdr_reference_white_outputs(
+            cosmic_comp_config.hdr_reference_white_outputs.clone(),
+        );
+        crate::utils::env::set_allow_tearing(cosmic_comp_config.allow_tearing);
+        crate::utils::env::set_allow_tearing_outputs(
+            cosmic_comp_config.allow_tearing_outputs.clone(),
+        );
+        crate::utils::env::set_hdr_enabled_outputs(cosmic_comp_config.hdr_enabled_outputs.clone());
+
         // Listen for updates to the toolkit config
         if let Ok(tk_config) = cosmic_config::Config::new("com.system76.CosmicTk", 1) {
             fn handle_new_toolkit_config(config: CosmicTk, state: &mut State) {
@@ -421,7 +431,7 @@ impl Config {
             .collect::<Vec<_>>();
         infos.sort();
 
-        if let Some(configs) = self
+        if let Some(mut configs) = self
             .dynamic_conf
             .outputs()
             .config
@@ -444,6 +454,23 @@ impl Config {
             })
             .cloned()
         {
+            let hdr_policy = crate::utils::env::hdr_policy();
+            if hdr_policy.require_active && hdr_policy.isolate_output {
+                let requested = hdr_policy.primary_output().context(
+                    "COSMIC_HDR_ISOLATE_OUTPUT requires an exact COSMIC_HDR_OUTPUT connector",
+                )?;
+                for (info, config) in infos.iter().zip(configs.iter_mut()) {
+                    if info.connector == requested {
+                        config.enabled = OutputState::Enabled;
+                        config.position = (0, 0);
+                        config.xwayland_primary = true;
+                    } else {
+                        config.enabled = OutputState::Disabled;
+                        config.xwayland_primary = false;
+                    }
+                }
+            }
+
             let known_good_configs = outputs
                 .iter()
                 .map(|output| {
@@ -522,7 +549,11 @@ impl Config {
             }
 
             output_state.update();
-            self.write_outputs(output_state.outputs());
+            // Output isolation is session-local safety policy. Never persist it over the
+            // user's ordinary mixed-monitor layout.
+            if !(hdr_policy.require_active && hdr_policy.isolate_output) {
+                self.write_outputs(output_state.outputs());
+            }
         } else {
             if outputs
                 .iter()
@@ -547,6 +578,24 @@ impl Config {
                     config.position = (w, 0);
                 }
                 w += output.geometry().size.w as u32;
+            }
+
+            let hdr_policy = crate::utils::env::hdr_policy();
+            if hdr_policy.require_active && hdr_policy.isolate_output {
+                let requested = hdr_policy.primary_output().context(
+                    "COSMIC_HDR_ISOLATE_OUTPUT requires an exact COSMIC_HDR_OUTPUT connector",
+                )?;
+                for output in &outputs {
+                    let mut config = output.config_mut();
+                    if output.name() == requested {
+                        config.enabled = OutputState::Enabled;
+                        config.position = (0, 0);
+                        config.xwayland_primary = true;
+                    } else {
+                        config.enabled = OutputState::Disabled;
+                        config.xwayland_primary = false;
+                    }
+                }
             }
 
             let mut backend = backend.lock();
@@ -578,7 +627,9 @@ impl Config {
                 }
             }
             output_state.update();
-            self.write_outputs(output_state.outputs());
+            if !(hdr_policy.require_active && hdr_policy.isolate_output) {
+                self.write_outputs(output_state.outputs());
+            }
         }
 
         Ok(())
@@ -907,6 +958,61 @@ fn config_changed(config: cosmic_config::Config, keys: Vec<String>, state: &mut 
                         &mut state.common.workspace_state.update(),
                         shell_ref.seats.iter(),
                     );
+                }
+            }
+            "allow_tearing_outputs" => {
+                let new = get_config::<std::collections::HashMap<String, bool>>(
+                    &config,
+                    "allow_tearing_outputs",
+                );
+                if new != state.common.config.cosmic_conf.allow_tearing_outputs {
+                    state.common.config.cosmic_conf.allow_tearing_outputs = new.clone();
+                    crate::utils::env::set_allow_tearing_outputs(new);
+                }
+            }
+            "hdr_enabled_outputs" => {
+                let new = get_config::<std::collections::HashMap<String, bool>>(
+                    &config,
+                    "hdr_enabled_outputs",
+                );
+                if new != state.common.config.cosmic_conf.hdr_enabled_outputs {
+                    state.common.config.cosmic_conf.hdr_enabled_outputs = new.clone();
+                    crate::utils::env::set_hdr_enabled_outputs(new);
+                    // HDR on/off switches the connector color state and shader
+                    // pipeline; run the full output configuration pass.
+                    if let Err(err) = state.refresh_output_config() {
+                        tracing::warn!(?err, "failed to re-apply outputs for HDR toggle");
+                    }
+                }
+            }
+            "allow_tearing" => {
+                let new = get_config::<bool>(&config, "allow_tearing");
+                if new != state.common.config.cosmic_conf.allow_tearing {
+                    state.common.config.cosmic_conf.allow_tearing = new;
+                    crate::utils::env::set_allow_tearing(new);
+                }
+            }
+            "hdr_reference_white_outputs" => {
+                let new = get_config::<std::collections::HashMap<String, u16>>(
+                    &config,
+                    "hdr_reference_white_outputs",
+                );
+                if new != state.common.config.cosmic_conf.hdr_reference_white_outputs {
+                    state.common.config.cosmic_conf.hdr_reference_white_outputs = new.clone();
+                    crate::utils::env::set_hdr_reference_white_outputs(new);
+                    if let BackendData::Kms(kms_state) = &mut state.backend {
+                        kms_state.lock_devices().update_hdr_reference_white();
+                    }
+                }
+            }
+            "hdr_reference_white" => {
+                let new = get_config::<Option<u16>>(&config, "hdr_reference_white");
+                if new != state.common.config.cosmic_conf.hdr_reference_white {
+                    state.common.config.cosmic_conf.hdr_reference_white = new;
+                    crate::utils::env::set_hdr_reference_white_override(new);
+                    if let BackendData::Kms(kms_state) = &mut state.backend {
+                        kms_state.lock_devices().update_hdr_reference_white();
+                    }
                 }
             }
             "active_hint" => {

@@ -4,7 +4,11 @@ use crate::{
     config::{CompOutputConfig, ScreenFilter},
     shell::Shell,
     state::BackendData,
-    utils::{env::dev_var, global::remove_global_with_timer, prelude::*},
+    utils::{
+        env::{dev_var, hdr_policy},
+        global::remove_global_with_timer,
+        prelude::*,
+    },
     wayland::protocols::{drm::WlDrmState, output_power::OutputPowerState},
 };
 
@@ -18,8 +22,12 @@ use indexmap::IndexMap;
 use render::gles::GbmGlowBackend;
 use smithay::{
     backend::{
-        allocator::{Buffer, dmabuf::Dmabuf, format::FormatSet},
-        drm::{DrmDeviceFd, DrmNode, NodeType, VrrSupport, output::DrmOutputRenderElements},
+        allocator::{Buffer, Fourcc, dmabuf::Dmabuf, format::FormatSet},
+        drm::{
+            DrmDeviceFd, DrmNode, NodeType, VrrSupport,
+            color::{Colorspace, ConnectorColorState},
+            output::DrmOutputRenderElements,
+        },
         egl::{EGLContext, EGLDevice, EGLDisplay},
         input::InputEvent,
         libinput::{LibinputInputBackend, LibinputSessionInterface},
@@ -60,12 +68,12 @@ use std::{
 };
 
 mod device;
-mod drm_helpers;
+pub(crate) mod drm_helpers;
 pub mod render;
 mod surface;
 use device::*;
-pub(crate) use surface::Surface;
 pub use surface::Timings;
+pub(crate) use surface::{Surface, emergency_shutdown_hdr_surfaces};
 
 use super::render::{CLEAR_COLOR, CursorMode, output_elements};
 
@@ -92,6 +100,22 @@ pub struct KmsGuard<'a> {
     session: &'a LibSeatSession,
 }
 
+/// Resolves the configured reference white ("SDR brightness") for an output:
+/// per-output config file value, then the live cosmic-config override, then
+/// the environment default. The per-panel EDID ceiling is applied by callers
+/// once the sink's capabilities are known.
+fn requested_reference_white(output: &Output) -> f32 {
+    CompOutputConfig(output.config())
+        .0
+        .hdr_reference_white
+        .or(crate::utils::env::hdr_reference_white_for(&output.name()))
+        .unwrap_or(hdr_policy().reference_white)
+        .clamp(
+            cosmic_comp_config::HDR_REFERENCE_WHITE_MIN,
+            cosmic_comp_config::HDR_REFERENCE_WHITE_MAX,
+        ) as f32
+}
+
 pub fn init_backend(
     dh: &DisplayHandle,
     event_loop: &mut EventLoop<'static, State>,
@@ -99,6 +123,13 @@ pub fn init_backend(
 ) -> Result<()> {
     // establish session
     let (session, notifier) = LibSeatSession::new().context("Failed to acquire session")?;
+    let hdr_policy = hdr_policy();
+    let hdr_required = hdr_policy.require_active;
+    if hdr_required && !session.is_active() {
+        anyhow::bail!(
+            "experimental HDR session is not the active libseat session; refusing to initialize KMS"
+        );
+    }
 
     // setup input
     let libinput_context = init_libinput(dh, &session, &event_loop.handle())
@@ -145,11 +176,22 @@ pub fn init_backend(
 
     // manually add already present gpus
     let mut outputs = Vec::new();
+    let mut device_errors = Vec::new();
     for (dev, path) in udev_dispatcher.as_source_ref().device_list() {
         match state.device_added(dev, path, dh) {
             Ok(added) => outputs.extend(added),
-            Err(err) => warn!("Failed to add device {}: {:?}", path.display(), err),
+            Err(err) => {
+                warn!("Failed to add device {}: {:?}", path.display(), err);
+                device_errors.push(format!("{}: {err:#}", path.display()));
+            }
         }
+    }
+
+    if hdr_required && outputs.is_empty() {
+        anyhow::bail!(
+            "experimental HDR session found no usable DRM outputs; refusing to announce a blind session ({})",
+            device_errors.join("; ")
+        );
     }
 
     if let Err(err) = state.select_primary_gpu(dh) {
@@ -158,6 +200,11 @@ pub fn init_backend(
     state.update_default_feedback();
 
     if let Err(err) = state.refresh_output_config() {
+        if hdr_required {
+            return Err(err.context(
+                "required HDR output configuration failed; refusing to fall back to SDR",
+            ));
+        }
         info!(
             ?err,
             "Couldn't enable all found outputs, trying to disable outputs."
@@ -177,6 +224,23 @@ pub fn init_backend(
             if let Err(err) = state.refresh_output_config() {
                 error!("Couldn't enable any output: {}", err);
             }
+        }
+    }
+
+    if hdr_required {
+        let requested_output = hdr_policy
+            .primary_output()
+            .context("COSMIC_HDR_REQUIRE_ACTIVE needs an exact COSMIC_HDR_OUTPUT connector")?;
+        let hdr_active = outputs
+            .iter()
+            .find(|output| output.name() == requested_output)
+            .and_then(|output| output.user_data().get::<drm_helpers::HdrOutputState>())
+            .and_then(drm_helpers::HdrOutputState::staged)
+            .is_some();
+        if !hdr_active {
+            anyhow::bail!(
+                "required HDR output {requested_output} was not activated; refusing to announce the desktop session"
+            );
         }
     }
 
@@ -896,6 +960,52 @@ impl KmsGuard<'_> {
             .collect()
     }
 
+    /// Live-apply a changed HDR reference white ("SDR brightness") to active
+    /// HDR outputs without a full output reconfiguration or modeset.
+    pub fn update_hdr_reference_white(&mut self) {
+        for device in self.drm_devices.values_mut() {
+            for surface in device.inner.surfaces.values_mut() {
+                let (hdr_active, previous) = surface.hdr_rendering();
+                if !hdr_active {
+                    continue;
+                }
+                let Some(active) = surface
+                    .output
+                    .user_data()
+                    .get::<drm_helpers::HdrOutputState>()
+                    .and_then(drm_helpers::HdrOutputState::staged)
+                else {
+                    continue;
+                };
+                let ceiling = active
+                    .capabilities
+                    .max_luminance
+                    .max(cosmic_comp_config::HDR_REFERENCE_WHITE_MIN);
+                let white = requested_reference_white(&surface.output).min(f32::from(ceiling));
+                if (white - previous).abs() > f32::EPSILON {
+                    surface.prepare_hdr_rendering(true, white);
+                    if let Some(state) = surface
+                        .output
+                        .user_data()
+                        .get::<drm_helpers::HdrOutputState>()
+                        && let Some(mut active) = state.staged()
+                    {
+                        active.reference_white = white as u16;
+                        state.stage(Some(active));
+                    }
+                    info!(
+                        output = %surface.output.name(),
+                        reference_white = white,
+                        "live HDR reference white update"
+                    );
+                }
+            }
+        }
+        // Keep the published per-output status (slider UIs) in sync with live
+        // changes, not only with full output reconfigurations.
+        self.publish_hdr_output_state();
+    }
+
     pub fn apply_config_for_outputs(
         &mut self,
         test_only: bool,
@@ -1049,9 +1159,28 @@ impl KmsGuard<'_> {
             // reconfigure existing
             for (crtc, surface) in device.inner.surfaces.iter_mut() {
                 let output_config = CompOutputConfig(surface.output.config());
+                let hdr_policy = hdr_policy();
+                let environment_output = hdr_policy.output_requested(&surface.output.name());
+                let hdr_primary = hdr_policy
+                    .primary_output()
+                    .is_some_and(|primary| primary == surface.output.name());
+                let hdr_requested = hdr_policy.experiment_enabled
+                    && crate::utils::env::hdr_enabled_override(&surface.output.name())
+                        .unwrap_or(output_config.0.hdr_enabled == Some(true) || environment_output);
+                let mut hdr_reference_white = requested_reference_white(&surface.output);
+                let requested_vrr = output_config.0.vrr;
+                let requested_max_bpc = output_config.0.max_bpc;
+                let vrr_target_rate = output_config.0.vrr_target_rate;
 
                 let drm = &mut device.drm;
                 let conn = surface.connector;
+                // Probed unconditionally: settings UIs need to know which
+                // panels can do HDR before it is ever enabled.
+                let hdr_capabilities = drm_helpers::edid_info(drm.device(), conn)
+                    .ok()
+                    .as_ref()
+                    .and_then(drm_helpers::hdr_sink_capabilities);
+                surface.hdr_sink_capabilities = hdr_capabilities;
                 let conn_info = drm.device().get_connector(conn, false)?;
                 let mode = conn_info
                     .modes()
@@ -1067,6 +1196,7 @@ impl KmsGuard<'_> {
                         (output_config.0.mode.1.unwrap() as i32 - refresh_rate as i32).abs()
                     })
                     .ok_or(anyhow::anyhow!("Unable to find matching mode"))?;
+                std::mem::drop(output_config);
 
                 if !test_only {
                     if !surface.is_active() {
@@ -1139,7 +1269,8 @@ impl KmsGuard<'_> {
                             compositor
                         };
 
-                        if let Some(bpc) = output_config.0.max_bpc
+                        if !hdr_requested
+                            && let Some(bpc) = requested_max_bpc
                             && let Err(err) = drm_helpers::set_max_bpc(drm.device(), conn, bpc)
                         {
                             warn!(
@@ -1150,11 +1281,136 @@ impl KmsGuard<'_> {
                             );
                         }
 
-                        let vrr = output_config.0.vrr;
-                        let vrr_target_rate = output_config.0.vrr_target_rate;
-                        std::mem::drop(output_config);
+                        let mut hdr_active = false;
+                        let mut active_hdr_output = None;
+                        let mut compositor_ref =
+                            drm.compositors().get(crtc).unwrap().lock().unwrap();
+                        if hdr_requested {
+                            let format = compositor_ref.format();
+                            let ten_bit_scanout =
+                                matches!(format, Fourcc::Abgr2101010 | Fourcc::Argb2101010);
+                            let colorspaces = compositor_ref.supported_colorspaces(conn);
+                            let metadata_supported = compositor_ref.hdr_metadata_supported(conn);
+                            let bpc_range = compositor_ref.max_bpc_range(conn);
+                            let hdr_max_bpc = bpc_range
+                                .as_ref()
+                                .ok()
+                                .and_then(|range| drm_helpers::hdr_max_bpc_value(range.as_ref()));
 
-                        let compositor_ref = drm.compositors().get(crtc).unwrap().lock().unwrap();
+                            match (
+                                hdr_capabilities,
+                                &colorspaces,
+                                &metadata_supported,
+                                hdr_max_bpc,
+                            ) {
+                                (Some(caps), Ok(colorspaces), Ok(true), Some(max_bpc))
+                                    if ten_bit_scanout
+                                        && colorspaces.contains(&Colorspace::Bt2020Rgb) =>
+                                {
+                                    // "Max brightness" is per panel: never map SDR white
+                                    // above what this sink reports as its peak luminance.
+                                    hdr_reference_white = hdr_reference_white.min(f32::from(
+                                        caps.max_luminance
+                                            .max(cosmic_comp_config::HDR_REFERENCE_WHITE_MIN),
+                                    ));
+                                    let state = ConnectorColorState {
+                                        colorspace: Colorspace::Bt2020Rgb,
+                                        hdr_metadata: Some(caps.output_metadata(
+                                            hdr_policy.metadata_luminance_from_panel,
+                                        )),
+                                        max_bpc,
+                                    };
+                                    match compositor_ref.use_color_state(state) {
+                                        Ok(()) => {
+                                            hdr_active = true;
+                                            active_hdr_output =
+                                                Some(drm_helpers::ActiveHdrOutput {
+                                                    capabilities: caps,
+                                                    reference_white: hdr_reference_white as u16,
+                                                });
+                                            info!(
+                                                output = %surface.output.name(),
+                                                ?format,
+                                                peak_luminance = caps.max_luminance,
+                                                min_luminance = caps.min_luminance,
+                                                reference_white = hdr_reference_white,
+                                                ?max_bpc,
+                                                "staged experimental HDR10 output state"
+                                            );
+                                        }
+                                        Err(err) => {
+                                            if hdr_policy.require_active && hdr_primary {
+                                                let failure = anyhow::anyhow!(
+                                                    "required HDR atomic TEST_ONLY validation failed for {}: {err}",
+                                                    surface.output.name()
+                                                );
+                                                std::mem::drop(compositor_ref);
+                                                std::mem::forget(compositor);
+                                                return Err(failure);
+                                            }
+                                            warn!(
+                                                output = %surface.output.name(),
+                                                ?err,
+                                                "HDR atomic TEST_ONLY validation failed; keeping SDR"
+                                            );
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    if hdr_policy.require_active && hdr_primary {
+                                        let failure = anyhow::anyhow!(
+                                            "required 10-bit/PQ/BT.2020 path is unavailable for {} (format={format:?}, capabilities={hdr_capabilities:?}, colorspaces={colorspaces:?}, metadata={metadata_supported:?}, bpc={bpc_range:?})",
+                                            surface.output.name()
+                                        );
+                                        std::mem::drop(compositor_ref);
+                                        std::mem::forget(compositor);
+                                        return Err(failure);
+                                    }
+                                    warn!(
+                                        output = %surface.output.name(),
+                                        ?format,
+                                        ?hdr_capabilities,
+                                        ?colorspaces,
+                                        ?metadata_supported,
+                                        ?bpc_range,
+                                        "HDR requested but the complete 10-bit/PQ/BT.2020 path is unavailable; keeping SDR"
+                                    );
+                                }
+                            }
+                        }
+                        if !hdr_active
+                            && let Err(err) =
+                                compositor_ref.use_color_state(ConnectorColorState::default())
+                        {
+                            warn!(
+                                output = %surface.output.name(),
+                                ?err,
+                                "failed to stage explicit SDR connector state"
+                            );
+                        }
+
+                        surface
+                            .output
+                            .user_data()
+                            .insert_if_missing_threadsafe(drm_helpers::HdrOutputState::default);
+                        surface
+                            .output
+                            .user_data()
+                            .get::<drm_helpers::HdrOutputState>()
+                            .unwrap()
+                            .stage(active_hdr_output);
+
+                        // Queue shader state before Resume. The surface thread receives these
+                        // commands FIFO, and cannot render without the compositor handed over by
+                        // Resume, so its first frame always matches the staged connector state.
+                        surface.prepare_hdr_rendering(hdr_active, hdr_reference_white);
+
+                        // VRR was forced off during HDR bring-up out of
+                        // caution; HDR10 signalling and adaptive sync are
+                        // independent, and fixed-cadence presentation is
+                        // exactly the "forced vsync" feel gamers object to.
+                        let vrr = requested_vrr;
+
                         let vrr_support = compositor_ref
                             .vrr_supported(
                                 compositor_ref
@@ -1191,6 +1447,7 @@ impl KmsGuard<'_> {
                             Some(overlay_formats).filter(|f| !f.indexset().is_empty()),
                             Some(async_formats).filter(|f| !f.indexset().is_empty()),
                         );
+                        std::mem::drop(compositor_ref);
 
                         surface.output.set_adaptive_sync_support(vrr_support);
                         if match vrr_support {
@@ -1220,10 +1477,125 @@ impl KmsGuard<'_> {
                             );
                         }
                     } else {
-                        let vrr = output_config.0.vrr;
-                        let vrr_target_rate = output_config.0.vrr_target_rate;
-                        std::mem::drop(output_config);
-                        if vrr != surface.output.adaptive_sync() {
+                        let (hdr_active, previous_reference_white) = surface.hdr_rendering();
+                        if hdr_requested != hdr_active {
+                            // Live HDR toggle. The swapchain is 10-bit in both
+                            // modes (the device-wide format preference), so
+                            // switching only stages new connector color state
+                            // and flips the shader pipeline - the same
+                            // building blocks the initial setup uses; the next
+                            // frame commit applies it.
+                            surface
+                                .output
+                                .user_data()
+                                .insert_if_missing_threadsafe(drm_helpers::HdrOutputState::default);
+                            let mut compositor_ref =
+                                drm.compositors().get(crtc).unwrap().lock().unwrap();
+                            if hdr_requested {
+                                let format = compositor_ref.format();
+                                let colorspaces = compositor_ref.supported_colorspaces(conn);
+                                let metadata_supported =
+                                    compositor_ref.hdr_metadata_supported(conn);
+                                let bpc_range = compositor_ref.max_bpc_range(conn);
+                                let hdr_max_bpc = bpc_range.as_ref().ok().and_then(|range| {
+                                    drm_helpers::hdr_max_bpc_value(range.as_ref())
+                                });
+                                match (
+                                    hdr_capabilities,
+                                    &colorspaces,
+                                    &metadata_supported,
+                                    hdr_max_bpc,
+                                ) {
+                                    (Some(caps), Ok(colorspaces), Ok(true), Some(max_bpc))
+                                        if matches!(
+                                            format,
+                                            Fourcc::Abgr2101010 | Fourcc::Argb2101010
+                                        ) && colorspaces.contains(&Colorspace::Bt2020Rgb) =>
+                                    {
+                                        let white = hdr_reference_white.min(f32::from(
+                                            caps.max_luminance
+                                                .max(cosmic_comp_config::HDR_REFERENCE_WHITE_MIN),
+                                        ));
+                                        match compositor_ref.use_color_state(ConnectorColorState {
+                                            colorspace: Colorspace::Bt2020Rgb,
+                                            hdr_metadata: Some(caps.output_metadata(
+                                                hdr_policy.metadata_luminance_from_panel,
+                                            )),
+                                            max_bpc,
+                                        }) {
+                                            Ok(()) => {
+                                                surface.prepare_hdr_rendering(true, white);
+                                                surface
+                                                    .output
+                                                    .user_data()
+                                                    .get::<drm_helpers::HdrOutputState>()
+                                                    .unwrap()
+                                                    .stage(Some(drm_helpers::ActiveHdrOutput {
+                                                        capabilities: caps,
+                                                        reference_white: white as u16,
+                                                    }));
+                                                info!(
+                                                    output = %surface.output.name(),
+                                                    reference_white = white,
+                                                    "enabled HDR live"
+                                                );
+                                            }
+                                            Err(err) => warn!(
+                                                output = %surface.output.name(),
+                                                ?err,
+                                                "live HDR enable failed validation; keeping SDR"
+                                            ),
+                                        }
+                                    }
+                                    _ => warn!(
+                                        output = %surface.output.name(),
+                                        "HDR requested but the 10-bit/PQ/BT.2020 path is unavailable; keeping SDR"
+                                    ),
+                                }
+                            } else {
+                                if let Err(err) =
+                                    compositor_ref.use_color_state(ConnectorColorState::default())
+                                {
+                                    warn!(
+                                        output = %surface.output.name(),
+                                        ?err,
+                                        "failed to stage SDR connector state on live HDR disable"
+                                    );
+                                }
+                                surface.prepare_hdr_rendering(false, hdr_reference_white);
+                                surface
+                                    .output
+                                    .user_data()
+                                    .get::<drm_helpers::HdrOutputState>()
+                                    .unwrap()
+                                    .stage(None);
+                                info!(output = %surface.output.name(), "disabled HDR live");
+                            }
+                        } else if hdr_active
+                            && (hdr_reference_white - previous_reference_white).abs() > f32::EPSILON
+                        {
+                            surface.prepare_hdr_rendering(true, hdr_reference_white);
+                            if let Some(state) = surface
+                                .output
+                                .user_data()
+                                .get::<drm_helpers::HdrOutputState>()
+                                && let Some(mut active) = state.staged()
+                            {
+                                active.reference_white = hdr_reference_white as u16;
+                                state.stage(Some(active));
+                            }
+                        }
+                        // VRR was forced off during HDR bring-up out of
+                        // caution; HDR10 signalling and adaptive sync are
+                        // independent, and fixed-cadence presentation is
+                        // exactly the "forced vsync" feel gamers object to.
+                        let vrr = requested_vrr;
+                        // `LockedBackend::apply_config_for_outputs` publishes
+                        // the requested value on `Output` before entering the
+                        // KMS backend.  Compare against the mode actually sent
+                        // to the render thread; comparing against `Output`
+                        // made every live toggle look like a no-op.
+                        if surface.adaptive_sync_update_required(vrr) {
                             if match surface.output.adaptive_sync_support() {
                                 Some(VrrSupport::RequiresModeset)
                                     if vrr == AdaptiveSync::Enabled =>
@@ -1351,6 +1723,52 @@ impl KmsGuard<'_> {
             }
         }
 
+        if !test_only {
+            self.publish_hdr_output_state();
+        }
+
         Ok(())
+    }
+
+    /// Publish per-output HDR status as cosmic-config state so settings UIs can
+    /// scale their brightness sliders to each panel's EDID peak.
+    fn publish_hdr_output_state(&self) {
+        let mut status = std::collections::HashMap::new();
+        for device in self.drm_devices.values() {
+            for surface in device.inner.surfaces.values() {
+                let (hdr_active, reference_white) = surface.hdr_rendering();
+                let staged = surface
+                    .output
+                    .user_data()
+                    .get::<drm_helpers::HdrOutputState>()
+                    .and_then(drm_helpers::HdrOutputState::staged);
+                // Capable panels are listed even while running SDR, so
+                // settings UIs can offer the per-display HDR toggle.
+                let capabilities = staged
+                    .map(|active| active.capabilities)
+                    .or(surface.hdr_sink_capabilities);
+                if let Some(capabilities) = capabilities {
+                    status.insert(
+                        surface.output.name(),
+                        cosmic_comp_config::HdrOutputStatus {
+                            max_luminance: capabilities.max_luminance,
+                            reference_white: reference_white as u16,
+                            active: hdr_active && staged.is_some(),
+                            passthrough: surface.hdr_passthrough,
+                            capable: true,
+                        },
+                    );
+                }
+            }
+        }
+        match cosmic_config::Config::new_state("com.system76.CosmicComp", 1) {
+            Ok(state) => {
+                use cosmic_config::ConfigSet;
+                if let Err(err) = state.set("hdr_outputs", status) {
+                    warn!(?err, "failed to publish HDR output state");
+                }
+            }
+            Err(err) => warn!(?err, "failed to open cosmic-config state for HDR outputs"),
+        }
     }
 }

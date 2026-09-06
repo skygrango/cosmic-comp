@@ -13,16 +13,21 @@ use tracing::warn;
 
 use crate::backend::render::{
     element::AsGlowRenderer,
-    wayland::{blur_effect::BlurElement, clipped_surface::ClippedSurfaceRenderElement},
+    wayland::{
+        blur_effect::BlurElement, clipped_surface::ClippedSurfaceRenderElement,
+        hdr_surface::HdrSurfaceRenderElement,
+    },
 };
 
 pub mod blur_effect;
 pub mod clipped_surface;
+pub mod hdr_surface;
 
 render_elements! {
     pub SurfaceRenderElement<R> where R: AsGlowRenderer + ImportAll, R::TextureId: Send;
     Blur=BlurElement,
     Clipped=ClippedSurfaceRenderElement<R>,
+    Hdr=HdrSurfaceRenderElement<R>,
     Wayland=WaylandSurfaceRenderElement<R>,
 }
 
@@ -85,10 +90,21 @@ pub fn push_render_elements_from_surface_tree<R>(
                 };
 
                 if has_view {
+                    // `states` is already locked by the tree traversal; re-locking the
+                    // surface via `get_surface_description(surface)` deadlocks the render
+                    // thread (observed on hardware 2026-08-31).
+                    let description =
+                        smithay::wayland::color::management::surface_description_from_states(
+                            states,
+                        )
+                        .0;
+                    let pq_bt2020_content =
+                        description.is_some_and(|description| description.is_pq_bt2020());
+                    let scrgb_content = description.filter(|description| description.windows_scrgb);
                     match WaylandSurfaceRenderElement::from_surface(
                         renderer, surface, states, location, alpha, kind,
                     ) {
-                        Ok(Some(surface)) => {
+                        Ok(Some(element)) => {
                             let blur_geo = blur_geometry.unwrap_or(geometry);
                             blur = BlurElement::from_surface(
                                 renderer,
@@ -101,14 +117,29 @@ pub fn push_render_elements_from_surface_tree<R>(
                             let elem: SurfaceRenderElement<R> = if radii.iter().any(|r| *r != 0)
                                 && should_clip
                                 && ClippedSurfaceRenderElement::will_clip(
-                                    &surface, scale, geometry, radii,
+                                    &element, scale, geometry, radii,
                                 ) {
                                 ClippedSurfaceRenderElement::new(
-                                    renderer, surface, scale, geometry, radii,
+                                    renderer, element, scale, geometry, radii,
+                                )
+                                .into()
+                            } else if pq_bt2020_content {
+                                HdrSurfaceRenderElement::new(
+                                    element,
+                                    description
+                                        .and_then(|d| d.luminances)
+                                        .map(|(_min, _max, reference)| reference.max(80) as f32)
+                                        .unwrap_or(203.0),
+                                )
+                                .into()
+                            } else if let Some(description) = scrgb_content {
+                                HdrSurfaceRenderElement::new_scrgb(
+                                    element,
+                                    scrgb_reference_scale(&description),
                                 )
                                 .into()
                             } else {
-                                surface.into()
+                                element.into()
                             };
                             if let Some(push_below) = push_below.as_mut()
                                 && passed_main
@@ -142,4 +173,33 @@ pub fn push_render_elements_from_surface_tree<R>(
         },
         |_, _, _| true,
     );
+}
+
+/// Rescales an output's reference white for Windows-scRGB content: the
+/// encoding's 1.0 is its `max` luminance (80 cd/m²) and its SDR white is the
+/// `reference` (203 cd/m² per BT.2408), so mapping that reference onto the
+/// output's reference keeps SDR-in-scRGB at the same brightness as native SDR.
+fn scrgb_reference_scale(
+    description: &smithay::wayland::color::management::ImageDescription,
+) -> f32 {
+    description
+        .luminances
+        .map(|(_min, max, reference)| {
+            if reference == 0 {
+                1.0
+            } else {
+                max as f32 / reference as f32
+            }
+        })
+        .unwrap_or(80.0 / 203.0)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn scrgb_reference_scale_matches_windows_conventions() {
+        use smithay::wayland::color::management::ImageDescription;
+        let scale = super::scrgb_reference_scale(&ImageDescription::WINDOWS_SCRGB);
+        assert!((scale - 80.0 / 203.0).abs() < 1e-6);
+    }
 }

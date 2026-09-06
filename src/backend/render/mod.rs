@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use std::{
-    borrow::Borrow,
+    borrow::{Borrow, BorrowMut},
     cell::RefCell,
     collections::HashMap,
     ops::ControlFlow,
@@ -90,6 +90,8 @@ use smithay_egui::EguiState;
 pub mod animations;
 pub mod cursor;
 pub mod element;
+#[cfg(test)]
+mod hdr_test_vectors;
 pub mod shadow;
 pub mod wayland;
 use self::element::{AsGlowRenderer, CosmicElement};
@@ -101,6 +103,99 @@ pub type GlMultiRenderer<'a> =
 pub type GlMultiFrame<'a, 'frame, 'buffer> =
     MultiFrame<'a, 'a, 'frame, 'buffer, GbmGlowBackend<DrmDeviceFd>, GbmGlowBackend<DrmDeviceFd>>;
 pub type GlMultiError = MultiError<GbmGlowBackend<DrmDeviceFd>, GbmGlowBackend<DrmDeviceFd>>;
+
+static HDR_SDR_TEXTURE_SHADER: &str = include_str!("shaders/hdr_sdr_texture.frag");
+pub struct HdrSdrTextureShader(pub GlesTexProgram);
+
+/// CPU mirror of `decode_sdr` in the HDR shaders: `gamma == 0.0` is the
+/// piecewise sRGB curve, anything else a pure power law.
+fn decode_sdr(value: f32, gamma: f32) -> f32 {
+    if gamma > 0.0 {
+        value.max(0.0).powf(gamma)
+    } else if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn srgb_color_to_pq(color: Color32F, reference_white: f32) -> Color32F {
+    let policy = crate::utils::env::hdr_policy();
+    sdr_color_to_pq(
+        color,
+        reference_white,
+        policy.sdr_gamma,
+        policy.gamut_stretch,
+    )
+}
+
+fn sdr_color_to_pq(
+    color: Color32F,
+    reference_white: f32,
+    sdr_gamma: f32,
+    gamut_stretch: f32,
+) -> Color32F {
+    let alpha = color.a();
+    let unpremultiply = |value: f32| if alpha > 0.00001 { value / alpha } else { 0.0 };
+    let decode = |value: f32| decode_sdr(value, sdr_gamma);
+    let pq = |value: f32| {
+        const M1: f32 = 0.159_301_76;
+        const M2: f32 = 78.84375;
+        const C1: f32 = 0.8359375;
+        const C2: f32 = 18.851_563;
+        const C3: f32 = 18.6875;
+        let p = value.max(0.0).powf(M1);
+        ((C1 + C2 * p) / (1.0 + C3 * p)).powf(M2)
+    };
+
+    let r = decode(unpremultiply(color.r()));
+    let g = decode(unpremultiply(color.g()));
+    let b = decode(unpremultiply(color.b()));
+    let stretch = gamut_stretch.clamp(0.0, 1.0);
+    let mix = |converted: f32, native: f32| converted + (native - converted) * stretch;
+    let scale = reference_white.clamp(80.0, 10_000.0) / 10_000.0;
+    Color32F::new(
+        pq(mix(0.627404 * r + 0.329282 * g + 0.043314 * b, r) * scale) * alpha,
+        pq(mix(0.069097 * r + 0.919540 * g + 0.011362 * b, g) * scale) * alpha,
+        pq(mix(0.016392 * r + 0.088013 * g + 0.895595 * b, b) * scale) * alpha,
+        alpha,
+    )
+}
+
+/// Configure default texture and solid-color draws for a frame whose client
+/// buffers are already PQ/BT.2020. HDR-tagged surface elements temporarily
+/// suspend the texture override around their own draw.
+pub fn set_hdr_client_blend<R: AsGlowRenderer>(renderer: &mut R, reference_white: Option<f32>) {
+    let gles = BorrowMut::<GlesRenderer>::borrow_mut(renderer.glow_renderer_mut());
+    if let Some(reference_white) = reference_white {
+        let program = gles
+            .egl_context()
+            .user_data()
+            .get::<HdrSdrTextureShader>()
+            .expect("custom shaders not initialized")
+            .0
+            .clone();
+        gles.set_default_tex_program_override(Some((
+            program,
+            vec![
+                Uniform::new("hdr_reference_white", reference_white),
+                Uniform::new("hdr_sdr_gamma", crate::utils::env::hdr_policy().sdr_gamma),
+                Uniform::new(
+                    "hdr_gamut_stretch",
+                    crate::utils::env::hdr_policy().gamut_stretch,
+                ),
+                Uniform::new("hdr_input_pq", 0.0_f32),
+                Uniform::new("hdr_content_reference", 203.0_f32),
+            ],
+        )));
+        gles.set_solid_color_transform(Some(Box::new(move |color| {
+            srgb_color_to_pq(color, reference_white)
+        })));
+    } else {
+        gles.set_default_tex_program_override(None);
+        gles.set_solid_color_transform(None);
+    }
+}
 
 pub enum RendererRef<'a> {
     Glow(&'a mut GlowRenderer),
@@ -286,10 +381,10 @@ impl IndicatorShader {
                     Uniform::new(
                         "radius",
                         [
-                            outer_radius[0] as f32,
-                            outer_radius[1] as f32,
-                            outer_radius[2] as f32,
                             outer_radius[3] as f32,
+                            outer_radius[1] as f32,
+                            outer_radius[0] as f32,
+                            outer_radius[2] as f32,
                         ],
                     ),
                     Uniform::new("scale", scale as f32),
@@ -421,6 +516,20 @@ pub fn init_shaders(renderer: &mut GlesRenderer) -> Result<(), GlesError> {
         &[
             UniformName::new("invert", UniformType::_1f),
             UniformName::new("color_mode", UniformType::_1f),
+            UniformName::new("hdr_enabled", UniformType::_1f),
+            UniformName::new("hdr_reference_white", UniformType::_1f),
+            UniformName::new("hdr_sdr_gamma", UniformType::_1f),
+            UniformName::new("hdr_gamut_stretch", UniformType::_1f),
+        ],
+    )?;
+    let hdr_sdr_texture_shader = renderer.compile_custom_texture_shader(
+        HDR_SDR_TEXTURE_SHADER,
+        &[
+            UniformName::new("hdr_reference_white", UniformType::_1f),
+            UniformName::new("hdr_sdr_gamma", UniformType::_1f),
+            UniformName::new("hdr_gamut_stretch", UniformType::_1f),
+            UniformName::new("hdr_input_pq", UniformType::_1f),
+            UniformName::new("hdr_content_reference", UniformType::_1f),
         ],
     )?;
     let clipping_shader = renderer.compile_custom_texture_shader(
@@ -457,6 +566,9 @@ pub fn init_shaders(renderer: &mut GlesRenderer) -> Result<(), GlesError> {
     egl_context
         .user_data()
         .insert_if_missing(|| PostprocessShader(postprocess_shader));
+    egl_context
+        .user_data()
+        .insert_if_missing(|| HdrSdrTextureShader(hdr_sdr_texture_shader));
     egl_context
         .user_data()
         .insert_if_missing(|| ClippingShader(clipping_shader));
@@ -1123,6 +1235,24 @@ pub struct PostprocessState {
     pub output_config: PostprocessOutputConfig,
 }
 
+/// Pick the SDR render target that feeds the HDR post-processing shader.
+///
+/// A ten-bit scanout format does not imply that rendering to and sampling an
+/// offscreen texture with that format is reliable. The compositor contents at
+/// this point are still sRGB, so use the matching, widely-supported eight-bit
+/// channel layout and let the final shader write PQ into the ten-bit scanout FB.
+pub fn postprocess_intermediate_format(output_format: Fourcc, hdr_enabled: bool) -> Fourcc {
+    if !hdr_enabled {
+        return output_format;
+    }
+
+    match output_format {
+        Fourcc::Abgr2101010 => Fourcc::Abgr8888,
+        Fourcc::Argb2101010 => Fourcc::Argb8888,
+        _ => output_format,
+    }
+}
+
 impl PostprocessState {
     pub fn new_with_renderer<R: AsGlowRenderer>(
         renderer: &mut R,
@@ -1378,6 +1508,10 @@ where
                                 .map(|val| val as u8 as f32)
                                 .unwrap_or(0.),
                         ),
+                        Uniform::new("hdr_enabled", 0.0_f32),
+                        Uniform::new("hdr_reference_white", 203.0_f32),
+                        Uniform::new("hdr_sdr_gamma", 0.0_f32),
+                        Uniform::new("hdr_gamut_stretch", 0.0_f32),
                     ],
                 );
                 constrain_render_elements(

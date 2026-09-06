@@ -7,7 +7,7 @@ use crate::{
             CLEAR_COLOR, CursorMode, GlMultiError, GlMultiRenderer, PostprocessOutputConfig,
             PostprocessShader, PostprocessState,
             element::{CosmicElement, DamageElement},
-            init_shaders, output_elements,
+            init_shaders, output_elements, postprocess_intermediate_format, set_hdr_client_blend,
         },
     },
     config::ScreenFilter,
@@ -62,7 +62,7 @@ use smithay::{
             utils::with_renderer_surface_state,
         },
     },
-    desktop::utils::OutputPresentationFeedback,
+    desktop::utils::{OutputPresentationFeedback, with_surfaces_surface_tree},
     output::{Output, OutputNoMode},
     reexports::{
         calloop::{
@@ -95,8 +95,8 @@ use std::{
     collections::{HashMap, HashSet, hash_map},
     mem,
     sync::{
-        Arc, LazyLock, RwLock,
-        atomic::{AtomicBool, Ordering},
+        Arc, LazyLock, Mutex, OnceLock, RwLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{Receiver, SyncSender},
     },
     thread::JoinHandle,
@@ -105,6 +105,69 @@ use std::{
 
 mod timings;
 pub use self::timings::Timings;
+
+/// One-line inventory of a surface tree's color descriptions and buffer
+/// formats, for the passthrough-change telemetry: shows exactly what clients
+/// and drivers attached to each (sub)surface.
+fn describe_hdr_surface_tree(surface: &WlSurface) -> String {
+    let mut parts = Vec::new();
+    with_surfaces_surface_tree(surface, |_, states| {
+        let description =
+            smithay::wayland::color::management::surface_description_from_states(states).0;
+        let kind = match description {
+            None => "untagged".to_string(),
+            Some(desc) => format!(
+                "tf={:?} primaries={:?} scrgb={} bt2100={}",
+                desc.transfer, desc.primaries.named, desc.windows_scrgb, desc.windows_bt2100
+            ),
+        };
+        let buffer = states
+            .data_map
+            .get::<smithay::backend::renderer::utils::RendererSurfaceStateUserData>()
+            .and_then(|data| {
+                let data = data.lock().unwrap();
+                let size = data.buffer_size();
+                data.buffer().map(|buffer| {
+                    use smithay::backend::allocator::Buffer as _;
+                    let format = smithay::wayland::dmabuf::get_dmabuf(buffer)
+                        .map(|dmabuf| format!("{:?}", dmabuf.format().code))
+                        .unwrap_or_else(|_| "shm/unknown".to_string());
+                    format!("{format} {size:?}")
+                })
+            })
+            .unwrap_or_else(|| "nobuffer".to_string());
+        parts.push(format!("[{kind} | {buffer}]"));
+    });
+    parts.join(" ")
+}
+
+/// Whether any surface in the tree asked for tearing presentation via
+/// `wp_tearing_control_v1`. Same locking rule as the description gates: read
+/// from `states` inside the traversal, never re-lock the surface.
+fn surface_tree_prefers_async(surface: &WlSurface) -> bool {
+    let mut found = false;
+    with_surfaces_surface_tree(surface, |_, states| {
+        if smithay::wayland::tearing_control::prefer_async_from_states(states) {
+            found = true;
+        }
+    });
+    found
+}
+
+fn surface_tree_has_hdr_client_description(surface: &WlSurface) -> bool {
+    let mut found = false;
+    // The traversal callback runs with each surface's state lock held, so the
+    // description must be read from `states`, never via `get_surface_description`.
+    with_surfaces_surface_tree(surface, |_, states| {
+        if smithay::wayland::color::management::surface_description_from_states(states)
+            .0
+            .is_some_and(|description| description.is_pq_bt2020() || description.windows_scrgb)
+        {
+            found = true;
+        }
+    });
+    found
+}
 
 use super::{drm_helpers, render::gles::GbmGlowBackend};
 
@@ -138,8 +201,14 @@ pub struct Surface {
     thread_command: Sender<ThreadCommand>,
     thread_token: RegistrationToken,
     thread: Option<JoinHandle<()>>,
+    emergency_shutdown_id: Option<u64>,
 
     dpms: bool,
+    adaptive_sync_mode: AdaptiveSync,
+    hdr_enabled: bool,
+    pub(super) hdr_passthrough: bool,
+    pub(super) hdr_sink_capabilities: Option<drm_helpers::HdrSinkCapabilities>,
+    hdr_reference_white: f32,
 }
 
 pub struct SurfaceThreadState {
@@ -161,6 +230,10 @@ pub struct SurfaceThreadState {
     output: Output,
     mirroring: Option<Output>,
     screen_filter: ScreenFilter,
+    hdr_enabled: bool,
+    hdr_reference_white: f32,
+    hdr_passthrough_reported: bool,
+    tearing_reported: bool,
     postprocess_textures: HashMap<DrmNode, PostprocessState>,
 
     shell: Arc<parking_lot::RwLock<Shell>>,
@@ -184,6 +257,42 @@ pub struct SurfaceThreadState {
     /// Plot name for the presentation misprediction plot.
     presentation_misprediction_plot_name: tracy_client::PlotName,
     sequence_delta_plot_name: tracy_client::PlotName,
+}
+
+static HDR_SURFACE_SENDERS: OnceLock<Mutex<HashMap<u64, Sender<ThreadCommand>>>> = OnceLock::new();
+static NEXT_HDR_SURFACE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn register_hdr_surface(sender: Sender<ThreadCommand>) -> u64 {
+    let id = NEXT_HDR_SURFACE_ID.fetch_add(1, Ordering::Relaxed);
+    HDR_SURFACE_SENDERS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(id, sender);
+    id
+}
+
+/// Stop strict-HDR surface threads without relying on the compositor's main
+/// event loop. A blocked Wayland/config callback must not prevent connector
+/// color state from being cleared before an external watchdog ends the process.
+pub fn emergency_shutdown_hdr_surfaces() {
+    let senders = HDR_SURFACE_SENDERS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    for sender in senders {
+        let _ = sender.send(ThreadCommand::End);
+    }
+}
+
+/// Receives from a surface-thread channel, bounded by the teardown timeout in
+/// strict HDR mode so a wedged thread cannot hang the compositor forever.
+fn recv_bounded<T>(rx: Receiver<T>) -> Result<T, String> {
+    rx.recv_timeout(crate::utils::env::hdr_policy().teardown_timeout)
+        .map_err(|err| err.to_string())
 }
 
 pub type GbmDrmOutput = DrmOutput<
@@ -235,6 +344,10 @@ pub enum ThreadCommand {
     },
     UpdateMirroring(Option<Output>),
     UpdateScreenFilter(ScreenFilter),
+    UpdateHdr {
+        enabled: bool,
+        reference_white: f32,
+    },
     VBlank(Option<DrmEventMetadata>),
     ScheduleRender(bool),
     AdaptiveSyncAvailable(SyncSender<Result<VrrSupport>>),
@@ -243,6 +356,7 @@ pub enum ThreadCommand {
     AllowFrameFlags(bool, FrameFlags),
     End,
     DpmsOff,
+    DpmsOn,
 }
 
 #[derive(Debug)]
@@ -250,6 +364,9 @@ pub enum SurfaceCommand {
     SignalFIFO,
     SendFrames(usize),
     RenderStates(RenderElementStates),
+    FatalRenderError(String),
+    /// The render thread's HDR client passthrough state changed.
+    HdrPassthrough(bool),
 }
 
 #[derive(Debug, Default)]
@@ -370,9 +487,34 @@ impl Surface {
                             }
                         });
                 }
+                Event::Msg(SurfaceCommand::HdrPassthrough(active)) => {
+                    {
+                        let kms = state.backend.kms();
+                        if let Some(surface) = kms
+                            .drm_devices
+                            .get_mut(&dev_node)
+                            .and_then(|device| device.inner.surfaces.get_mut(&crtc))
+                        {
+                            surface.hdr_passthrough = active;
+                        }
+                    }
+                    state
+                        .backend
+                        .kms()
+                        .lock_devices()
+                        .publish_hdr_output_state();
+                }
+                Event::Msg(SurfaceCommand::FatalRenderError(err)) => {
+                    error!(output = %output_clone.name(), %err, "strict HDR output failed after activation; ending session");
+                    state.common.should_stop = true;
+                    state.common.event_loop_signal.stop();
+                    state.common.event_loop_signal.wakeup();
+                }
                 Event::Closed => {}
             })
             .map_err(|_| anyhow::anyhow!("Failed to establish channel to surface thread"))?;
+
+        let emergency_shutdown_id = Some(register_hdr_surface(tx.clone()));
 
         Ok(Surface {
             connector,
@@ -388,7 +530,13 @@ impl Surface {
             thread_command: tx,
             thread_token,
             thread: Some(thread),
+            emergency_shutdown_id,
             dpms: true,
+            adaptive_sync_mode: AdaptiveSync::Disabled,
+            hdr_enabled: false,
+            hdr_passthrough: false,
+            hdr_sink_capabilities: None,
+            hdr_reference_white: 203.0,
         })
     }
 
@@ -409,7 +557,7 @@ impl Surface {
             egl,
             sync: tx,
         });
-        let _ = rx.recv();
+        self.wait_for_surface_ack(rx, "adding renderer node");
     }
 
     pub fn remove_node(&mut self, node: DrmNode) {
@@ -421,7 +569,7 @@ impl Surface {
             .send(ThreadCommand::NodeRemoved { node, sync: tx });
         // Block so we can be sure the file descriptor is closed
         // (which is relevant for the udev device_removed callback).
-        let _ = rx.recv();
+        self.wait_for_surface_ack(rx, "removing renderer node");
     }
 
     pub fn on_vblank(&self, metadata: Option<DrmEventMetadata>) {
@@ -456,18 +604,42 @@ impl Surface {
             .send(ThreadCommand::UpdateScreenFilter(config));
     }
 
+    /// Queue HDR shader state before `resume`. FIFO command ordering ensures
+    /// that a newly resumed output cannot render before this state is applied.
+    pub fn prepare_hdr_rendering(&mut self, enabled: bool, reference_white: f32) {
+        self.hdr_enabled = enabled;
+        self.hdr_reference_white = reference_white.clamp(80.0, 10_000.0);
+        let _ = self.thread_command.send(ThreadCommand::UpdateHdr {
+            enabled,
+            reference_white: self.hdr_reference_white,
+        });
+    }
+
+    pub fn hdr_rendering(&self) -> (bool, f32) {
+        (self.hdr_enabled, self.hdr_reference_white)
+    }
+
     pub fn adaptive_sync_support(&self) -> Result<VrrSupport> {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let _ = self
             .thread_command
             .send(ThreadCommand::AdaptiveSyncAvailable(tx));
-        rx.recv().context("Surface thread died")?
+        recv_bounded(rx).map_err(|err| anyhow::anyhow!("surface thread VRR query failed: {err}"))?
     }
 
     pub fn use_adaptive_sync(&mut self, vrr: AdaptiveSync) {
-        let _ = self
+        if self
             .thread_command
-            .send(ThreadCommand::UseAdaptiveSync(vrr));
+            .send(ThreadCommand::UseAdaptiveSync(vrr))
+            .is_ok()
+        {
+            self.adaptive_sync_mode = vrr;
+        }
+    }
+
+    /// Whether the render thread still needs the requested adaptive-sync mode.
+    pub fn adaptive_sync_update_required(&self, requested: AdaptiveSync) -> bool {
+        adaptive_sync_update_required(requested, self.adaptive_sync_mode)
     }
 
     pub fn set_vrr_target_rate(&mut self, rate: u32) {
@@ -485,7 +657,7 @@ impl Surface {
     pub fn suspend(&mut self) {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let _ = self.thread_command.send(ThreadCommand::Suspend(tx));
-        let _ = rx.recv();
+        self.wait_for_surface_ack(rx, "suspending output");
     }
 
     pub fn resume(
@@ -515,7 +687,7 @@ impl Surface {
         if self.dpms != on {
             self.dpms = on;
             if on {
-                self.schedule_render();
+                let _ = self.thread_command.send(ThreadCommand::DpmsOn);
             } else {
                 let _ = self.thread_command.send(ThreadCommand::DpmsOff);
             }
@@ -527,14 +699,55 @@ impl Surface {
         std::mem::drop(self);
         if let Some(thread) = thread {
             let name = thread.thread().name().unwrap().to_string();
+            {
+                let deadline =
+                    std::time::Instant::now() + crate::utils::env::hdr_policy().teardown_timeout;
+                while !thread.is_finished() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                if !thread.is_finished() {
+                    warn!(
+                        output = %name,
+                        operation = "drop_and_join",
+                        "surface thread did not stop before the strict HDR deadline; detaching it"
+                    );
+                    return;
+                }
+            }
             let _ = thread.join();
             info!("Thread {} terminated.", name)
         }
+    }
+
+    fn wait_for_surface_ack(&self, rx: Receiver<()>, operation: &'static str) {
+        if let Err(err) = recv_bounded(rx) {
+            warn!(
+                output = %self.output.name(),
+                operation,
+                %err,
+                "surface-thread synchronization failed"
+            );
+        }
+    }
+
+    /// Ask the surface thread to stop and return its join handle without waiting.
+    ///
+    /// The compositor owned by that thread is dropped while the DRM device is still
+    /// active, allowing its atomic surface to clear persistent connector color state.
+    pub fn begin_shutdown(mut self) -> Option<JoinHandle<()>> {
+        let thread = self.thread.take();
+        std::mem::drop(self);
+        thread
     }
 }
 
 impl Drop for Surface {
     fn drop(&mut self) {
+        if let Some(id) = self.emergency_shutdown_id.take()
+            && let Some(senders) = HDR_SURFACE_SENDERS.get()
+        {
+            senders.lock().unwrap().remove(&id);
+        }
         let _ = self.thread_command.send(ThreadCommand::End);
         self.loop_handle.remove(self.thread_token);
         if let Some(thread) = self.thread.take() {
@@ -547,6 +760,13 @@ impl Drop for Surface {
             */
         }
     }
+}
+
+fn adaptive_sync_update_required(
+    requested: AdaptiveSync,
+    render_thread_mode: AdaptiveSync,
+) -> bool {
+    requested != render_thread_mode
 }
 
 fn surface_thread(
@@ -609,6 +829,10 @@ fn surface_thread(
         output,
         mirroring: None,
         screen_filter,
+        hdr_enabled: false,
+        hdr_reference_white: 203.0,
+        hdr_passthrough_reported: false,
+        tearing_reported: false,
         postprocess_textures: HashMap::new(),
 
         shell,
@@ -668,6 +892,33 @@ fn surface_thread(
             Event::Msg(ThreadCommand::UpdateScreenFilter(filter_config)) => {
                 state.update_screen_filter(filter_config);
             }
+            Event::Msg(ThreadCommand::UpdateHdr {
+                enabled,
+                reference_white,
+            }) => {
+                state.hdr_enabled = enabled;
+                state.hdr_reference_white = reference_white.clamp(80.0, 10_000.0);
+                // Shader uniforms are not part of the texture's commit
+                // counter.  Recreate the post-process target so a live HDR
+                // policy change gets a fresh element identity and full redraw.
+                state.postprocess_textures.clear();
+                if enabled {
+                    state.frame_flags.remove(FrameFlags::ALLOW_SCANOUT);
+                } else {
+                    state.frame_flags.insert(FrameFlags::DEFAULT);
+                    if crate::utils::env::bool_var("COSMIC_DISABLE_DIRECT_SCANOUT").unwrap_or(false)
+                    {
+                        state.frame_flags.remove(FrameFlags::ALLOW_SCANOUT);
+                    } else if crate::utils::env::bool_var("COSMIC_DISABLE_OVERLAY_SCANOUT")
+                        .unwrap_or(false)
+                    {
+                        state
+                            .frame_flags
+                            .remove(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
+                    }
+                }
+                state.queue_redraw(false, false);
+            }
             Event::Msg(ThreadCommand::AdaptiveSyncAvailable(result)) => {
                 if let Some(compositor) = state.compositor.as_mut() {
                     let _ = result.send(
@@ -720,8 +971,18 @@ fn surface_thread(
                     };
                 }
             }
+            Event::Msg(ThreadCommand::DpmsOn) => {
+                if let Some(compositor) = state.compositor.as_mut()
+                    && let Err(err) = compositor.with_compositor(|c| c.reset_state())
+                {
+                    error!(?err, "failed to restore output state after DPMS");
+                }
+                state.queue_redraw(false, false);
+            }
             Event::Msg(ThreadCommand::AllowFrameFlags(flag, mut flags)) => {
-                if crate::utils::env::bool_var("COSMIC_DISABLE_DIRECT_SCANOUT").unwrap_or(false) {
+                if state.hdr_enabled
+                    || crate::utils::env::bool_var("COSMIC_DISABLE_DIRECT_SCANOUT").unwrap_or(false)
+                {
                     flags.remove(FrameFlags::ALLOW_SCANOUT);
                 }
                 if crate::utils::env::bool_var("COSMIC_DISABLE_OVERLAY_SCANOUT").unwrap_or(false) {
@@ -732,6 +993,9 @@ fn surface_thread(
                     state.frame_flags.insert(flags);
                 } else {
                     state.frame_flags.remove(flags);
+                }
+                if state.hdr_enabled {
+                    state.frame_flags.remove(FrameFlags::ALLOW_SCANOUT);
                 }
             }
             Event::Closed | Event::Msg(ThreadCommand::End) => {
@@ -1074,6 +1338,12 @@ impl SurfaceThreadState {
                 if let Err(err) = state.redraw(estimated_presentation) {
                     let name = state.output.name();
                     warn!(?name, "Failed to submit rendering: {:?}", err);
+                    if crate::utils::env::hdr_policy().require_active {
+                        let _ = state
+                            .thread_sender
+                            .send(SurfaceCommand::FatalRenderError(format!("{err:#}")));
+                        return TimeoutAction::Drop;
+                    }
                     state.queue_redraw(true, false);
                 }
                 TimeoutAction::Drop
@@ -1142,7 +1412,13 @@ impl SurfaceThreadState {
         let mut additional_frame_flags = FrameFlags::empty();
         let mut remove_frame_flags = FrameFlags::empty();
 
-        let (has_active_fullscreen, fullscreen_drives_refresh_rate, animations_going) = {
+        let (
+            has_active_fullscreen,
+            fullscreen_drives_refresh_rate,
+            animations_going,
+            has_hdr_fullscreen,
+            hdr_candidate,
+        ) = {
             let shell = self.shell.read();
             let animations_going = shell.animations_going();
             let output = self.mirroring.as_ref().unwrap_or(&self.output);
@@ -1156,11 +1432,114 @@ impl SurfaceThreadState {
                     recursive_frame_time_estimation(&self.clock, &surface)
                         .is_some_and(|dur| dur <= min_vrr_frame_time)
                 });
-                (true, drives_refresh_rate, animations_going)
+                let has_hdr = fullscreen_surface
+                    .wl_surface()
+                    .as_deref()
+                    .is_some_and(surface_tree_has_hdr_client_description);
+                let candidate = fullscreen_surface.wl_surface().as_deref().cloned();
+                (
+                    true,
+                    drives_refresh_rate,
+                    animations_going,
+                    has_hdr,
+                    candidate,
+                )
+            } else if self.hdr_enabled {
+                // winewayland offers no exclusive fullscreen, so HDR games
+                // arrive as borderless windows. Treat the focused window as
+                // the passthrough candidate when it covers the whole output
+                // and carries an HDR image description; without this, PQ
+                // client content would be run through the SDR-to-PQ shader
+                // and lose its highlight range.
+                let covering_candidate = if let Some((_, workspace)) =
+                    shell.workspaces.active(output)
+                {
+                    let seat = shell.seats.last_active();
+                    workspace
+                        .focus_stack
+                        .get(seat)
+                        .last()
+                        .and_then(|target| match target {
+                            crate::shell::focus::FocusTarget::Window(mapped) => Some(mapped),
+                            _ => None,
+                        })
+                        .filter(|mapped| {
+                            workspace.element_geometry(mapped).is_some_and(|geometry| {
+                                let geometry = geometry.as_logical();
+                                let output_size = output.geometry().size.as_logical();
+                                geometry.loc.x <= 0
+                                    && geometry.loc.y <= 0
+                                    && geometry.loc.x + geometry.size.w >= output_size.w
+                                    && geometry.loc.y + geometry.size.h >= output_size.h
+                            })
+                        })
+                        .and_then(|mapped| mapped.active_window().wl_surface().as_deref().cloned())
+                } else {
+                    None
+                };
+                let covering_hdr = covering_candidate
+                    .as_ref()
+                    .is_some_and(|surface| surface_tree_has_hdr_client_description(surface));
+                (
+                    covering_hdr,
+                    false,
+                    animations_going,
+                    covering_hdr,
+                    covering_candidate,
+                )
             } else {
-                (false, false, animations_going)
+                (false, false, animations_going, false, None)
             }
         };
+
+        let hdr_client_passthrough = self.hdr_enabled
+            && has_active_fullscreen
+            && has_hdr_fullscreen
+            && self.screen_filter.is_noop()
+            && self.mirroring.is_none();
+        if hdr_client_passthrough != self.hdr_passthrough_reported {
+            self.hdr_passthrough_reported = hdr_client_passthrough;
+            // warn-level so it reaches the journal; it only fires on change.
+            let details = hdr_candidate
+                .as_ref()
+                .map(describe_hdr_surface_tree)
+                .unwrap_or_default();
+            warn!(
+                output = %self.output.name(),
+                passthrough = hdr_client_passthrough,
+                covering_or_fullscreen = has_active_fullscreen,
+                hdr_description = has_hdr_fullscreen,
+                %details,
+                "HDR client passthrough changed"
+            );
+            let _ = self
+                .thread_sender
+                .send(SurfaceCommand::HdrPassthrough(hdr_client_passthrough));
+        }
+        set_hdr_client_blend(
+            &mut renderer,
+            hdr_client_passthrough.then_some(self.hdr_reference_white),
+        );
+        if hdr_client_passthrough {
+            additional_frame_flags |= FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT;
+        }
+
+        // Tearing: honor the fullscreen/covering client's async hint with real
+        // async page flips when the user allows it. The KMS layer falls back
+        // to synchronized flips whenever the kernel refuses to tear.
+        let tearing = crate::utils::env::tearing_allowed_for(&self.output.name())
+            && has_active_fullscreen
+            && hdr_candidate
+                .as_ref()
+                .is_some_and(|surface| surface_tree_prefers_async(surface));
+        if tearing != self.tearing_reported {
+            self.tearing_reported = tearing;
+            warn!(
+                output = %self.output.name(),
+                tearing,
+                "tearing presentation changed"
+            );
+        }
 
         if has_active_fullscreen || animations_going {
             // skip overlay plane assign if we have a fullscreen surface or dynamic contents to save on tests
@@ -1207,14 +1586,16 @@ impl SurfaceThreadState {
         };
 
         // actual rendering
+        let postprocess =
+            !self.screen_filter.is_noop() || (self.hdr_enabled && !hdr_client_passthrough);
         let source_output = self
             .mirroring
             .as_ref()
-            .or((!self.screen_filter.is_noop()).then_some(&self.output))
+            .or(postprocess.then_some(&self.output))
             .filter(|output| {
                 PostprocessOutputConfig::for_output_untransformed(output)
                     != PostprocessOutputConfig::for_output(&self.output)
-                    || !self.screen_filter.is_noop()
+                    || postprocess
             });
 
         let mut pre_postprocess_data = PrePostprocessData::default();
@@ -1222,14 +1603,19 @@ impl SurfaceThreadState {
         let res = if let Some(source_output) = source_output {
             let offscreen_output_config =
                 PostprocessOutputConfig::for_output_untransformed(source_output);
+            let intermediate_format =
+                postprocess_intermediate_format(compositor.format(), self.hdr_enabled);
             let postprocess_state = match self.postprocess_textures.entry(self.target_node) {
                 hash_map::Entry::Occupied(occupied) => {
                     let postprocess_state = occupied.into_mut();
-                    // If output config is different, re-create offscreen state
-                    if postprocess_state.output_config != offscreen_output_config {
+                    // If output config is different, or the offscreen buffer's
+                    // intermediate format changed.
+                    if postprocess_state.output_config != offscreen_output_config
+                        || postprocess_state.texture.format() != Some(intermediate_format)
+                    {
                         *postprocess_state = PostprocessState::new_with_renderer(
                             &mut renderer,
-                            compositor.format(),
+                            intermediate_format,
                             offscreen_output_config,
                         )?
                     }
@@ -1238,7 +1624,7 @@ impl SurfaceThreadState {
                 hash_map::Entry::Vacant(vacant) => {
                     vacant.insert(PostprocessState::new_with_renderer(
                         &mut renderer,
-                        compositor.format(),
+                        intermediate_format,
                         offscreen_output_config,
                     )?)
                 }
@@ -1394,18 +1780,19 @@ impl SurfaceThreadState {
                 &pre_postprocess_data,
                 postprocess_state,
                 &self.screen_filter,
+                self.hdr_enabled,
+                self.hdr_reference_white,
             );
 
             if let Err(err) = compositor.with_compositor(|c| c.use_vrr(vrr)) {
                 warn!("Unable to set adaptive VRR state: {}", err);
             }
 
-            // let presentation_mode = if self.output.is_foreground_fullscreen_occupied().is_some() {
-            //     additional_frame_flags |= FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY;
-            //     PresentationMode::Async
-            // } else {
-            //     PresentationMode::VSync
-            // };
+            let presentation_mode = if tearing {
+                PresentationMode::Async
+            } else {
+                PresentationMode::VSync
+            };
 
             compositor.render_frame(
                 &mut renderer,
@@ -1414,19 +1801,18 @@ impl SurfaceThreadState {
                 self.frame_flags
                     .union(additional_frame_flags)
                     .difference(remove_frame_flags),
-                PresentationMode::VSync,
+                presentation_mode,
             )
         } else {
             if let Err(err) = compositor.with_compositor(|c| c.use_vrr(vrr)) {
                 warn!("Unable to set adaptive VRR state: {}", err);
             }
 
-            // let presentation_mode = if self.output.is_foreground_fullscreen_occupied().is_some() {
-            //     additional_frame_flags |= FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY;
-            //     PresentationMode::Async
-            // } else {
-            //     PresentationMode::VSync
-            // };
+            let presentation_mode = if tearing {
+                PresentationMode::Async
+            } else {
+                PresentationMode::VSync
+            };
 
             compositor.render_frame(
                 &mut renderer,
@@ -1435,9 +1821,10 @@ impl SurfaceThreadState {
                 self.frame_flags
                     .union(additional_frame_flags)
                     .difference(remove_frame_flags),
-                PresentationMode::VSync,
+                presentation_mode,
             )
         };
+        set_hdr_client_blend(&mut renderer, None);
         self.timings.draw_done(&self.clock);
 
         match res {
@@ -1510,6 +1897,15 @@ impl SurfaceThreadState {
                         }
 
                         if x.is_ok() {
+                            if self.hdr_enabled
+                                && let Some(hdr_state) =
+                                    self.output.user_data().get::<drm_helpers::HdrOutputState>()
+                            {
+                                // TEST_ONLY validation is not enough to advertise HDR to
+                                // clients. Publish it only after the real frame commit was
+                                // accepted by KMS.
+                                hdr_state.commit();
+                            }
                             if self.mirroring.is_none() {
                                 self.frame_callback_seq = self.frame_callback_seq.wrapping_add(1);
                                 self.send_frame_callbacks();
@@ -2021,6 +2417,8 @@ fn postprocess_elements<'a>(
     pre_postprocess_data: &PrePostprocessData,
     postprocess_state: &PostprocessState,
     screen_filter: &ScreenFilter,
+    hdr_enabled: bool,
+    hdr_reference_white: f32,
 ) -> Vec<CosmicElement<GlMultiRenderer<'a>>> {
     let postprocess_texture_shader = Borrow::<GlesRenderer>::borrow(renderer.as_ref())
         .egl_context()
@@ -2061,6 +2459,13 @@ fn postprocess_elements<'a>(
                         .map(|val| val as u8 as f32)
                         .unwrap_or(0.),
                 ),
+                Uniform::new("hdr_enabled", if hdr_enabled { 1.0 } else { 0.0 }),
+                Uniform::new("hdr_reference_white", hdr_reference_white),
+                Uniform::new("hdr_sdr_gamma", crate::utils::env::hdr_policy().sdr_gamma),
+                Uniform::new(
+                    "hdr_gamut_stretch",
+                    crate::utils::env::hdr_policy().gamut_stretch,
+                ),
             ],
         ));
     }
@@ -2094,6 +2499,13 @@ fn postprocess_elements<'a>(
                     .color_filter
                     .map(|val| val as u8 as f32)
                     .unwrap_or(0.),
+            ),
+            Uniform::new("hdr_enabled", if hdr_enabled { 1.0 } else { 0.0 }),
+            Uniform::new("hdr_reference_white", hdr_reference_white),
+            Uniform::new("hdr_sdr_gamma", crate::utils::env::hdr_policy().sdr_gamma),
+            Uniform::new(
+                "hdr_gamut_stretch",
+                crate::utils::env::hdr_policy().gamut_stretch,
             ),
         ],
     ));
