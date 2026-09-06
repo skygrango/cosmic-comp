@@ -7,7 +7,10 @@ use smithay::{
     reexports::wayland_server::protocol::wl_surface,
     render_elements,
     utils::{Logical, Physical, Point, Rectangle, Scale},
-    wayland::compositor::{self, TraversalAction},
+    wayland::{
+        color::management::ImageDescription,
+        compositor::{self, TraversalAction},
+    },
 };
 use tracing::warn;
 
@@ -88,7 +91,7 @@ pub fn push_render_elements_from_surface_tree<R>(
                     match WaylandSurfaceRenderElement::from_surface(
                         renderer, surface, states, location, alpha, kind,
                     ) {
-                        Ok(Some(surface)) => {
+                        Ok(Some(element)) => {
                             let blur_geo = blur_geometry.unwrap_or(geometry);
                             blur = BlurElement::from_surface(
                                 renderer,
@@ -101,14 +104,14 @@ pub fn push_render_elements_from_surface_tree<R>(
                             let elem: SurfaceRenderElement<R> = if radii.iter().any(|r| *r != 0)
                                 && should_clip
                                 && ClippedSurfaceRenderElement::will_clip(
-                                    &surface, scale, geometry, radii,
+                                    &element, scale, geometry, radii,
                                 ) {
                                 ClippedSurfaceRenderElement::new(
-                                    renderer, surface, scale, geometry, radii,
+                                    renderer, element, scale, geometry, radii,
                                 )
                                 .into()
                             } else {
-                                surface.into()
+                                element.into()
                             };
                             if let Some(push_below) = push_below.as_mut()
                                 && passed_main
@@ -120,9 +123,9 @@ pub fn push_render_elements_from_surface_tree<R>(
                         }
                         Ok(None) => {} // surface is not mapped
                         Err(err) => {
-                            warn!("Failed to import surface: {}", err);
+                            warn!("Failed to import surface: {:?}", err);
                         }
-                    };
+                    }
                 }
             }
 
@@ -142,4 +145,33 @@ pub fn push_render_elements_from_surface_tree<R>(
         },
         |_, _, _| true,
     );
+}
+
+/// Rescales an output's reference white for Windows-scRGB content: the
+/// encoding's 1.0 is its `max` luminance (80 cd/m²) and its SDR white is the
+/// `reference` (203 cd/m² per BT.2408), so mapping that reference onto the
+/// output's reference keeps SDR-in-scRGB at the same brightness as native SDR.
+#[cfg_attr(not(test), allow(dead_code))]
+fn scrgb_reference_scale(description: &ImageDescription) -> f32 {
+    description
+        .luminances
+        .map(|(_min, max, reference)| {
+            if reference == 0 {
+                1.0
+            } else {
+                max as f32 / reference as f32
+            }
+        })
+        .unwrap_or(80.0 / 203.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scrgb_reference_scale_matches_windows_conventions() {
+        let scale = scrgb_reference_scale(&ImageDescription::WINDOWS_SCRGB);
+        assert!((scale - 80.0 / 203.0).abs() < 1e-6);
+    }
 }

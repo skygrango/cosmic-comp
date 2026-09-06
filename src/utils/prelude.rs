@@ -2,10 +2,16 @@ use cosmic_comp_config::output::comp::{AdaptiveSync, OutputConfig, OutputState};
 use parking_lot::RwLock;
 use smithay::{
     backend::drm::VrrSupport as Support,
+    desktop::utils::with_surfaces_surface_tree,
     output::{Output, WeakOutput},
     reexports::wayland_server::{Client, protocol::wl_surface::WlSurface},
     utils::Rectangle,
-    wayland::compositor::{Barrier, CompositorHandler},
+    wayland::{
+        color::management::surface_description_from_states,
+        compositor::{Barrier, CompositorHandler},
+        seat::WaylandFocus,
+        tearing_control::prefer_async_from_states,
+    },
 };
 
 pub use super::geometry::*;
@@ -52,14 +58,58 @@ pub trait OutputExt {
     fn set_avg_frametime(&self, duration: Option<Duration>);
     fn get_avg_frametime(&self) -> Option<Duration>;
 
-    fn set_fullscreen_occupied(&self, surface: Option<CosmicSurface>);
-    fn is_foreground_fullscreen_occupied(&self) -> Option<CosmicSurface>;
+    fn set_fullscreen_occupied(&self, occupied: Option<FullscreenOccupied>);
+    fn is_foreground_fullscreen_occupied(&self) -> Option<FullscreenOccupied>;
+    fn refresh_fullscreen_occupied_flags(&self);
 }
 
 struct Vrr(AtomicU8);
 struct VrrSupport(AtomicU8);
 struct Mirroring(Mutex<Option<WeakOutput>>);
-struct FullscreenOccupied(RwLock<Option<WeakCosmicSurface>>);
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FullscreenOccupied {
+    pub surface: CosmicSurface,
+    pub has_hdr: bool,
+    pub prefers_async: bool,
+}
+
+impl std::ops::Deref for FullscreenOccupied {
+    type Target = CosmicSurface;
+
+    fn deref(&self) -> &Self::Target {
+        &self.surface
+    }
+}
+
+impl FullscreenOccupied {
+    pub fn new(surface: CosmicSurface, has_hdr: bool, prefers_async: bool) -> Self {
+        Self {
+            surface,
+            has_hdr,
+            prefers_async,
+        }
+    }
+
+    #[inline]
+    pub fn hdr(&self) -> bool {
+        self.has_hdr
+    }
+
+    #[inline]
+    pub fn tearing(&self) -> bool {
+        self.prefers_async
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WeakFullscreenOccupied {
+    surface: WeakCosmicSurface,
+    has_hdr: bool,
+    prefers_async: bool,
+}
+
+struct OutputFullscreenOccupied(RwLock<Option<WeakFullscreenOccupied>>);
 
 #[derive(Debug, Clone)]
 pub struct FifoBarrierItem {
@@ -253,20 +303,107 @@ impl OutputExt for Output {
         *self.user_data().get::<AvgFrameTime>()?.0.read()
     }
 
-    fn set_fullscreen_occupied(&self, surface: Option<CosmicSurface>) {
+    fn set_fullscreen_occupied(&self, occupied: Option<FullscreenOccupied>) {
         let user_data = self.user_data();
-        user_data
-            .insert_if_missing_threadsafe(|| FullscreenOccupied(parking_lot::RwLock::new(None)));
-        let lock = &user_data.get::<FullscreenOccupied>().unwrap().0;
-        if lock.read().as_ref().and_then(|weak| weak.upgrade()) == surface {
+        user_data.insert_if_missing_threadsafe(|| {
+            OutputFullscreenOccupied(parking_lot::RwLock::new(None))
+        });
+        let lock = &user_data.get::<OutputFullscreenOccupied>().unwrap().0;
+        let should_update = match (&*lock.read(), &occupied) {
+            (Some(current), Some(next)) => {
+                current.surface.upgrade().as_ref() != Some(&next.surface)
+                    || current.has_hdr != next.has_hdr
+                    || current.prefers_async != next.prefers_async
+            }
+            (None, None) => false,
+            _ => true,
+        };
+        if !should_update {
             return;
         }
-        *lock.write() = surface.map(|s| s.downgrade());
+        *lock.write() = occupied.map(|occ| WeakFullscreenOccupied {
+            surface: occ.surface.downgrade(),
+            has_hdr: occ.has_hdr,
+            prefers_async: occ.prefers_async,
+        });
     }
 
-    fn is_foreground_fullscreen_occupied(&self) -> Option<CosmicSurface> {
-        self.user_data()
-            .get::<FullscreenOccupied>()
-            .and_then(|state| state.0.read().as_ref().and_then(|weak| weak.upgrade()))
+    fn is_foreground_fullscreen_occupied(&self) -> Option<FullscreenOccupied> {
+        let state = self.user_data().get::<OutputFullscreenOccupied>()?;
+        let guard = state.0.read();
+        let weak_occ = guard.as_ref()?;
+        let surface = weak_occ.surface.upgrade()?;
+        Some(FullscreenOccupied {
+            surface,
+            has_hdr: weak_occ.has_hdr,
+            prefers_async: weak_occ.prefers_async,
+        })
     }
+
+    fn refresh_fullscreen_occupied_flags(&self) {
+        let Some(state) = self.user_data().get::<OutputFullscreenOccupied>() else {
+            return;
+        };
+        let (surface, current_hdr, current_async) = {
+            let guard = state.0.read();
+            let Some(weak_occ) = guard.as_ref() else {
+                return;
+            };
+            let Some(surface) = weak_occ.surface.upgrade() else {
+                return;
+            };
+            (surface, weak_occ.has_hdr, weak_occ.prefers_async)
+        };
+        let has_hdr = surface
+            .wl_surface()
+            .as_deref()
+            .is_some_and(surface_tree_has_hdr_client_description);
+        let prefers_async = surface
+            .wl_surface()
+            .as_deref()
+            .is_some_and(surface_tree_prefers_async);
+        if current_hdr == has_hdr && current_async == prefers_async {
+            return;
+        }
+        let mut guard = state.0.write();
+        let Some(weak_occ) = guard.as_mut() else {
+            return;
+        };
+        if weak_occ.surface.upgrade().as_ref() == Some(&surface) {
+            weak_occ.has_hdr = has_hdr;
+            weak_occ.prefers_async = prefers_async;
+        }
+    }
+}
+
+/// Whether any surface in the tree asked for tearing presentation via
+/// `wp_tearing_control_v1`. Same locking rule as the description gates: read
+/// from `states` inside the traversal, never re-lock the surface.
+pub fn surface_tree_prefers_async(surface: &WlSurface) -> bool {
+    let mut found = false;
+    with_surfaces_surface_tree(surface, |_, states| {
+        if prefer_async_from_states(states) {
+            found = true;
+        }
+    });
+    found
+}
+
+pub fn surface_tree_has_hdr_client_description(surface: &WlSurface) -> bool {
+    let mut found = false;
+    with_surfaces_surface_tree(surface, |_, states| {
+        let is_hdr = states
+            .data_map
+            .get::<smithay::backend::renderer::utils::RendererSurfaceStateUserData>()
+            .and_then(|data| data.lock().ok())
+            .is_some_and(|state| state.is_hdr());
+        if is_hdr
+            || surface_description_from_states(states)
+                .0
+                .is_some_and(|description| description.is_hdr())
+        {
+            found = true;
+        }
+    });
+    found
 }

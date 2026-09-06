@@ -22,6 +22,166 @@ uniform float tint;
 
 uniform float invert;
 uniform float color_mode;
+// Experimental output transform. Input is compositor SDR in sRGB/Rec.709;
+// output is BT.2020 with the ST 2084 (PQ) transfer function. PQ is absolute:
+// linear SDR 1.0 maps to hdr_reference_white cd/m².
+uniform float hdr_enabled;
+
+// BEGIN HDR COMMON
+// Shared HDR math for every shader in this pipeline. The block must stay
+// byte-identical across the hdr shaders; hdr_test_vectors enforces that, and
+// srgb_color_to_pq mirrors it on the CPU for solid colors.
+uniform float hdr_reference_white;
+// SDR decode: 0.0 = piecewise sRGB, otherwise a pure power gamma (2.2 matches
+// how displays actually show SDR; sRGB's linear toe lifts shadows in HDR).
+uniform float hdr_sdr_gamma;
+// 0.0 = colorimetric 709->2020; 1.0 = keep native primaries ("vivid").
+uniform float hdr_gamut_stretch;
+
+// Linear Rec.709 to linear BT.2020. GLSL constructors are column-major.
+const mat3 rec709_to_bt2020 = mat3(
+    0.6274040, 0.0690970, 0.0163916,
+    0.3292820, 0.9195400, 0.0880132,
+    0.0433136, 0.0113612, 0.8955950
+);
+
+// Linear Display P3 to linear BT.2020. GLSL constructors are column-major.
+const mat3 p3_to_bt2020 = mat3(
+    0.7538330, 0.0457438, -0.0012103,
+    0.1985974, 0.9417772, 0.0176017,
+    0.0475696, 0.0124789, 0.9836086
+);
+
+// Primaries selector: 0.0 = Rec.709 / sRGB, 1.0 = Display P3, 2.0 = BT.2020 (identity)
+uniform float hdr_input_primaries;
+
+vec3 convert_primaries(vec3 linear_rgb) {
+    if (hdr_input_primaries > 1.5) {
+        return linear_rgb;
+    } else if (hdr_input_primaries > 0.5) {
+        return p3_to_bt2020 * linear_rgb;
+    } else {
+        return mix(
+            rec709_to_bt2020 * linear_rgb,
+            linear_rgb,
+            clamp(hdr_gamut_stretch, 0.0, 1.0)
+        );
+    }
+}
+
+float decode_sdr(float value) {
+    if (hdr_sdr_gamma == 1.0) {
+        return value;
+    }
+    if (hdr_sdr_gamma > 0.0) {
+        return pow(max(value, 0.0), hdr_sdr_gamma);
+    }
+    return value <= 0.04045
+        ? value / 12.92
+        : pow((value + 0.055) / 1.055, 2.4);
+}
+
+// ST 2084 inverse EOTF: absolute luminance in the normalized 10000 cd/m^2
+// domain to a PQ code value.
+float encode_pq(float value) {
+    const float m1 = 0.1593017578125; // 2610 / 16384
+    const float m2 = 78.84375;        // 2523 / 4096 * 128
+    const float c1 = 0.8359375;       // 3424 / 4096
+    const float c2 = 18.8515625;      // 2413 / 4096 * 32
+    const float c3 = 18.6875;         // 2392 / 4096 * 32
+    float p = pow(max(value, 0.0), m1);
+    return pow((c1 + c2 * p) / (1.0 + c3 * p), m2);
+}
+
+// SDR (premultiplied handling done by callers) to PQ/BT.2020, with the
+// reference white defining where linear SDR 1.0 lands in absolute luminance.
+vec3 sdr_to_pq(vec3 rgb) {
+    vec3 linear_rgb = vec3(
+        decode_sdr(rgb.r),
+        decode_sdr(rgb.g),
+        decode_sdr(rgb.b)
+    );
+    vec3 absolute = max(convert_primaries(linear_rgb), 0.0)
+        * (clamp(hdr_reference_white, 80.0, 10000.0) / 10000.0);
+    return vec3(
+        encode_pq(absolute.r),
+        encode_pq(absolute.g),
+        encode_pq(absolute.b)
+    );
+}
+// PQ content re-referencing: passthrough content carries its own reference
+// white (203 cd/m² for windows_bt2100 per BT.2408). Scaling decoded luminance
+// by hdr_reference_white / hdr_content_reference aligns the content's SDR
+// level with the desktop's, like KWin's reference-white mapping. Values above
+// the panel's peak are left for the panel to clip.
+uniform float hdr_input_pq;          // 1.0 = buffer holds PQ code values
+uniform float hdr_input_hlg;         // 1.0 = buffer holds HLG code values (BT.2100)
+uniform float hdr_content_reference; // content reference white in cd/m²
+
+// ST 2084 EOTF: PQ code value to luminance in the normalized 10000 cd/m^2
+// domain (inverse of encode_pq).
+float pq_to_linear(float code) {
+    const float m1 = 0.1593017578125;
+    const float m2 = 78.84375;
+    const float c1 = 0.8359375;
+    const float c2 = 18.8515625;
+    const float c3 = 18.6875;
+    float p = pow(max(code, 0.0), 1.0 / m2);
+    return pow(max(p - c1, 0.0) / (c2 - c3 * p), 1.0 / m1);
+}
+
+vec3 pq_rescale(vec3 code) {
+    float ref_scale = clamp(hdr_reference_white, 80.0, 10000.0)
+        / max(hdr_content_reference, 80.0);
+    if (abs(ref_scale - 1.0) < 0.001) {
+        return code;
+    }
+    vec3 linear_rgb = vec3(
+        pq_to_linear(code.r),
+        pq_to_linear(code.g),
+        pq_to_linear(code.b)
+    );
+    linear_rgb *= ref_scale;
+    return vec3(
+        encode_pq(linear_rgb.r),
+        encode_pq(linear_rgb.g),
+        encode_pq(linear_rgb.b)
+    );
+}
+
+// HLG inverse OETF (ARIB STD-B67 / ITU-R BT.2100)
+float hlg_to_scene(float e) {
+    const float a = 0.17883277;
+    const float b = 0.28466892;
+    const float c = 0.55991073;
+    e = clamp(e, 0.0, 1.0);
+    if (e <= 0.5) {
+        return (e * e) / 3.0;
+    } else {
+        return (exp((e - c) / a) + b) / 12.0;
+    }
+}
+
+// HLG (BT.2020 primaries) to PQ/BT.2020 with OOTF and reference white scaling.
+vec3 hlg_to_pq(vec3 hlg) {
+    vec3 scene = vec3(
+        hlg_to_scene(hlg.r),
+        hlg_to_scene(hlg.g),
+        hlg_to_scene(hlg.b)
+    );
+    float ys = dot(scene, vec3(0.2627, 0.6780, 0.0593));
+    float gain = pow(max(ys, 1e-6), 0.2) * 0.10;
+    float ref_scale = clamp(hdr_reference_white, 80.0, 10000.0)
+        / max(hdr_content_reference, 80.0);
+    vec3 display = scene * (gain * ref_scale);
+    return vec3(
+        encode_pq(display.r),
+        encode_pq(display.g),
+        encode_pq(display.b)
+    );
+}
+// END HDR COMMON
+
 
 void main() {
     vec4 color = texture2D(tex, v_coords);
@@ -32,8 +192,14 @@ void main() {
     color = color * alpha;
 #endif
 
-    // un-multiply
-    color.rgb /= color.a;
+    // Un-multiply before color conversion. Fully transparent pixels have no
+    // defined straight RGB value; force them to black instead of feeding
+    // NaN/Inf through the HDR matrix and PQ transfer function.
+    if (color.a > 0.00001) {
+        color.rgb /= color.a;
+    } else {
+        color.rgb = vec3(0.0);
+    }
 
     // First invert then filter
 
@@ -81,6 +247,10 @@ void main() {
         correction.b =  (diff.r * 0.7) + (diff.b * 1.0);
 
         color.rgb += correction;
+    }
+
+    if (hdr_enabled > 0.5) {
+        color.rgb = sdr_to_pq(color.rgb);
     }
 
     // re-multiply

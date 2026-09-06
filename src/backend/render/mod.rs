@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use std::{
-    borrow::Borrow,
+    borrow::{Borrow, BorrowMut},
     cell::RefCell,
     collections::HashMap,
     ops::ControlFlow,
@@ -101,6 +101,16 @@ pub type GlMultiRenderer<'a> =
 pub type GlMultiFrame<'a, 'frame, 'buffer> =
     MultiFrame<'a, 'a, 'frame, 'buffer, GbmGlowBackend<DrmDeviceFd>, GbmGlowBackend<DrmDeviceFd>>;
 pub type GlMultiError = MultiError<GbmGlowBackend<DrmDeviceFd>, GbmGlowBackend<DrmDeviceFd>>;
+
+use smithay::backend::renderer::gles::HdrOutputConfig;
+
+/// Configure default texture and solid-color draws for a frame whose client
+/// buffers are already PQ/BT.2020. Surfaces will have their texture shader uniforms
+/// adjusted per surface based on their committed color description directly in smithay.
+pub fn set_hdr_client_blend<R: AsGlowRenderer>(renderer: &mut R, config: Option<HdrOutputConfig>) {
+    let gles = BorrowMut::<GlesRenderer>::borrow_mut(renderer.glow_renderer_mut());
+    let _ = gles.set_hdr_output(config);
+}
 
 pub enum RendererRef<'a> {
     Glow(&'a mut GlowRenderer),
@@ -286,10 +296,10 @@ impl IndicatorShader {
                     Uniform::new(
                         "radius",
                         [
-                            outer_radius[0] as f32,
-                            outer_radius[1] as f32,
-                            outer_radius[2] as f32,
                             outer_radius[3] as f32,
+                            outer_radius[1] as f32,
+                            outer_radius[0] as f32,
+                            outer_radius[2] as f32,
                         ],
                     ),
                     Uniform::new("scale", scale as f32),
@@ -421,6 +431,10 @@ pub fn init_shaders(renderer: &mut GlesRenderer) -> Result<(), GlesError> {
         &[
             UniformName::new("invert", UniformType::_1f),
             UniformName::new("color_mode", UniformType::_1f),
+            UniformName::new("hdr_enabled", UniformType::_1f),
+            UniformName::new("hdr_reference_white", UniformType::_1f),
+            UniformName::new("hdr_sdr_gamma", UniformType::_1f),
+            UniformName::new("hdr_gamut_stretch", UniformType::_1f),
         ],
     )?;
     let clipping_shader = renderer.compile_custom_texture_shader(
@@ -1123,6 +1137,24 @@ pub struct PostprocessState {
     pub output_config: PostprocessOutputConfig,
 }
 
+/// Pick the SDR render target that feeds the HDR post-processing shader.
+///
+/// A ten-bit scanout format does not imply that rendering to and sampling an
+/// offscreen texture with that format is reliable. The compositor contents at
+/// this point are still sRGB, so use the matching, widely-supported eight-bit
+/// channel layout and let the final shader write PQ into the ten-bit scanout FB.
+pub fn postprocess_intermediate_format(output_format: Fourcc, hdr_enabled: bool) -> Fourcc {
+    if !hdr_enabled {
+        return output_format;
+    }
+
+    match output_format {
+        Fourcc::Abgr2101010 => Fourcc::Abgr8888,
+        Fourcc::Argb2101010 => Fourcc::Argb8888,
+        _ => output_format,
+    }
+}
+
 impl PostprocessState {
     pub fn new_with_renderer<R: AsGlowRenderer>(
         renderer: &mut R,
@@ -1378,6 +1410,10 @@ where
                                 .map(|val| val as u8 as f32)
                                 .unwrap_or(0.),
                         ),
+                        Uniform::new("hdr_enabled", 0.0_f32),
+                        Uniform::new("hdr_reference_white", 203.0_f32),
+                        Uniform::new("hdr_sdr_gamma", 0.0_f32),
+                        Uniform::new("hdr_gamut_stretch", 0.0_f32),
                     ],
                 );
                 constrain_render_elements(
