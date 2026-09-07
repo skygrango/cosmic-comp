@@ -211,6 +211,7 @@ pub struct SurfaceThreadState {
     screen_filter: ScreenFilter,
     hdr_enabled: bool,
     hdr_reference_white: f32,
+    hdr_max_luminance: f32,
     hdr_config: Option<HdrOutputConfig>,
     hdr_passthrough_reported: bool,
     tearing_reported: bool,
@@ -327,6 +328,7 @@ pub enum ThreadCommand {
     UpdateHdr {
         enabled: bool,
         reference_white: f32,
+        max_luminance: f32,
     },
     VBlank(Option<DrmEventMetadata>),
     ScheduleRender(bool),
@@ -590,9 +592,15 @@ impl Surface {
     pub fn prepare_hdr_rendering(&mut self, enabled: bool, reference_white: f32) {
         self.hdr_enabled = enabled;
         self.hdr_reference_white = reference_white.clamp(80.0, 10_000.0);
+        let max_luminance = self
+            .hdr_sink_capabilities
+            .map(|c| c.max_luminance as f32)
+            .unwrap_or(1000.0)
+            .max(self.hdr_reference_white);
         let _ = self.thread_command.send(ThreadCommand::UpdateHdr {
             enabled,
             reference_white: self.hdr_reference_white,
+            max_luminance,
         });
     }
 
@@ -810,6 +818,7 @@ fn surface_thread(
         screen_filter,
         hdr_enabled: false,
         hdr_reference_white: 203.0,
+        hdr_max_luminance: 1000.0,
         hdr_config: None,
         hdr_passthrough_reported: false,
         tearing_reported: false,
@@ -875,9 +884,11 @@ fn surface_thread(
             Event::Msg(ThreadCommand::UpdateHdr {
                 enabled,
                 reference_white,
+                max_luminance,
             }) => {
                 state.hdr_enabled = enabled;
                 state.hdr_reference_white = reference_white.clamp(80.0, 10_000.0);
+                state.hdr_max_luminance = max_luminance.max(state.hdr_reference_white);
                 state.update_hdr_config();
                 // Shader uniforms are not part of the texture's commit
                 // counter.  Recreate the post-process target so a live HDR
@@ -1957,6 +1968,7 @@ impl SurfaceThreadState {
             self.hdr_enabled && self.screen_filter.is_noop() && self.mirroring.is_none();
         self.hdr_config = surface_hdr_active.then(|| HdrOutputConfig {
             reference_white: self.hdr_reference_white,
+            max_luminance: self.hdr_max_luminance,
             sdr_gamma: hdr_policy().sdr_gamma,
             gamut_stretch: hdr_policy().gamut_stretch,
         });
