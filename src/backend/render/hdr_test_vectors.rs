@@ -1,6 +1,6 @@
 //! CPU reference vectors for the constants mirrored in `offscreen.frag`.
 
-use smithay::backend::allocator::Fourcc;
+use smithay::backend::{allocator::Fourcc, renderer::Color32F};
 
 #[test]
 fn hdr_postprocess_uses_sdr_intermediate_matching_channel_order() {
@@ -80,18 +80,12 @@ fn st2084_matches_reference_code_values() {
 
 #[test]
 fn solid_color_hdr_path_matches_shader_white_point() {
-    let white = super::srgb_color_to_pq(
-        smithay::backend::renderer::Color32F::new(1.0, 1.0, 1.0, 1.0),
-        203.0,
-    );
+    let white = super::srgb_color_to_pq(Color32F::new(1.0, 1.0, 1.0, 1.0), 203.0);
     assert!((white.r() - 0.5807).abs() < 0.0003);
     assert!((white.r() - white.g()).abs() < 0.0001);
     assert!((white.g() - white.b()).abs() < 0.0001);
 
-    let transparent = super::srgb_color_to_pq(
-        smithay::backend::renderer::Color32F::new(0.0, 0.0, 0.0, 0.0),
-        203.0,
-    );
+    let transparent = super::srgb_color_to_pq(Color32F::new(0.0, 0.0, 0.0, 0.0), 203.0);
     assert_eq!(transparent.a(), 0.0);
     assert!(transparent.r().is_finite());
 }
@@ -108,18 +102,13 @@ fn gamma22_decode_keeps_shadows_darker_than_srgb_toe() {
     // The end points agree, so reference white is unaffected by the choice.
     assert_eq!(super::decode_sdr(0.0, 2.2), 0.0);
     assert!((super::decode_sdr(1.0, 2.2) - 1.0).abs() < 1e-6);
-    let white = super::sdr_color_to_pq(
-        smithay::backend::renderer::Color32F::new(1.0, 1.0, 1.0, 1.0),
-        203.0,
-        2.2,
-        0.0,
-    );
+    let white = super::sdr_color_to_pq(Color32F::new(1.0, 1.0, 1.0, 1.0), 203.0, 2.2, 0.0);
     assert!((white.r() - 0.5807).abs() < 0.0003);
 }
 
 #[test]
 fn gamut_stretch_moves_primaries_toward_native() {
-    let red = smithay::backend::renderer::Color32F::new(1.0, 0.0, 0.0, 1.0);
+    let red = Color32F::new(1.0, 0.0, 0.0, 1.0);
     let colorimetric = super::sdr_color_to_pq(red, 203.0, 2.2, 0.0);
     let native = super::sdr_color_to_pq(red, 203.0, 2.2, 1.0);
     // Colorimetric red carries green/blue energy in the BT.2020 container;
@@ -128,7 +117,7 @@ fn gamut_stretch_moves_primaries_toward_native() {
     assert!(colorimetric.g() > native.g());
     assert!(native.g() < 1e-4 && native.b() < 1e-4);
     // Neutral white is unaffected by the stretch.
-    let white = smithay::backend::renderer::Color32F::new(1.0, 1.0, 1.0, 1.0);
+    let white = Color32F::new(1.0, 1.0, 1.0, 1.0);
     let a = super::sdr_color_to_pq(white, 203.0, 2.2, 0.0);
     let b = super::sdr_color_to_pq(white, 203.0, 2.2, 1.0);
     assert!((a.r() - b.r()).abs() < 1e-4);

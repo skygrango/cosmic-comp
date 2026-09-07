@@ -2,12 +2,15 @@ use cosmic_comp_config::output::comp::{AdaptiveSync, OutputConfig, OutputState};
 use parking_lot::RwLock;
 use smithay::{
     backend::drm::VrrSupport as Support,
+    desktop::utils::with_surfaces_surface_tree,
     output::{Output, WeakOutput},
     reexports::wayland_server::{Client, protocol::wl_surface::WlSurface},
     utils::Rectangle,
     wayland::{
+        color::management::surface_description_from_states,
         compositor::{Barrier, CompositorHandler},
         seat::WaylandFocus,
+        tearing_control::prefer_async_from_states,
     },
 };
 
@@ -378,8 +381,8 @@ impl OutputExt for Output {
 /// from `states` inside the traversal, never re-lock the surface.
 pub fn surface_tree_prefers_async(surface: &WlSurface) -> bool {
     let mut found = false;
-    smithay::desktop::utils::with_surfaces_surface_tree(surface, |_, states| {
-        if smithay::wayland::tearing_control::prefer_async_from_states(states) {
+    with_surfaces_surface_tree(surface, |_, states| {
+        if prefer_async_from_states(states) {
             found = true;
         }
     });
@@ -390,8 +393,8 @@ pub fn surface_tree_has_hdr_client_description(surface: &WlSurface) -> bool {
     let mut found = false;
     // The traversal callback runs with each surface's state lock held, so the
     // description must be read from `states`, never via `get_surface_description`.
-    smithay::desktop::utils::with_surfaces_surface_tree(surface, |_, states| {
-        if smithay::wayland::color::management::surface_description_from_states(states)
+    with_surfaces_surface_tree(surface, |_, states| {
+        if surface_description_from_states(states)
             .0
             .is_some_and(|description| description.is_hdr())
         {

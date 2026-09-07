@@ -5,7 +5,7 @@ use crate::{
     shell::Shell,
     state::BackendData,
     utils::{
-        env::{dev_var, hdr_policy},
+        env::{bool_var, dev_var, hdr_enabled_override, hdr_policy, hdr_reference_white_for},
         global::remove_global_with_timer,
         prelude::*,
     },
@@ -52,6 +52,7 @@ use smithay::{
     },
     utils::{Clock, DevPath, Monotonic, Size},
     wayland::{
+        color::management::Chromaticities,
         dmabuf::{DmabufFeedbackBuilder, DmabufGlobal},
         drm_syncobj::{DrmSyncobjState, supports_syncobj_eventfd},
         relative_pointer::RelativePointerManagerState,
@@ -108,7 +109,7 @@ fn requested_reference_white(output: &Output) -> f32 {
     CompOutputConfig(output.config())
         .0
         .hdr_reference_white
-        .or(crate::utils::env::hdr_reference_white_for(&output.name()))
+        .or(hdr_reference_white_for(&output.name()))
         .unwrap_or(hdr_policy().reference_white)
         .clamp(
             cosmic_comp_config::HDR_REFERENCE_WHITE_MIN,
@@ -640,7 +641,7 @@ impl State {
             }
         }
 
-        if !crate::utils::env::bool_var("COSMIC_DISABLE_SYNCOBJ").unwrap_or(false) {
+        if !bool_var("COSMIC_DISABLE_SYNCOBJ").unwrap_or(false) {
             if let Some(primary_node) = primary_node
                 .as_ref()
                 .and_then(|node| node.node_with_type(NodeType::Primary).and_then(|x| x.ok()))
@@ -1165,7 +1166,7 @@ impl KmsGuard<'_> {
                     .primary_output()
                     .is_some_and(|primary| primary == surface.output.name());
                 let hdr_requested = hdr_policy.experiment_enabled
-                    && crate::utils::env::hdr_enabled_override(&surface.output.name())
+                    && hdr_enabled_override(&surface.output.name())
                         .unwrap_or(output_config.0.hdr_enabled == Some(true) || environment_output);
                 let mut hdr_reference_white = requested_reference_white(&surface.output);
                 let requested_vrr = output_config.0.vrr;
@@ -1182,7 +1183,7 @@ impl KmsGuard<'_> {
                 let native_primaries = edid_info.as_ref().and_then(|info| {
                     info.edid().map(|edid| {
                         let coords = edid.chromaticity_coords();
-                        smithay::wayland::color::management::Chromaticities {
+                        Chromaticities {
                             red: (
                                 (coords.red_x * 1_000_000.0).round() as i32,
                                 (coords.red_y * 1_000_000.0).round() as i32,

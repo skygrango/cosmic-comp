@@ -11,9 +11,12 @@ use crate::{
     dbus::DBusState,
     input::{PointerFocusState, gestures::GestureState},
     shell::{CosmicSurface, SeatExt, Shell, grabs::SeatMoveGrabState},
-    utils::prelude::OutputExt,
+    utils::{env::hdr_policy, prelude::OutputExt},
     wayland::{
-        handlers::{data_device::get_dnd_icon, image_copy_capture::SessionHolder},
+        handlers::{
+            color_management::description_for_output, data_device::get_dnd_icon,
+            image_copy_capture::SessionHolder,
+        },
         protocols::{
             a11y::A11yState,
             corner_radius::CornerRadiusState,
@@ -696,7 +699,7 @@ impl State {
         let clock = Clock::new();
         let config = Config::load(&handle);
         let compositor_state = CompositorState::new::<Self>(dh);
-        let advertise_hdr = crate::utils::env::hdr_policy().experiment_enabled;
+        let advertise_hdr = hdr_policy().experiment_enabled;
         let color_management_state = ColorManagementState::new::<Self, _>(
             dh,
             [
@@ -1039,8 +1042,7 @@ impl Common {
         let shell = self.shell.read();
         let color_management = &self.color_management_state;
 
-        let current_output_desc =
-            crate::wayland::handlers::color_management::description_for_output(output);
+        let current_output_desc = description_for_output(output);
         output
             .user_data()
             .insert_if_missing_threadsafe(OutputColorDescriptionState::default);
@@ -1070,10 +1072,7 @@ impl Common {
                             output.current_scale().fractional_scale().max(1.0),
                         );
                     });
-                    color_management.preferred_changed(
-                        surface,
-                        crate::wayland::handlers::color_management::description_for_output(&output),
-                    );
+                    color_management.preferred_changed(surface, description_for_output(&output));
                 }
             }
         };

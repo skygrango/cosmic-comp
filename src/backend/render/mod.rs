@@ -35,7 +35,7 @@ use crate::{
         layout::tiling::ANIMATION_DURATION,
         zoom::ZoomState,
     },
-    utils::{prelude::*, quirks::workspace_overview_is_open},
+    utils::{env::hdr_policy, prelude::*, quirks::workspace_overview_is_open},
     wayland::{
         handlers::{
             compositor::FRAME_TIME_FILTER,
@@ -120,7 +120,7 @@ fn decode_sdr(value: f32, gamma: f32) -> f32 {
 }
 
 fn srgb_color_to_pq(color: Color32F, reference_white: f32) -> Color32F {
-    let policy = crate::utils::env::hdr_policy();
+    let policy = hdr_policy();
     sdr_color_to_pq(
         color,
         reference_white,
@@ -179,11 +179,8 @@ pub fn set_hdr_client_blend<R: AsGlowRenderer>(renderer: &mut R, reference_white
             program,
             vec![
                 Uniform::new("hdr_reference_white", reference_white),
-                Uniform::new("hdr_sdr_gamma", crate::utils::env::hdr_policy().sdr_gamma),
-                Uniform::new(
-                    "hdr_gamut_stretch",
-                    crate::utils::env::hdr_policy().gamut_stretch,
-                ),
+                Uniform::new("hdr_sdr_gamma", hdr_policy().sdr_gamma),
+                Uniform::new("hdr_gamut_stretch", hdr_policy().gamut_stretch),
                 Uniform::new("hdr_input_pq", 0.0_f32),
                 Uniform::new("hdr_input_hlg", 0.0_f32),
                 Uniform::new("hdr_input_primaries", 0.0_f32),

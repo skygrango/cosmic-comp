@@ -16,6 +16,7 @@ use smithay::{
         property,
     },
     utils::Transform,
+    wayland::color::management::Chromaticities,
 };
 use std::{
     collections::HashMap,
@@ -249,7 +250,7 @@ pub struct HdrSinkCapabilities {
 pub struct ActiveHdrOutput {
     pub capabilities: HdrSinkCapabilities,
     pub reference_white: u16,
-    pub native_primaries: Option<smithay::wayland::color::management::Chromaticities>,
+    pub native_primaries: Option<Chromaticities>,
 }
 
 #[derive(Debug, Default)]

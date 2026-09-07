@@ -7,16 +7,24 @@ use smithay::{
     reexports::wayland_server::protocol::wl_surface,
     render_elements,
     utils::{Logical, Physical, Point, Rectangle, Scale},
-    wayland::compositor::{self, TraversalAction},
+    wayland::{
+        color::management::{
+            ImageDescription, Primaries, TransferFunction, surface_description_from_states,
+        },
+        compositor::{self, TraversalAction},
+    },
 };
 use tracing::warn;
 
-use crate::backend::render::{
-    element::AsGlowRenderer,
-    wayland::{
-        blur_effect::BlurElement, clipped_surface::ClippedSurfaceRenderElement,
-        hdr_surface::HdrSurfaceRenderElement,
+use crate::{
+    backend::render::{
+        element::AsGlowRenderer,
+        wayland::{
+            blur_effect::BlurElement, clipped_surface::ClippedSurfaceRenderElement,
+            hdr_surface::HdrSurfaceRenderElement,
+        },
     },
+    utils::env::hdr_policy,
 };
 
 pub mod blur_effect;
@@ -93,11 +101,7 @@ pub fn push_render_elements_from_surface_tree<R>(
                     // `states` is already locked by the tree traversal; re-locking the
                     // surface via `get_surface_description(surface)` deadlocks the render
                     // thread (observed on hardware 2026-08-31).
-                    let description =
-                        smithay::wayland::color::management::surface_description_from_states(
-                            states,
-                        )
-                        .0;
+                    let description = surface_description_from_states(states).0;
                     match WaylandSurfaceRenderElement::from_surface(
                         renderer, surface, states, location, alpha, kind,
                     ) {
@@ -121,9 +125,6 @@ pub fn push_render_elements_from_surface_tree<R>(
                                 )
                                 .into()
                             } else if let Some(description) = description {
-                                use smithay::wayland::color::management::{
-                                    Primaries, TransferFunction,
-                                };
                                 if description.transfer == TransferFunction::Hlg {
                                     HdrSurfaceRenderElement::new_hlg(
                                         element,
@@ -156,7 +157,7 @@ pub fn push_render_elements_from_surface_tree<R>(
                                         TransferFunction::Gamma22 => 2.2,
                                         TransferFunction::CompoundPower24
                                         | TransferFunction::Srgb => 0.0,
-                                        _ => crate::utils::env::hdr_policy().sdr_gamma,
+                                        _ => hdr_policy().sdr_gamma,
                                     };
                                     let primaries_mode = match description.primaries.named {
                                         Some(Primaries::DisplayP3) => 1.0,
@@ -211,9 +212,7 @@ pub fn push_render_elements_from_surface_tree<R>(
 /// encoding's 1.0 is its `max` luminance (80 cd/m²) and its SDR white is the
 /// `reference` (203 cd/m² per BT.2408), so mapping that reference onto the
 /// output's reference keeps SDR-in-scRGB at the same brightness as native SDR.
-fn scrgb_reference_scale(
-    description: &smithay::wayland::color::management::ImageDescription,
-) -> f32 {
+fn scrgb_reference_scale(description: &ImageDescription) -> f32 {
     description
         .luminances
         .map(|(_min, max, reference)| {
@@ -228,10 +227,11 @@ fn scrgb_reference_scale(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn scrgb_reference_scale_matches_windows_conventions() {
-        use smithay::wayland::color::management::ImageDescription;
-        let scale = super::scrgb_reference_scale(&ImageDescription::WINDOWS_SCRGB);
+        let scale = scrgb_reference_scale(&ImageDescription::WINDOWS_SCRGB);
         assert!((scale - 80.0 / 203.0).abs() < 1e-6);
     }
 }

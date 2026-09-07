@@ -90,14 +90,15 @@ impl ColorManagementHandler for State {
 mod tests {
     use super::*;
     use crate::backend::kms::drm_helpers::{ActiveHdrOutput, HdrSinkCapabilities};
+    use smithay::output::{PhysicalProperties, Subpixel};
 
     #[test]
     fn reports_the_hardware_validated_hdr_description() {
         let output = Output::new(
             "DP-test".into(),
-            smithay::output::PhysicalProperties {
+            PhysicalProperties {
                 size: (0, 0).into(),
-                subpixel: smithay::output::Subpixel::Unknown,
+                subpixel: Subpixel::Unknown,
                 make: "Test".into(),
                 model: "HDR".into(),
                 serial_number: "test".into(),

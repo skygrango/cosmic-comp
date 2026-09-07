@@ -11,9 +11,12 @@ use crate::{
         },
     },
     config::ScreenFilter,
-    shell::Shell,
+    shell::{Shell, focus::FocusTarget},
     state::SurfaceDmabufFeedback,
-    utils::prelude::*,
+    utils::{
+        env::{bool_var, hdr_policy, tearing_allowed_for},
+        prelude::*,
+    },
     wayland::handlers::{
         compositor::{FULLSCREEN_IMMEDIATE_RENDER, recursive_frame_time_estimation},
         image_copy_capture::{FrameHolder, PendingImageCopyData, SessionData, submit_buffer},
@@ -26,7 +29,7 @@ use cosmic_comp_config::output::comp::AdaptiveSync;
 use smithay::{
     backend::{
         allocator::{
-            Fourcc,
+            Buffer, Fourcc,
             format::FormatSet,
             gbm::{GbmAllocator, GbmBuffer},
         },
@@ -59,7 +62,7 @@ use smithay::{
             glow::GlowRenderer,
             multigpu::{ApiDevice, Error as MultiError, GpuManager},
             sync::SyncPoint,
-            utils::with_renderer_surface_state,
+            utils::{RendererSurfaceStateUserData, with_renderer_surface_state},
         },
     },
     desktop::utils::{OutputPresentationFeedback, with_surfaces_surface_tree},
@@ -79,6 +82,7 @@ use smithay::{
     },
     utils::{Clock, IsAlive, Monotonic, Physical, Point, Rectangle, Transform},
     wayland::{
+        color::management::{Chromaticities, surface_description_from_states},
         dmabuf::{DmabufFeedbackBuilder, get_dmabuf},
         image_copy_capture::{
             CaptureFailureReason, Frame as ScreencopyFrame, SessionRef as ScreencopySessionRef,
@@ -112,8 +116,7 @@ pub use self::timings::Timings;
 fn describe_hdr_surface_tree(surface: &WlSurface) -> String {
     let mut parts = Vec::new();
     with_surfaces_surface_tree(surface, |_, states| {
-        let description =
-            smithay::wayland::color::management::surface_description_from_states(states).0;
+        let description = surface_description_from_states(states).0;
         let kind = match description {
             None => "untagged".to_string(),
             Some(desc) => format!(
@@ -123,13 +126,12 @@ fn describe_hdr_surface_tree(surface: &WlSurface) -> String {
         };
         let buffer = states
             .data_map
-            .get::<smithay::backend::renderer::utils::RendererSurfaceStateUserData>()
+            .get::<RendererSurfaceStateUserData>()
             .and_then(|data| {
                 let data = data.lock().unwrap();
                 let size = data.buffer_size();
                 data.buffer().map(|buffer| {
-                    use smithay::backend::allocator::Buffer as _;
-                    let format = smithay::wayland::dmabuf::get_dmabuf(buffer)
+                    let format = get_dmabuf(buffer)
                         .map(|dmabuf| format!("{:?}", dmabuf.format().code))
                         .unwrap_or_else(|_| "shm/unknown".to_string());
                     format!("{format} {size:?}")
@@ -143,13 +145,11 @@ fn describe_hdr_surface_tree(surface: &WlSurface) -> String {
 
 use super::{drm_helpers, render::gles::GbmGlowBackend};
 
-static FULLSCREEN_SKIP_OTHER_SURFACE: LazyLock<bool> = LazyLock::new(|| {
-    crate::utils::env::bool_var("COSMIC_FULLSCREEN_SKIP_OTHER_SURFACE").unwrap_or(true)
-});
+static FULLSCREEN_SKIP_OTHER_SURFACE: LazyLock<bool> =
+    LazyLock::new(|| bool_var("COSMIC_FULLSCREEN_SKIP_OTHER_SURFACE").unwrap_or(true));
 
-static FULLSCREEN_SKIP_OTHER_SURFACE_ALWAYS: LazyLock<bool> = LazyLock::new(|| {
-    crate::utils::env::bool_var("COSMIC_FULLSCREEN_SKIP_OTHER_SURFACE_ALWAYS").unwrap_or(false)
-});
+static FULLSCREEN_SKIP_OTHER_SURFACE_ALWAYS: LazyLock<bool> =
+    LazyLock::new(|| bool_var("COSMIC_FULLSCREEN_SKIP_OTHER_SURFACE_ALWAYS").unwrap_or(false));
 
 const _30_HZ: Duration = Duration::from_nanos(1_000_000_000 / 30);
 
@@ -180,7 +180,7 @@ pub struct Surface {
     hdr_enabled: bool,
     pub(super) hdr_passthrough: bool,
     pub(super) hdr_sink_capabilities: Option<drm_helpers::HdrSinkCapabilities>,
-    pub(super) native_primaries: Option<smithay::wayland::color::management::Chromaticities>,
+    pub(super) native_primaries: Option<Chromaticities>,
     hdr_reference_white: f32,
 }
 
@@ -264,7 +264,7 @@ pub fn emergency_shutdown_hdr_surfaces() {
 /// Receives from a surface-thread channel, bounded by the teardown timeout in
 /// strict HDR mode so a wedged thread cannot hang the compositor forever.
 fn recv_bounded<T>(rx: Receiver<T>) -> Result<T, String> {
-    rx.recv_timeout(crate::utils::env::hdr_policy().teardown_timeout)
+    rx.recv_timeout(hdr_policy().teardown_timeout)
         .map_err(|err| err.to_string())
 }
 
@@ -674,8 +674,7 @@ impl Surface {
         if let Some(thread) = thread {
             let name = thread.thread().name().unwrap().to_string();
             {
-                let deadline =
-                    std::time::Instant::now() + crate::utils::env::hdr_policy().teardown_timeout;
+                let deadline = std::time::Instant::now() + hdr_policy().teardown_timeout;
                 while !thread.is_finished() && std::time::Instant::now() < deadline {
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -764,8 +763,7 @@ fn surface_thread(
 
     #[cfg(feature = "debug")]
     let egui = {
-        let state =
-            smithay_egui::EguiState::new(smithay::utils::Rectangle::from_size((400, 800).into()));
+        let state = smithay_egui::EguiState::new(Rectangle::from_size((400, 800).into()));
         let visuals = egui::style::Visuals {
             window_shadow: egui::Shadow::NONE,
             ..Default::default()
@@ -880,12 +878,9 @@ fn surface_thread(
                     state.frame_flags.remove(FrameFlags::ALLOW_SCANOUT);
                 } else {
                     state.frame_flags.insert(FrameFlags::DEFAULT);
-                    if crate::utils::env::bool_var("COSMIC_DISABLE_DIRECT_SCANOUT").unwrap_or(false)
-                    {
+                    if bool_var("COSMIC_DISABLE_DIRECT_SCANOUT").unwrap_or(false) {
                         state.frame_flags.remove(FrameFlags::ALLOW_SCANOUT);
-                    } else if crate::utils::env::bool_var("COSMIC_DISABLE_OVERLAY_SCANOUT")
-                        .unwrap_or(false)
-                    {
+                    } else if bool_var("COSMIC_DISABLE_OVERLAY_SCANOUT").unwrap_or(false) {
                         state
                             .frame_flags
                             .remove(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
@@ -954,12 +949,10 @@ fn surface_thread(
                 state.queue_redraw(false, false);
             }
             Event::Msg(ThreadCommand::AllowFrameFlags(flag, mut flags)) => {
-                if state.hdr_enabled
-                    || crate::utils::env::bool_var("COSMIC_DISABLE_DIRECT_SCANOUT").unwrap_or(false)
-                {
+                if state.hdr_enabled || bool_var("COSMIC_DISABLE_DIRECT_SCANOUT").unwrap_or(false) {
                     flags.remove(FrameFlags::ALLOW_SCANOUT);
                 }
-                if crate::utils::env::bool_var("COSMIC_DISABLE_OVERLAY_SCANOUT").unwrap_or(false) {
+                if bool_var("COSMIC_DISABLE_OVERLAY_SCANOUT").unwrap_or(false) {
                     flags.remove(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
                 }
 
@@ -1034,9 +1027,9 @@ impl SurfaceThreadState {
         self.timings
             .set_min_refresh_interval(self.min_vrr_frame_time);
 
-        if crate::utils::env::bool_var("COSMIC_DISABLE_DIRECT_SCANOUT").unwrap_or(false) {
+        if bool_var("COSMIC_DISABLE_DIRECT_SCANOUT").unwrap_or(false) {
             self.frame_flags.remove(FrameFlags::ALLOW_SCANOUT);
-        } else if crate::utils::env::bool_var("COSMIC_DISABLE_OVERLAY_SCANOUT").unwrap_or(false) {
+        } else if bool_var("COSMIC_DISABLE_OVERLAY_SCANOUT").unwrap_or(false) {
             self.frame_flags
                 .remove(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
         }
@@ -1312,7 +1305,7 @@ impl SurfaceThreadState {
                 if let Err(err) = state.redraw(estimated_presentation) {
                     let name = state.output.name();
                     warn!(?name, "Failed to submit rendering: {:?}", err);
-                    if crate::utils::env::hdr_policy().require_active {
+                    if hdr_policy().require_active {
                         let _ = state
                             .thread_sender
                             .send(SurfaceCommand::FatalRenderError(format!("{err:#}")));
@@ -1434,7 +1427,7 @@ impl SurfaceThreadState {
                         .get(seat)
                         .last()
                         .and_then(|target| match target {
-                            crate::shell::focus::FocusTarget::Window(mapped) => Some(mapped),
+                            FocusTarget::Window(mapped) => Some(mapped),
                             _ => None,
                         })
                         .filter(|mapped| {
@@ -1505,9 +1498,8 @@ impl SurfaceThreadState {
         // Tearing: honor the fullscreen/covering client's async hint with real
         // async page flips when the user allows it. The KMS layer falls back
         // to synchronized flips whenever the kernel refuses to tear.
-        let tearing = crate::utils::env::tearing_allowed_for(&self.output.name())
-            && has_active_fullscreen
-            && prefers_async;
+        let tearing =
+            tearing_allowed_for(&self.output.name()) && has_active_fullscreen && prefers_async;
         if tearing != self.tearing_reported {
             self.tearing_reported = tearing;
             warn!(
@@ -2437,11 +2429,8 @@ fn postprocess_elements<'a>(
                 ),
                 Uniform::new("hdr_enabled", if hdr_enabled { 1.0 } else { 0.0 }),
                 Uniform::new("hdr_reference_white", hdr_reference_white),
-                Uniform::new("hdr_sdr_gamma", crate::utils::env::hdr_policy().sdr_gamma),
-                Uniform::new(
-                    "hdr_gamut_stretch",
-                    crate::utils::env::hdr_policy().gamut_stretch,
-                ),
+                Uniform::new("hdr_sdr_gamma", hdr_policy().sdr_gamma),
+                Uniform::new("hdr_gamut_stretch", hdr_policy().gamut_stretch),
             ],
         ));
     }
@@ -2478,11 +2467,8 @@ fn postprocess_elements<'a>(
             ),
             Uniform::new("hdr_enabled", if hdr_enabled { 1.0 } else { 0.0 }),
             Uniform::new("hdr_reference_white", hdr_reference_white),
-            Uniform::new("hdr_sdr_gamma", crate::utils::env::hdr_policy().sdr_gamma),
-            Uniform::new(
-                "hdr_gamut_stretch",
-                crate::utils::env::hdr_policy().gamut_stretch,
-            ),
+            Uniform::new("hdr_sdr_gamma", hdr_policy().sdr_gamma),
+            Uniform::new("hdr_gamut_stretch", hdr_policy().gamut_stretch),
         ],
     ));
 

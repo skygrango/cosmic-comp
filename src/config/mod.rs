@@ -4,7 +4,13 @@ use crate::{
     input::InputBackendId,
     shell::Shell,
     state::{BackendData, State},
-    utils::prelude::OutputExt,
+    utils::{
+        env::{
+            hdr_policy, set_allow_tearing, set_allow_tearing_outputs, set_hdr_enabled_outputs,
+            set_hdr_reference_white_outputs, set_hdr_reference_white_override,
+        },
+        prelude::OutputExt,
+    },
     wayland::protocols::{
         output_configuration::OutputConfigurationState, workspace::WorkspaceUpdateGuard,
     },
@@ -192,15 +198,11 @@ impl Config {
                 c
             });
 
-        crate::utils::env::set_hdr_reference_white_override(cosmic_comp_config.hdr_reference_white);
-        crate::utils::env::set_hdr_reference_white_outputs(
-            cosmic_comp_config.hdr_reference_white_outputs.clone(),
-        );
-        crate::utils::env::set_allow_tearing(cosmic_comp_config.allow_tearing);
-        crate::utils::env::set_allow_tearing_outputs(
-            cosmic_comp_config.allow_tearing_outputs.clone(),
-        );
-        crate::utils::env::set_hdr_enabled_outputs(cosmic_comp_config.hdr_enabled_outputs.clone());
+        set_hdr_reference_white_override(cosmic_comp_config.hdr_reference_white);
+        set_hdr_reference_white_outputs(cosmic_comp_config.hdr_reference_white_outputs.clone());
+        set_allow_tearing(cosmic_comp_config.allow_tearing);
+        set_allow_tearing_outputs(cosmic_comp_config.allow_tearing_outputs.clone());
+        set_hdr_enabled_outputs(cosmic_comp_config.hdr_enabled_outputs.clone());
 
         // Listen for updates to the toolkit config
         if let Ok(tk_config) = cosmic_config::Config::new("com.system76.CosmicTk", 1) {
@@ -454,7 +456,7 @@ impl Config {
             })
             .cloned()
         {
-            let hdr_policy = crate::utils::env::hdr_policy();
+            let hdr_policy = hdr_policy();
             if hdr_policy.require_active && hdr_policy.isolate_output {
                 let requested = hdr_policy.primary_output().context(
                     "COSMIC_HDR_ISOLATE_OUTPUT requires an exact COSMIC_HDR_OUTPUT connector",
@@ -580,7 +582,7 @@ impl Config {
                 w += output.geometry().size.w as u32;
             }
 
-            let hdr_policy = crate::utils::env::hdr_policy();
+            let hdr_policy = hdr_policy();
             if hdr_policy.require_active && hdr_policy.isolate_output {
                 let requested = hdr_policy.primary_output().context(
                     "COSMIC_HDR_ISOLATE_OUTPUT requires an exact COSMIC_HDR_OUTPUT connector",
@@ -967,7 +969,7 @@ fn config_changed(config: cosmic_config::Config, keys: Vec<String>, state: &mut 
                 );
                 if new != state.common.config.cosmic_conf.allow_tearing_outputs {
                     state.common.config.cosmic_conf.allow_tearing_outputs = new.clone();
-                    crate::utils::env::set_allow_tearing_outputs(new);
+                    set_allow_tearing_outputs(new);
                 }
             }
             "hdr_enabled_outputs" => {
@@ -977,7 +979,7 @@ fn config_changed(config: cosmic_config::Config, keys: Vec<String>, state: &mut 
                 );
                 if new != state.common.config.cosmic_conf.hdr_enabled_outputs {
                     state.common.config.cosmic_conf.hdr_enabled_outputs = new.clone();
-                    crate::utils::env::set_hdr_enabled_outputs(new);
+                    set_hdr_enabled_outputs(new);
                     // HDR on/off switches the connector color state and shader
                     // pipeline; run the full output configuration pass.
                     if let Err(err) = state.refresh_output_config() {
@@ -989,7 +991,7 @@ fn config_changed(config: cosmic_config::Config, keys: Vec<String>, state: &mut 
                 let new = get_config::<bool>(&config, "allow_tearing");
                 if new != state.common.config.cosmic_conf.allow_tearing {
                     state.common.config.cosmic_conf.allow_tearing = new;
-                    crate::utils::env::set_allow_tearing(new);
+                    set_allow_tearing(new);
                 }
             }
             "hdr_reference_white_outputs" => {
@@ -999,7 +1001,7 @@ fn config_changed(config: cosmic_config::Config, keys: Vec<String>, state: &mut 
                 );
                 if new != state.common.config.cosmic_conf.hdr_reference_white_outputs {
                     state.common.config.cosmic_conf.hdr_reference_white_outputs = new.clone();
-                    crate::utils::env::set_hdr_reference_white_outputs(new);
+                    set_hdr_reference_white_outputs(new);
                     if let BackendData::Kms(kms_state) = &mut state.backend {
                         kms_state.lock_devices().update_hdr_reference_white();
                     }
@@ -1009,7 +1011,7 @@ fn config_changed(config: cosmic_config::Config, keys: Vec<String>, state: &mut 
                 let new = get_config::<Option<u16>>(&config, "hdr_reference_white");
                 if new != state.common.config.cosmic_conf.hdr_reference_white {
                     state.common.config.cosmic_conf.hdr_reference_white = new;
-                    crate::utils::env::set_hdr_reference_white_override(new);
+                    set_hdr_reference_white_override(new);
                     if let BackendData::Kms(kms_state) = &mut state.backend {
                         kms_state.lock_devices().update_hdr_reference_white();
                     }
