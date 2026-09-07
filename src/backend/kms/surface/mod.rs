@@ -1403,9 +1403,7 @@ impl SurfaceThreadState {
             has_active_fullscreen,
             fullscreen_drives_refresh_rate,
             animations_going,
-            has_hdr_fullscreen,
             prefers_async,
-            hdr_candidate,
         ) = {
             let shell = self.shell.read();
             let animations_going = shell.animations_going();
@@ -1420,95 +1418,42 @@ impl SurfaceThreadState {
                     recursive_frame_time_estimation(&self.clock, &surface)
                         .is_some_and(|dur| dur <= min_vrr_frame_time)
                 });
-                let has_hdr = fullscreen_surface.has_hdr;
+                //let has_hdr = fullscreen_surface.has_hdr;
                 let prefers_async = fullscreen_surface.prefers_async;
-                let candidate = fullscreen_surface.wl_surface().as_deref().cloned();
-                (
-                    true,
-                    drives_refresh_rate,
-                    animations_going,
-                    has_hdr,
-                    prefers_async,
-                    candidate,
-                )
-            } else if self.hdr_enabled {
-                // winewayland offers no exclusive fullscreen, so HDR games
-                // arrive as borderless windows. Treat the focused window as
-                // the passthrough candidate when it covers the whole output
-                // and carries an HDR image description; without this, PQ
-                // client content would be run through the SDR-to-PQ shader
-                // and lose its highlight range.
-                let covering_candidate = if let Some((_, workspace)) =
-                    shell.workspaces.active(output)
-                {
-                    let seat = shell.seats.last_active();
-                    workspace
-                        .focus_stack
-                        .get(seat)
-                        .last()
-                        .and_then(|target| match target {
-                            FocusTarget::Window(mapped) => Some(mapped),
-                            _ => None,
-                        })
-                        .filter(|mapped| {
-                            workspace.element_geometry(mapped).is_some_and(|geometry| {
-                                let geometry = geometry.as_logical();
-                                let output_size = output.geometry().size.as_logical();
-                                geometry.loc.x <= 0
-                                    && geometry.loc.y <= 0
-                                    && geometry.loc.x + geometry.size.w >= output_size.w
-                                    && geometry.loc.y + geometry.size.h >= output_size.h
-                            })
-                        })
-                        .and_then(|mapped| mapped.active_window().wl_surface().as_deref().cloned())
-                } else {
-                    None
-                };
-                let covering_hdr = covering_candidate
-                    .as_ref()
-                    .is_some_and(|surface| surface_tree_has_hdr_client_description(surface));
-                let covering_async = covering_candidate
-                    .as_ref()
-                    .is_some_and(|surface| surface_tree_prefers_async(surface));
-                (
-                    covering_hdr,
-                    false,
-                    animations_going,
-                    covering_hdr,
-                    covering_async,
-                    covering_candidate,
-                )
+                //let candidate = fullscreen_surface.wl_surface().as_deref().cloned();
+                (true, drives_refresh_rate, animations_going, prefers_async)
             } else {
-                (false, false, animations_going, false, false, None)
+                (false, false, animations_going, false)
             }
         };
 
-        let hdr_client_passthrough = self.hdr_enabled
-            && has_active_fullscreen
-            && has_hdr_fullscreen
-            && self.screen_filter.is_noop()
-            && self.mirroring.is_none();
-        if hdr_client_passthrough != self.hdr_passthrough_reported {
-            self.hdr_passthrough_reported = hdr_client_passthrough;
-            // warn-level so it reaches the journal; it only fires on change.
-            let details = hdr_candidate
-                .as_ref()
-                .map(describe_hdr_surface_tree)
-                .unwrap_or_default();
-            warn!(
-                output = %self.output.name(),
-                passthrough = hdr_client_passthrough,
-                covering_or_fullscreen = has_active_fullscreen,
-                hdr_description = has_hdr_fullscreen,
-                %details,
-                "HDR client passthrough changed"
-            );
-            let _ = self
-                .thread_sender
-                .send(SurfaceCommand::HdrPassthrough(hdr_client_passthrough));
-        }
+        // let hdr_client_passthrough = self.hdr_enabled
+        //     && has_active_fullscreen
+        //     && has_hdr_fullscreen
+        //     && self.screen_filter.is_noop()
+        //     && self.mirroring.is_none();
+        // if hdr_client_passthrough != self.hdr_passthrough_reported {
+        //     self.hdr_passthrough_reported = hdr_client_passthrough;
+        //     // warn-level so it reaches the journal; it only fires on change.
+        //     let details = hdr_candidate
+        //         .as_ref()
+        //         .map(describe_hdr_surface_tree)
+        //         .unwrap_or_default();
+        //     warn!(
+        //         output = %self.output.name(),
+        //         passthrough = hdr_client_passthrough,
+        //         covering_or_fullscreen = has_active_fullscreen,
+        //         hdr_description = has_hdr_fullscreen,
+        //         %details,
+        //         "HDR client passthrough changed"
+        //     );
+        //     let _ = self
+        //         .thread_sender
+        //         .send(SurfaceCommand::HdrPassthrough(hdr_client_passthrough));
+        // }
         set_hdr_client_blend(&mut renderer, self.hdr_config);
-        if hdr_client_passthrough {
+
+        if has_active_fullscreen {
             additional_frame_flags |= FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT;
         }
 
@@ -1517,14 +1462,14 @@ impl SurfaceThreadState {
         // to synchronized flips whenever the kernel refuses to tear.
         let tearing =
             tearing_allowed_for(&self.output.name()) && has_active_fullscreen && prefers_async;
-        if tearing != self.tearing_reported {
-            self.tearing_reported = tearing;
-            warn!(
-                output = %self.output.name(),
-                tearing,
-                "tearing presentation changed"
-            );
-        }
+        // if tearing != self.tearing_reported {
+        //     self.tearing_reported = tearing;
+        //     warn!(
+        //         output = %self.output.name(),
+        //         tearing,
+        //         "tearing presentation changed"
+        //     );
+        // }
 
         if has_active_fullscreen || animations_going {
             // skip overlay plane assign if we have a fullscreen surface or dynamic contents to save on tests

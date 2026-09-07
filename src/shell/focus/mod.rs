@@ -368,7 +368,7 @@ impl Shell {
                                 .surface
                                 .wl_surface()
                                 .as_deref()
-                                .is_some_and(surface_tree_has_hdr_client_description);
+                                .is_some_and(surface_tree_is_hdr);
                             let prefers_async = fs
                                 .surface
                                 .wl_surface()

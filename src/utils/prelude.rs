@@ -7,7 +7,6 @@ use smithay::{
     reexports::wayland_server::{Client, protocol::wl_surface::WlSurface},
     utils::Rectangle,
     wayland::{
-        color::management::surface_description_from_states,
         compositor::{Barrier, CompositorHandler},
         seat::WaylandFocus,
         tearing_control::prefer_async_from_states,
@@ -70,7 +69,6 @@ struct Mirroring(Mutex<Option<WeakOutput>>);
 #[derive(Debug, Clone, PartialEq)]
 pub struct FullscreenOccupied {
     pub surface: CosmicSurface,
-    pub has_hdr: bool,
     pub prefers_async: bool,
 }
 
@@ -86,14 +84,8 @@ impl FullscreenOccupied {
     pub fn new(surface: CosmicSurface, has_hdr: bool, prefers_async: bool) -> Self {
         Self {
             surface,
-            has_hdr,
             prefers_async,
         }
-    }
-
-    #[inline]
-    pub fn hdr(&self) -> bool {
-        self.has_hdr
     }
 
     #[inline]
@@ -105,7 +97,6 @@ impl FullscreenOccupied {
 #[derive(Debug, Clone)]
 struct WeakFullscreenOccupied {
     surface: WeakCosmicSurface,
-    has_hdr: bool,
     prefers_async: bool,
 }
 
@@ -312,7 +303,6 @@ impl OutputExt for Output {
         let should_update = match (&*lock.read(), &occupied) {
             (Some(current), Some(next)) => {
                 current.surface.upgrade().as_ref() != Some(&next.surface)
-                    || current.has_hdr != next.has_hdr
                     || current.prefers_async != next.prefers_async
             }
             (None, None) => false,
@@ -323,7 +313,6 @@ impl OutputExt for Output {
         }
         *lock.write() = occupied.map(|occ| WeakFullscreenOccupied {
             surface: occ.surface.downgrade(),
-            has_hdr: occ.has_hdr,
             prefers_async: occ.prefers_async,
         });
     }
@@ -335,7 +324,6 @@ impl OutputExt for Output {
         let surface = weak_occ.surface.upgrade()?;
         Some(FullscreenOccupied {
             surface,
-            has_hdr: weak_occ.has_hdr,
             prefers_async: weak_occ.prefers_async,
         })
     }
@@ -344,7 +332,7 @@ impl OutputExt for Output {
         let Some(state) = self.user_data().get::<OutputFullscreenOccupied>() else {
             return;
         };
-        let (surface, current_hdr, current_async) = {
+        let (surface, current_async) = {
             let guard = state.0.read();
             let Some(weak_occ) = guard.as_ref() else {
                 return;
@@ -352,17 +340,13 @@ impl OutputExt for Output {
             let Some(surface) = weak_occ.surface.upgrade() else {
                 return;
             };
-            (surface, weak_occ.has_hdr, weak_occ.prefers_async)
+            (surface, weak_occ.prefers_async)
         };
-        let has_hdr = surface
-            .wl_surface()
-            .as_deref()
-            .is_some_and(surface_tree_has_hdr_client_description);
         let prefers_async = surface
             .wl_surface()
             .as_deref()
             .is_some_and(surface_tree_prefers_async);
-        if current_hdr == has_hdr && current_async == prefers_async {
+        if current_async == prefers_async {
             return;
         }
         let mut guard = state.0.write();
@@ -370,7 +354,6 @@ impl OutputExt for Output {
             return;
         };
         if weak_occ.surface.upgrade().as_ref() == Some(&surface) {
-            weak_occ.has_hdr = has_hdr;
             weak_occ.prefers_async = prefers_async;
         }
     }
@@ -389,18 +372,14 @@ pub fn surface_tree_prefers_async(surface: &WlSurface) -> bool {
     found
 }
 
-pub fn surface_tree_has_hdr_client_description(surface: &WlSurface) -> bool {
+pub fn surface_tree_is_hdr(surface: &WlSurface) -> bool {
     let mut found = false;
     with_surfaces_surface_tree(surface, |_, states| {
-        let is_hdr = states
+        if states
             .data_map
             .get::<smithay::backend::renderer::utils::RendererSurfaceStateUserData>()
             .and_then(|data| data.lock().ok())
-            .is_some_and(|state| state.is_hdr());
-        if is_hdr
-            || surface_description_from_states(states)
-                .0
-                .is_some_and(|description| description.is_hdr())
+            .is_some_and(|state| state.is_hdr())
         {
             found = true;
         }
