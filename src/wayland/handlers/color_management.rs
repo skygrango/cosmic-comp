@@ -17,7 +17,7 @@ use smithay::{
     },
 };
 
-fn description_for_output(output: &Output) -> ImageDescription {
+pub(crate) fn description_for_output(output: &Output) -> ImageDescription {
     let Some(active) = output
         .user_data()
         .get::<HdrOutputState>()
@@ -36,12 +36,8 @@ fn description_for_output(output: &Output) -> ImageDescription {
         max_cll: Some(u32::from(caps.max_luminance)),
         max_fall: Some(u32::from(caps.max_frame_average_luminance)),
         mastering_luminance: Some((u32::from(caps.min_luminance), u32::from(caps.max_luminance))),
-        mastering_primaries: None,
-        luminances: Some((
-            u32::from(caps.min_luminance),
-            u32::from(caps.max_luminance),
-            u32::from(active.reference_white),
-        )),
+        mastering_primaries: active.native_primaries,
+        luminances: Some((50, 10_000, u32::from(active.reference_white))),
         windows_scrgb: false,
         windows_bt2100: false,
     }
@@ -120,12 +116,13 @@ mod tests {
                     min_luminance: 10,
                     max_frame_average_luminance: 993,
                 },
+                native_primaries: None,
                 reference_white: 203,
             }));
 
         let desc = description_for_output(&output);
         assert_eq!(desc.transfer, TransferFunction::St2084Pq);
         assert_eq!(desc.primaries.named, Some(Primaries::Bt2020));
-        assert_eq!(desc.luminances, Some((10, 993, 203)));
+        assert_eq!(desc.luminances, Some((50, 10_000, 203)));
     }
 }

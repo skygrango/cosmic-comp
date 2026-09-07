@@ -57,6 +57,9 @@ vec3 convert_primaries(vec3 linear_rgb) {
 }
 
 float decode_sdr(float value) {
+    if (hdr_sdr_gamma == 1.0) {
+        return value;
+    }
     if (hdr_sdr_gamma > 0.0) {
         return pow(max(value, 0.0), hdr_sdr_gamma);
     }
@@ -115,13 +118,7 @@ float pq_to_linear(float code) {
 }
 
 vec3 pq_rescale(vec3 code) {
-    float gain = clamp(hdr_reference_white, 80.0, 10000.0)
-        / max(hdr_content_reference, 80.0);
-    return vec3(
-        encode_pq(pq_to_linear(code.r) * gain),
-        encode_pq(pq_to_linear(code.g) * gain),
-        encode_pq(pq_to_linear(code.b) * gain)
-    );
+    return code;
 }
 
 // HLG inverse OETF (ARIB STD-B67 / ITU-R BT.2100)

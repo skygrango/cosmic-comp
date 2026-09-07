@@ -249,6 +249,7 @@ pub struct HdrSinkCapabilities {
 pub struct ActiveHdrOutput {
     pub capabilities: HdrSinkCapabilities,
     pub reference_white: u16,
+    pub native_primaries: Option<smithay::wayland::color::management::Chromaticities>,
 }
 
 #[derive(Debug, Default)]
@@ -581,6 +582,7 @@ mod hdr_tests {
                 min_luminance: 5,
                 max_frame_average_luminance: 400,
             },
+            native_primaries: None,
             reference_white: 203,
         };
         let state = HdrOutputState::default();

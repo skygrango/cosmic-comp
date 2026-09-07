@@ -180,6 +180,7 @@ pub struct Surface {
     hdr_enabled: bool,
     pub(super) hdr_passthrough: bool,
     pub(super) hdr_sink_capabilities: Option<drm_helpers::HdrSinkCapabilities>,
+    pub(super) native_primaries: Option<smithay::wayland::color::management::Chromaticities>,
     hdr_reference_white: f32,
 }
 
@@ -508,6 +509,7 @@ impl Surface {
             hdr_enabled: false,
             hdr_passthrough: false,
             hdr_sink_capabilities: None,
+            native_primaries: None,
             hdr_reference_white: 203.0,
         })
     }

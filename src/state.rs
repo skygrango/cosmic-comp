@@ -75,8 +75,9 @@ use smithay::{
         alpha_modifier::AlphaModifierState,
         background_effect::BackgroundEffectState,
         color::management::{
-            ColorManagementState, Feature as ColorFeature, Primaries as ColorPrimaries,
-            RenderIntent as ColorRenderIntent, TransferFunction as ColorTransferFunction,
+            ColorManagementState, Feature as ColorFeature, ImageDescription,
+            Primaries as ColorPrimaries, RenderIntent as ColorRenderIntent,
+            TransferFunction as ColorTransferFunction,
         },
         commit_timing::CommitTimingManagerState,
         compositor::{CompositorClientState, CompositorState, SurfaceData},
@@ -716,6 +717,9 @@ impl State {
                 ColorFeature::WindowsScrgb,
                 ColorFeature::WindowsBt2100,
                 ColorFeature::SetLuminances,
+                ColorFeature::SetMasteringDisplayPrimaries,
+                ColorFeature::ExtendedTargetVolume,
+                ColorFeature::SetPrimaries,
             ],
             [ColorRenderIntent::Perceptual],
             move |_| advertise_hdr,
@@ -1022,6 +1026,9 @@ fn primary_scanout_output_compare<'a>(
     default_primary_scanout_output_compare(current_output, current_state, next_output, next_state)
 }
 
+#[derive(Debug, Default)]
+struct OutputColorDescriptionState(parking_lot::Mutex<Option<ImageDescription>>);
+
 impl Common {
     #[profiling::function]
     pub fn update_primary_output(
@@ -1030,6 +1037,21 @@ impl Common {
         render_element_states: &RenderElementStates,
     ) {
         let shell = self.shell.read();
+        let color_management = &self.color_management_state;
+
+        let current_output_desc =
+            crate::wayland::handlers::color_management::description_for_output(output);
+        output
+            .user_data()
+            .insert_if_missing_threadsafe(OutputColorDescriptionState::default);
+        if let Some(desc_state) = output.user_data().get::<OutputColorDescriptionState>() {
+            let mut last_desc = desc_state.0.lock();
+            if *last_desc != Some(current_output_desc) {
+                *last_desc = Some(current_output_desc);
+                color_management.output_description_changed(output);
+            }
+        }
+
         let processor = |namespace: Option<usize>| {
             move |surface: &WlSurface, states: &SurfaceData| {
                 let primary_scanout_output = update_surface_primary_scanout_output(
@@ -1048,6 +1070,10 @@ impl Common {
                             output.current_scale().fractional_scale().max(1.0),
                         );
                     });
+                    color_management.preferred_changed(
+                        surface,
+                        crate::wayland::handlers::color_management::description_for_output(&output),
+                    );
                 }
             }
         };

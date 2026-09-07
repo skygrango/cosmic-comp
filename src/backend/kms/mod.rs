@@ -1174,13 +1174,35 @@ impl KmsGuard<'_> {
 
                 let drm = &mut device.drm;
                 let conn = surface.connector;
-                // Probed unconditionally: settings UIs need to know which
-                // panels can do HDR before it is ever enabled.
-                let hdr_capabilities = drm_helpers::edid_info(drm.device(), conn)
-                    .ok()
+                let edid_info = drm_helpers::edid_info(drm.device(), conn).ok();
+                let hdr_capabilities = edid_info
                     .as_ref()
                     .and_then(drm_helpers::hdr_sink_capabilities);
                 surface.hdr_sink_capabilities = hdr_capabilities;
+                let native_primaries = edid_info.as_ref().and_then(|info| {
+                    info.edid().map(|edid| {
+                        let coords = edid.chromaticity_coords();
+                        smithay::wayland::color::management::Chromaticities {
+                            red: (
+                                (coords.red_x * 1_000_000.0).round() as i32,
+                                (coords.red_y * 1_000_000.0).round() as i32,
+                            ),
+                            green: (
+                                (coords.green_x * 1_000_000.0).round() as i32,
+                                (coords.green_y * 1_000_000.0).round() as i32,
+                            ),
+                            blue: (
+                                (coords.blue_x * 1_000_000.0).round() as i32,
+                                (coords.blue_y * 1_000_000.0).round() as i32,
+                            ),
+                            white: (
+                                (coords.white_x * 1_000_000.0).round() as i32,
+                                (coords.white_y * 1_000_000.0).round() as i32,
+                            ),
+                        }
+                    })
+                });
+                surface.native_primaries = native_primaries;
                 let conn_info = drm.device().get_connector(conn, false)?;
                 let mode = conn_info
                     .modes()
@@ -1326,6 +1348,7 @@ impl KmsGuard<'_> {
                                             active_hdr_output =
                                                 Some(drm_helpers::ActiveHdrOutput {
                                                     capabilities: caps,
+                                                    native_primaries: surface.native_primaries,
                                                     reference_white: hdr_reference_white as u16,
                                                 });
                                             info!(
@@ -1532,6 +1555,7 @@ impl KmsGuard<'_> {
                                                     .unwrap()
                                                     .stage(Some(drm_helpers::ActiveHdrOutput {
                                                         capabilities: caps,
+                                                        native_primaries: surface.native_primaries,
                                                         reference_white: white as u16,
                                                     }));
                                                 info!(

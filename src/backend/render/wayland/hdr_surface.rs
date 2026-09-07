@@ -178,7 +178,7 @@ where
                     (program.clone(), uniforms)
                 })
             }
-            HdrSurfaceContent::ScrgbLinear { reference_scale } => {
+            HdrSurfaceContent::ScrgbLinear { .. } => {
                 saved.as_ref().map(|(program, uniforms)| {
                     let mut uniforms = uniforms.clone();
                     for uniform in &mut uniforms {
@@ -191,10 +191,9 @@ where
                             // scRGB escapes the sRGB gamut numerically; the
                             // "vivid" stretch must not distort it further.
                             "hdr_gamut_stretch" => uniform.value = UniformValue::_1f(0.0),
+                            // In scRGB, 1.0 is defined as 80 cd/m² (SMPTE ST 2084 scRGB).
                             "hdr_reference_white" => {
-                                if let UniformValue::_1f(white) = &mut uniform.value {
-                                    *white *= reference_scale;
-                                }
+                                uniform.value = UniformValue::_1f(80.0);
                             }
                             _ => {}
                         }
