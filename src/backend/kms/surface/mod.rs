@@ -1426,11 +1426,10 @@ impl SurfaceThreadState {
                 | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY;
         }
 
-        // Tearing: honor the fullscreen/covering client's async hint with real
-        // async page flips when the user allows it. The KMS layer falls back
-        // to synchronized flips whenever the kernel refuses to tear.
-        let tearing =
-            tearing_allowed_for(&self.output.name()) && has_active_fullscreen && prefers_async;
+        let tearing = !self.hdr_enabled
+            && tearing_allowed_for(&self.output.name())
+            && has_active_fullscreen
+            && prefers_async;
 
         if has_active_fullscreen || animations_going {
             // skip overlay plane assign if we have a fullscreen surface or dynamic contents to save on tests
