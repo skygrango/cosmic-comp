@@ -711,7 +711,11 @@ impl State {
                 ColorTransferFunction::Bt1886,
                 ColorTransferFunction::Gamma22,
             ],
-            [ColorPrimaries::Bt2020],
+            [
+                ColorPrimaries::Bt2020,
+                ColorPrimaries::Srgb,
+                ColorPrimaries::DisplayP3,
+            ],
             [
                 ColorFeature::WindowsScrgb,
                 ColorFeature::WindowsBt2100,
