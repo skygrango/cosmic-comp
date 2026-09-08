@@ -70,6 +70,7 @@ struct Mirroring(Mutex<Option<WeakOutput>>);
 pub struct FullscreenOccupied {
     pub surface: CosmicSurface,
     pub prefers_async: bool,
+    pub is_hdr: bool,
 }
 
 impl std::ops::Deref for FullscreenOccupied {
@@ -81,10 +82,11 @@ impl std::ops::Deref for FullscreenOccupied {
 }
 
 impl FullscreenOccupied {
-    pub fn new(surface: CosmicSurface, prefers_async: bool) -> Self {
+    pub fn new(surface: CosmicSurface, prefers_async: bool, is_hdr: bool) -> Self {
         Self {
             surface,
             prefers_async,
+            is_hdr,
         }
     }
 
@@ -92,12 +94,18 @@ impl FullscreenOccupied {
     pub fn tearing(&self) -> bool {
         self.prefers_async
     }
+
+    #[inline]
+    pub fn is_hdr(&self) -> bool {
+        self.is_hdr
+    }
 }
 
 #[derive(Debug, Clone)]
 struct WeakFullscreenOccupied {
     surface: WeakCosmicSurface,
     prefers_async: bool,
+    is_hdr: bool,
 }
 
 struct OutputFullscreenOccupied(RwLock<Option<WeakFullscreenOccupied>>);
@@ -303,6 +311,7 @@ impl OutputExt for Output {
         let should_update = match (&*lock.read(), &occupied) {
             (Some(current), Some(next)) => {
                 current.surface.upgrade().as_ref() != Some(&next.surface)
+                    || current.is_hdr != next.is_hdr
                     || current.prefers_async != next.prefers_async
             }
             (None, None) => false,
@@ -314,6 +323,7 @@ impl OutputExt for Output {
         *lock.write() = occupied.map(|occ| WeakFullscreenOccupied {
             surface: occ.surface.downgrade(),
             prefers_async: occ.prefers_async,
+            is_hdr: occ.is_hdr,
         });
     }
 
@@ -325,6 +335,7 @@ impl OutputExt for Output {
         Some(FullscreenOccupied {
             surface,
             prefers_async: weak_occ.prefers_async,
+            is_hdr: weak_occ.is_hdr,
         })
     }
 
@@ -374,12 +385,20 @@ pub fn surface_tree_prefers_async(surface: &WlSurface) -> bool {
 
 pub fn surface_tree_is_hdr(surface: &WlSurface) -> bool {
     let mut found = false;
+    // with_surfaces_surface_tree(surface, |_, states| {
+    //     if states
+    //         .data_map
+    //         .get::<smithay::backend::renderer::utils::RendererSurfaceStateUserData>()
+    //         .and_then(|data| data.lock().ok())
+    //         .is_some_and(|state| state.is_hdr())
+    //     {
+    //         found = true;
+    //     }
+    // });
     with_surfaces_surface_tree(surface, |_, states| {
-        if states
-            .data_map
-            .get::<smithay::backend::renderer::utils::RendererSurfaceStateUserData>()
-            .and_then(|data| data.lock().ok())
-            .is_some_and(|state| state.is_hdr())
+        if smithay::wayland::color::management::surface_description_from_states(states)
+            .0
+            .is_some_and(|description| description.is_pq_bt2020() || description.windows_scrgb)
         {
             found = true;
         }

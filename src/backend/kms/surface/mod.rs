@@ -172,6 +172,7 @@ pub struct SurfaceThreadState {
     mirroring: Option<Output>,
     screen_filter: ScreenFilter,
     hdr_enabled: bool,
+    is_scanout: bool,
     hdr_reference_white: f32,
     hdr_max_luminance: f32,
     hdr_hardware_offload: bool,
@@ -251,6 +252,14 @@ pub fn is_surface_scanout_compatible(
     } else {
         // On an SDR output, standard SDR content (non-HDR) matches the display pipeline.
         !surface_desc.is_some_and(|desc| desc.is_hdr())
+    }
+}
+
+pub fn is_scanout_compatible(output_hdr_enabled: bool, is_fullscreen_hdr: bool) -> bool {
+    if output_hdr_enabled == is_fullscreen_hdr {
+        true
+    } else {
+        false
     }
 }
 
@@ -785,6 +794,7 @@ fn surface_thread(
         mirroring: None,
         screen_filter,
         hdr_enabled: false,
+        is_scanout: false,
         hdr_reference_white: 203.0,
         hdr_max_luminance: 1000.0,
         hdr_hardware_offload: false,
@@ -1392,18 +1402,15 @@ impl SurfaceThreadState {
                     recursive_frame_time_estimation(&self.clock, &surface)
                         .is_some_and(|dur| dur <= min_vrr_frame_time)
                 });
-                let surface_desc = fullscreen_surface
-                    .wl_surface()
-                    .and_then(|surface| get_surface_description(&surface).0);
-                let is_scanout_compatible =
-                    is_surface_scanout_compatible(self.hdr_enabled, surface_desc.as_ref());
                 let prefers_async = fullscreen_surface.prefers_async;
+                let is_fullscreen_scanout_compatible =
+                    is_scanout_compatible(self.hdr_enabled, fullscreen_surface.is_hdr);
                 (
                     true,
                     drives_refresh_rate,
                     animations_going,
                     prefers_async,
-                    is_scanout_compatible,
+                    is_fullscreen_scanout_compatible,
                 )
             } else {
                 (false, false, animations_going, false, false)
@@ -1417,6 +1424,15 @@ impl SurfaceThreadState {
             && self.screen_filter.is_noop()
             && self.mirroring.is_none()
             && !bool_var("COSMIC_DISABLE_DIRECT_SCANOUT").unwrap_or(false);
+
+        if self.is_scanout != allow_primary_scanout {
+            if allow_primary_scanout {
+                error!("Eable SCANOUT");
+            } else {
+                error!("Disable SCANOUT");
+            }
+            self.is_scanout = allow_primary_scanout;
+        }
 
         if allow_primary_scanout {
             additional_frame_flags |= FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT

@@ -13,6 +13,7 @@ use smithay::{
     reexports::wayland_server::{Resource, protocol::wl_surface::WlSurface},
     utils::{IsAlive, Point, SERIAL_COUNTER, Serial},
     wayland::{
+        color::management::get_surface_description,
         pointer_constraints::with_pointer_constraint,
         seat::WaylandFocus,
         selection::{data_device::set_data_device_focus, primary_selection::set_primary_focus},
@@ -21,7 +22,7 @@ use smithay::{
 };
 use std::{borrow::Cow, hash::Hash, mem, sync::Mutex};
 
-use tracing::{debug, trace};
+use tracing::{debug, error, trace};
 
 pub use self::order::{Stage, render_input_order};
 use self::target::{KeyboardFocusTarget, WindowGroup};
@@ -362,9 +363,18 @@ impl Shell {
                                 .as_deref()
                                 .is_some_and(surface_tree_prefers_async);
 
+                            let is_hdr = fs
+                                .surface
+                                .wl_surface()
+                                .as_deref()
+                                .is_some_and(surface_tree_is_hdr);
+
+                            //error!("fullscreen is hdr:{:?}", is_hdr);
+
                             output.set_fullscreen_occupied(Some(FullscreenOccupied {
                                 surface: fs.surface.clone(),
                                 prefers_async,
+                                is_hdr,
                             }));
                             true
                         } else {

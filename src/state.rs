@@ -702,31 +702,40 @@ impl State {
         let advertise_hdr = hdr_policy().experiment_enabled;
         let color_management_state = ColorManagementState::new::<Self, _>(
             dh,
-            [
-                ColorTransferFunction::St2084Pq,
-                ColorTransferFunction::Hlg,
-                ColorTransferFunction::ExtLinear,
-                ColorTransferFunction::CompoundPower24,
-                ColorTransferFunction::Srgb,
-                ColorTransferFunction::Bt1886,
-                ColorTransferFunction::Gamma22,
-            ],
-            [
-                ColorPrimaries::Bt2020,
-                ColorPrimaries::Srgb,
-                ColorPrimaries::DisplayP3,
-            ],
-            [
-                ColorFeature::WindowsScrgb,
-                ColorFeature::WindowsBt2100,
-                ColorFeature::SetLuminances,
-                ColorFeature::SetMasteringDisplayPrimaries,
-                ColorFeature::ExtendedTargetVolume,
-                ColorFeature::SetPrimaries,
-            ],
+            [ColorTransferFunction::St2084Pq],
+            [ColorPrimaries::Bt2020],
+            [ColorFeature::WindowsScrgb, ColorFeature::WindowsBt2100],
             [ColorRenderIntent::Perceptual],
             move |_| advertise_hdr,
         );
+
+        // let color_management_state = ColorManagementState::new::<Self, _>(
+        //     dh,
+        //     [
+        //         ColorTransferFunction::St2084Pq,
+        //         ColorTransferFunction::Hlg,
+        //         ColorTransferFunction::ExtLinear,
+        //         ColorTransferFunction::CompoundPower24,
+        //         ColorTransferFunction::Srgb,
+        //         ColorTransferFunction::Bt1886,
+        //         ColorTransferFunction::Gamma22,
+        //     ],
+        //     [
+        //         ColorPrimaries::Bt2020,
+        //         ColorPrimaries::Srgb,
+        //         ColorPrimaries::DisplayP3,
+        //     ],
+        //     [
+        //         ColorFeature::WindowsScrgb,
+        //         ColorFeature::WindowsBt2100,
+        //         ColorFeature::SetLuminances,
+        //         ColorFeature::SetMasteringDisplayPrimaries,
+        //         ColorFeature::ExtendedTargetVolume,
+        //         ColorFeature::SetPrimaries,
+        //     ],
+        //     [ColorRenderIntent::Perceptual],
+        //     move |_| advertise_hdr,
+        // );
         let corner_radius_state = CornerRadiusState::new::<Self>(dh);
         let data_device_state = DataDeviceState::new::<Self>(dh);
         let dmabuf_state = DmabufState::new();
