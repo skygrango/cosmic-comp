@@ -732,15 +732,21 @@ impl Device {
             .with_context(|| format!("Failed to initialize GBM device for {}", path.display()))?;
         let (render_node, render_formats, texture_formats, is_software, egl, vulkan_phd, is_vulkan) =
             if let Some(instance) = vulkan_instance {
+                let dev_render_node = dev_node
+                    .node_with_type(smithay::backend::drm::NodeType::Render)
+                    .and_then(|res| res.ok());
+                let dev_primary_node = dev_node
+                    .node_with_type(smithay::backend::drm::NodeType::Primary)
+                    .and_then(|res| res.ok());
                 let phd = PhysicalDevice::enumerate(instance)?
                     .find(|phd| {
                         if let Ok(Some(primary)) = phd.primary_node() {
-                            if primary == dev_node {
+                            if primary == dev_node || Some(primary) == dev_primary_node {
                                 return true;
                             }
                         }
                         if let Ok(Some(render)) = phd.render_node() {
-                            if render == dev_node {
+                            if render == dev_node || Some(render) == dev_render_node {
                                 return true;
                             }
                         }
