@@ -911,7 +911,7 @@ impl CosmicSurface {
                         geometry,
                         scale,
                         alpha,
-                        false,
+                        radii.iter().any(|r| *r != 0),
                         radii,
                         None,
                         blur_strength,

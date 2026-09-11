@@ -13,6 +13,7 @@ use smithay::{
     reexports::wayland_server::{Resource, protocol::wl_surface::WlSurface},
     utils::{IsAlive, Point, SERIAL_COUNTER, Serial},
     wayland::{
+        color::management::get_surface_description,
         pointer_constraints::with_pointer_constraint,
         seat::WaylandFocus,
         selection::{data_device::set_data_device_focus, primary_selection::set_primary_focus},
@@ -21,7 +22,7 @@ use smithay::{
 };
 use std::{borrow::Cow, hash::Hash, mem, sync::Mutex};
 
-use tracing::{debug, trace};
+use tracing::{debug, error, trace};
 
 pub use self::order::{Stage, render_input_order};
 use self::target::{KeyboardFocusTarget, WindowGroup};
@@ -355,16 +356,26 @@ impl Shell {
                             is_focused
                         };
 
-                        let current_geo = SpaceElement::geometry(&fs.surface).as_local();
-                        let output_geo = output.geometry().to_local(&output);
+                        if is_foreground {
+                            let prefers_async = fs
+                                .surface
+                                .wl_surface()
+                                .as_deref()
+                                .is_some_and(surface_tree_prefers_async);
 
-                        let is_really_fullscreen = current_geo.loc.x <= 1
-                            && current_geo.loc.y <= 1
-                            && (current_geo.size.w - output_geo.size.w).abs() <= 1
-                            && (current_geo.size.h - output_geo.size.h).abs() <= 1;
+                            let is_hdr = fs
+                                .surface
+                                .wl_surface()
+                                .as_deref()
+                                .is_some_and(surface_tree_is_hdr);
 
-                        if is_foreground && is_really_fullscreen {
-                            output.set_fullscreen_occupied(Some(fs.surface.clone()));
+                            //error!("fullscreen is hdr:{:?}", is_hdr);
+
+                            output.set_fullscreen_occupied(Some(FullscreenOccupied {
+                                surface: fs.surface.clone(),
+                                prefers_async,
+                                is_hdr,
+                            }));
                             true
                         } else {
                             false

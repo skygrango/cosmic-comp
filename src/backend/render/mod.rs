@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use std::{
-    borrow::Borrow,
+    borrow::{Borrow, BorrowMut},
     cell::RefCell,
     collections::HashMap,
     ops::ControlFlow,
@@ -116,6 +116,18 @@ pub type VulkanMultiFrame<'a, 'frame, 'buffer> = MultiFrame<
 >;
 pub type VulkanMultiError =
     MultiError<GbmVulkanBackend<DrmDeviceFd>, GbmVulkanBackend<DrmDeviceFd>>;
+
+use smithay::backend::renderer::gles::HdrOutputConfig;
+
+/// Configure default texture and solid-color draws for a frame whose client
+/// buffers are already PQ/BT.2020. Surfaces will have their texture shader uniforms
+/// adjusted per surface based on their committed color description directly in smithay.
+pub fn set_hdr_client_blend<R: AsGlowRenderer>(renderer: &mut R, config: Option<HdrOutputConfig>) {
+    if let Some(glow) = renderer.glow_renderer_mut() {
+        let gles = BorrowMut::<GlesRenderer>::borrow_mut(glow);
+        let _ = gles.set_hdr_output(config);
+    }
+}
 
 pub enum RendererRef<'a> {
     Glow(&'a mut GlowRenderer),
@@ -307,10 +319,10 @@ impl IndicatorShader {
                     Uniform::new(
                         "radius",
                         [
-                            outer_radius[0] as f32,
-                            outer_radius[1] as f32,
-                            outer_radius[2] as f32,
                             outer_radius[3] as f32,
+                            outer_radius[1] as f32,
+                            outer_radius[0] as f32,
+                            outer_radius[2] as f32,
                         ],
                     ),
                     Uniform::new("scale", scale as f32),
@@ -448,6 +460,11 @@ pub fn init_shaders(renderer: &mut GlesRenderer) -> Result<(), GlesError> {
         &[
             UniformName::new("invert", UniformType::_1f),
             UniformName::new("color_mode", UniformType::_1f),
+            UniformName::new("hdr_enabled", UniformType::_1f),
+            UniformName::new("hdr_reference_white", UniformType::_1f),
+            UniformName::new("hdr_sdr_gamma", UniformType::_1f),
+            UniformName::new("hdr_gamut_stretch", UniformType::_1f),
+            UniformName::new("hdr_hardware_offload", UniformType::_1f),
         ],
     )?;
     let clipping_shader = renderer.compile_custom_texture_shader(
@@ -457,6 +474,18 @@ pub fn init_shaders(renderer: &mut GlesRenderer) -> Result<(), GlesError> {
             UniformName::new("corner_radius", UniformType::_4f),
             UniformName::new("input_to_geo", UniformType::Matrix3x3),
             UniformName::new("noise", UniformType::_1f),
+            UniformName::new("hdr_enabled", UniformType::_1f),
+            UniformName::new("hdr_reference_white", UniformType::_1f),
+            UniformName::new("hdr_sdr_gamma", UniformType::_1f),
+            UniformName::new("hdr_gamut_stretch", UniformType::_1f),
+            UniformName::new("hdr_hardware_offload", UniformType::_1f),
+            UniformName::new("hdr_target_is_sdr", UniformType::_1f),
+            UniformName::new("hdr_input_pq", UniformType::_1f),
+            UniformName::new("hdr_input_hlg", UniformType::_1f),
+            UniformName::new("hdr_input_primaries", UniformType::_1f),
+            UniformName::new("hdr_content_reference", UniformType::_1f),
+            UniformName::new("hdr_max_content_luminance", UniformType::_1f),
+            UniformName::new("hdr_max_destination_luminance", UniformType::_1f),
         ],
     )?;
     let shadow_shader = renderer.compile_custom_pixel_shader(
@@ -904,7 +933,7 @@ where
                     geometry.to_local(output).as_logical().to_f64(),
                     Scale::from(scale),
                     1.0,
-                    false,
+                    radii.iter().any(|r| *r != 0),
                     radii,
                     None,
                     blur_strength,
@@ -953,7 +982,7 @@ where
                     geometry.to_f64(),
                     Scale::from(scale),
                     1.0,
-                    false,
+                    radii.iter().any(|r| *r != 0),
                     radii,
                     padded.to_f64(),
                     blur_strength,
@@ -1150,6 +1179,16 @@ pub struct PostprocessState {
     pub cursor_texture: Option<TextureRenderBuffer<GlesTexture>>,
     pub cursor_damage_tracker: Option<OutputDamageTracker>,
     pub output_config: PostprocessOutputConfig,
+}
+
+/// Pick the SDR render target that feeds the HDR post-processing shader.
+///
+/// A ten-bit scanout format does not imply that rendering to and sampling an
+/// offscreen texture with that format is reliable. The compositor contents at
+/// this point are still sRGB, so use the matching, widely-supported eight-bit
+/// Pick the intermediate render target format for post-processing shaders.
+pub fn postprocess_intermediate_format(output_format: Fourcc, _hdr_enabled: bool) -> Fourcc {
+    output_format
 }
 
 impl PostprocessState {
@@ -1413,6 +1452,10 @@ where
                                 .map(|val| val as u8 as f32)
                                 .unwrap_or(0.),
                         ),
+                        Uniform::new("hdr_enabled", 0.0_f32),
+                        Uniform::new("hdr_reference_white", 203.0_f32),
+                        Uniform::new("hdr_sdr_gamma", 0.0_f32),
+                        Uniform::new("hdr_gamut_stretch", 0.0_f32),
                     ],
                 );
                 constrain_render_elements(
