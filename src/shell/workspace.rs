@@ -2155,16 +2155,22 @@ where
             WorkspaceRenderElement::Window(elem) => {
                 elem.draw(frame, src, dst, damage, opaque_regions, cache)
             }
-            WorkspaceRenderElement::Backdrop(elem) => RenderElement::<GlowRenderer>::draw(
-                elem,
-                R::glow_frame_mut(frame),
-                src,
-                dst,
-                damage,
-                opaque_regions,
-                cache,
-            )
-            .map_err(R::from_gles_error),
+            WorkspaceRenderElement::Backdrop(elem) => {
+                if let Some(glow_frame) = R::glow_frame_mut(frame) {
+                    RenderElement::<GlowRenderer>::draw(
+                        elem,
+                        glow_frame,
+                        src,
+                        dst,
+                        damage,
+                        opaque_regions,
+                        cache,
+                    )
+                    .map_err(R::from_gles_error)
+                } else {
+                    Ok(())
+                }
+            }
         }
     }
 
@@ -2179,7 +2185,9 @@ where
             WorkspaceRenderElement::FullscreenPopup(elem) => elem.underlying_storage(renderer),
             WorkspaceRenderElement::Window(elem) => elem.underlying_storage(renderer),
             WorkspaceRenderElement::Backdrop(elem) => {
-                elem.underlying_storage(renderer.glow_renderer_mut())
+                renderer
+                    .glow_renderer_mut()
+                    .and_then(|glow| elem.underlying_storage(glow))
             }
         }
     }
@@ -2208,14 +2216,18 @@ where
                 elem.capture_framebuffer(frame, src, dst, cache)
             }
             WorkspaceRenderElement::Backdrop(elem) => {
-                RenderElement::<GlowRenderer>::capture_framebuffer(
-                    elem,
-                    R::glow_frame_mut(frame),
-                    src,
-                    dst,
-                    cache,
-                )
-                .map_err(R::from_gles_error)
+                if let Some(glow_frame) = R::glow_frame_mut(frame) {
+                    RenderElement::<GlowRenderer>::capture_framebuffer(
+                        elem,
+                        glow_frame,
+                        src,
+                        dst,
+                        cache,
+                    )
+                    .map_err(R::from_gles_error)
+                } else {
+                    Ok(())
+                }
             }
         }
     }

@@ -248,16 +248,20 @@ where
         session_user_data
             .offscreen
             .take_if(|(context_id, renderbuffer)| {
-                renderer.glow_renderer().context_id() != *context_id
+                renderer.glow_renderer().map(|r| r.context_id()).as_ref() != Some(context_id)
                     || renderbuffer.size() != size
                     || renderbuffer.format() != Some(format)
             });
 
         if session_user_data.offscreen.is_none() {
-            let renderbuffer = Offscreen::<GlesRenderbuffer>::create_buffer(renderer, format, size)
+            let Some(glow) = renderer.glow_renderer() else {
+                return Ok(None);
+            };
+            let context_id = glow.context_id();
+            let renderbuffer = renderer
+                .create_glow_renderbuffer(format, size)
                 .map_err(DTError::Rendering)?;
-            session_user_data.offscreen =
-                Some((renderer.glow_renderer().context_id(), renderbuffer));
+            session_user_data.offscreen = Some((context_id, renderbuffer));
             // If we're allocating a new offscreen buffer, we need to re-render everything
             // (or copy the contexts of the shm buffer)
             age = 0;
@@ -271,7 +275,7 @@ where
     let SessionUserData { dt, offscreen } = &mut *session_user_data;
     let mut fb = offscreen
         .as_mut()
-        .map(|(_, tex)| renderer.bind(tex).map_err(DTError::Rendering))
+        .map(|(_, tex)| renderer.bind_glow_renderbuffer(tex).map_err(DTError::Rendering))
         .transpose()?;
     let (result, buffers) = render_fn(
         &frame.buffer(),

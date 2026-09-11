@@ -102,6 +102,15 @@ pub type GlMultiFrame<'a, 'frame, 'buffer> =
     MultiFrame<'a, 'a, 'frame, 'buffer, GbmGlowBackend<DrmDeviceFd>, GbmGlowBackend<DrmDeviceFd>>;
 pub type GlMultiError = MultiError<GbmGlowBackend<DrmDeviceFd>, GbmGlowBackend<DrmDeviceFd>>;
 
+use crate::backend::kms::render::vulkan::GbmVulkanBackend;
+
+pub type VulkanMultiRenderer<'a> =
+    MultiRenderer<'a, 'a, GbmVulkanBackend<DrmDeviceFd>, GbmVulkanBackend<DrmDeviceFd>>;
+pub type VulkanMultiFrame<'a, 'frame, 'buffer> =
+    MultiFrame<'a, 'a, 'frame, 'buffer, GbmVulkanBackend<DrmDeviceFd>, GbmVulkanBackend<DrmDeviceFd>>;
+pub type VulkanMultiError =
+    MultiError<GbmVulkanBackend<DrmDeviceFd>, GbmVulkanBackend<DrmDeviceFd>>;
+
 pub enum RendererRef<'a> {
     Glow(&'a mut GlowRenderer),
     GlMulti(GlMultiRenderer<'a>),
@@ -197,7 +206,10 @@ type IndicatorCache = RefCell<HashMap<Key, (IndicatorSettings, PixelShaderElemen
 
 impl IndicatorShader {
     pub fn get<R: AsGlowRenderer>(renderer: &R) -> GlesPixelProgram {
-        Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
+        let Some(glow) = renderer.glow_renderer() else {
+            return GlesPixelProgram::dummy();
+        };
+        Borrow::<GlesRenderer>::borrow(glow)
             .egl_context()
             .user_data()
             .get::<IndicatorShader>()
@@ -251,7 +263,10 @@ impl IndicatorShader {
             color,
         };
 
-        let user_data = Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
+        let Some(glow) = renderer.glow_renderer() else {
+            return PixelShaderElement::dummy();
+        };
+        let user_data = Borrow::<GlesRenderer>::borrow(glow)
             .egl_context()
             .user_data();
 
@@ -309,7 +324,7 @@ impl IndicatorShader {
 
 pub struct BackdropShader(pub GlesPixelProgram);
 
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 struct BackdropSettings {
     radius: f32,
     alpha: f32,
@@ -319,7 +334,10 @@ type BackdropCache = RefCell<HashMap<Key, (BackdropSettings, PixelShaderElement)
 
 impl BackdropShader {
     pub fn get<R: AsGlowRenderer>(renderer: &R) -> GlesPixelProgram {
-        Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
+        let Some(glow) = renderer.glow_renderer() else {
+            return GlesPixelProgram::dummy();
+        };
+        Borrow::<GlesRenderer>::borrow(glow)
             .egl_context()
             .user_data()
             .get::<BackdropShader>()
@@ -342,7 +360,10 @@ impl BackdropShader {
             color,
         };
 
-        let user_data = Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
+        let Some(glow) = renderer.glow_renderer() else {
+            return PixelShaderElement::dummy();
+        };
+        let user_data = Borrow::<GlesRenderer>::borrow(glow)
             .egl_context()
             .user_data();
 
@@ -644,13 +665,15 @@ where
         std::mem::drop(shell_guard);
         let scale = output.current_scale().fractional_scale();
 
-        if let Some((state, timings)) = _fps {
+        if let Some((state, timings)) = _fps
+            && let Some(glow_renderer) = renderer.glow_renderer_mut()
+        {
             vec![
                 fps_ui(
                     _gpu,
                     debug_active,
                     &seats,
-                    renderer.glow_renderer_mut(),
+                    glow_renderer,
                     state,
                     timings,
                     Rectangle::from_size(
@@ -1132,9 +1155,11 @@ impl PostprocessState {
         let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
         let opaque_regions = vec![Rectangle::from_size(buffer_size)];
 
-        let texture = Offscreen::<GlesTexture>::create_buffer(renderer, format, buffer_size)?;
+        let glow = renderer.glow_renderer_mut().expect("GLES renderer required");
+        let texture = Offscreen::<GlesTexture>::create_buffer(glow, format, buffer_size)
+            .map_err(R::from_gles_error)?;
         let texture_buffer = TextureRenderBuffer::from_texture(
-            renderer.glow_renderer(),
+            glow,
             texture,
             1,
             Transform::Normal,
@@ -1177,10 +1202,12 @@ impl PostprocessState {
             return Ok(());
         }
 
-        let texture = Offscreen::<GlesTexture>::create_buffer(renderer, format, buffer_size)?;
+        let glow = renderer.glow_renderer_mut().expect("GLES renderer required");
+        let texture = Offscreen::<GlesTexture>::create_buffer(glow, format, buffer_size)
+            .map_err(R::from_gles_error)?;
 
         let texture_buffer = TextureRenderBuffer::from_texture(
-            renderer.glow_renderer(),
+            glow,
             texture,
             1,
             Transform::Normal,
@@ -1280,7 +1307,7 @@ where
     };
 
     let mut postprocess_texture = None;
-    let result = if !screen_filter.filter.is_noop() {
+    let result = if !screen_filter.filter.is_noop() && renderer.glow_renderer().is_some() {
         if screen_filter.state.as_ref().is_none_or(|state| {
             state.output_config != PostprocessOutputConfig::for_output_untransformed(output)
         }) {
@@ -1300,7 +1327,7 @@ where
             .texture
             .render()
             .draw::<_, RenderError<R::Error>>(|tex| {
-                let mut target = renderer.bind(tex).map_err(RenderError::Rendering)?;
+                let mut target = renderer.bind_glow_texture(tex).map_err(RenderError::Rendering)?;
                 result = render_workspace(
                     gpu,
                     renderer,
@@ -1350,6 +1377,7 @@ where
 
             let postprocess_texture_shader = renderer
                 .glow_renderer_mut()
+                .expect("GLES renderer required")
                 .egl_context()
                 .user_data()
                 .get::<PostprocessShader>()
@@ -1511,7 +1539,7 @@ where
                             // but then rustc tries to equate the lifetime of target with the lifetime of our temporary fb...
                             // So instead of duplicating all the code, we use a closure..
                             if let Some(tex) = postprocess_texture.as_mut() {
-                                let mut fb = renderer.bind(tex).map_err(RenderError::Rendering)?;
+                                let mut fb = renderer.bind_glow_texture(tex).map_err(RenderError::Rendering)?;
                                 blit_to_buffer(renderer, &mut fb)
                                     .map_err(RenderError::Rendering)?;
                             } else {

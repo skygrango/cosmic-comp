@@ -32,7 +32,10 @@ type ShadowCache = RefCell<HashMap<CosmicMappedKey, (ShadowParameters, PixelShad
 
 impl ShadowShader {
     pub fn get<R: AsGlowRenderer>(renderer: &R) -> GlesPixelProgram {
-        Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
+        let Some(glow) = renderer.glow_renderer() else {
+            return GlesPixelProgram::dummy();
+        };
+        Borrow::<GlesRenderer>::borrow(glow)
             .egl_context()
             .user_data()
             .get::<ShadowShader>()
@@ -50,6 +53,10 @@ impl ShadowShader {
         scale: f64,
         dark_mode: bool,
     ) -> PixelShaderElement {
+        let Some(glow) = renderer.glow_renderer() else {
+            return PixelShaderElement::dummy();
+        };
+
         let params = ShadowParameters {
             geo,
             scale,
@@ -66,7 +73,7 @@ impl ShadowShader {
         geo.size.w -= fractional_pixel * 2.;
         geo.size.h -= fractional_pixel * 2.;
 
-        let user_data = Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
+        let user_data = Borrow::<GlesRenderer>::borrow(glow)
             .egl_context()
             .user_data();
 

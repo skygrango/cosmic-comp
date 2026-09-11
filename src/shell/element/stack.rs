@@ -2252,16 +2252,20 @@ where
                 elem.draw(frame, src, dst, damage, opaque_regions, cache)
             }
             CosmicStackRenderElement::Shadow(elem) | CosmicStackRenderElement::Border(elem) => {
-                RenderElement::<GlowRenderer>::draw(
-                    elem,
-                    R::glow_frame_mut(frame),
-                    src,
-                    dst,
-                    damage,
-                    opaque_regions,
-                    cache,
-                )
-                .map_err(R::from_gles_error)
+                if let Some(glow_frame) = R::glow_frame_mut(frame) {
+                    RenderElement::<GlowRenderer>::draw(
+                        elem,
+                        glow_frame,
+                        src,
+                        dst,
+                        damage,
+                        opaque_regions,
+                        cache,
+                    )
+                    .map_err(R::from_gles_error)
+                } else {
+                    Ok(())
+                }
             }
             CosmicStackRenderElement::Window(elem) => {
                 elem.draw(frame, src, dst, damage, opaque_regions, cache)
@@ -2273,7 +2277,7 @@ where
         match self {
             CosmicStackRenderElement::Header(elem) => elem.underlying_storage(renderer),
             CosmicStackRenderElement::Shadow(elem) | CosmicStackRenderElement::Border(elem) => {
-                elem.underlying_storage(renderer.glow_renderer_mut())
+                renderer.glow_renderer_mut().and_then(|glow| elem.underlying_storage(glow))
             }
             CosmicStackRenderElement::Window(elem) => elem.underlying_storage(renderer),
         }
@@ -2291,14 +2295,18 @@ where
                 elem.capture_framebuffer(frame, src, dst, cache)
             }
             CosmicStackRenderElement::Shadow(elem) | CosmicStackRenderElement::Border(elem) => {
-                RenderElement::<GlowRenderer>::capture_framebuffer(
-                    elem,
-                    R::glow_frame_mut(frame),
-                    src,
-                    dst,
-                    cache,
-                )
-                .map_err(R::from_gles_error)
+                if let Some(glow_frame) = R::glow_frame_mut(frame) {
+                    RenderElement::<GlowRenderer>::capture_framebuffer(
+                        elem,
+                        glow_frame,
+                        src,
+                        dst,
+                        cache,
+                    )
+                    .map_err(R::from_gles_error)
+                } else {
+                    Ok(())
+                }
             }
             CosmicStackRenderElement::Window(elem) => {
                 elem.capture_framebuffer(frame, src, dst, cache)
