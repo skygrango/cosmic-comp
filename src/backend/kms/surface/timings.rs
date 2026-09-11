@@ -15,6 +15,7 @@ pub struct Timings {
     pub vrr_target_rate_internal_ns: Option<NonZeroU64>,
     min_refresh_interval_ns: Option<NonZeroU64>,
     vrr: bool,
+    #[allow(dead_code)]
     vendor: Option<u32>,
 
     pub pending_frame: Option<PendingFrame>,

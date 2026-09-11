@@ -3,6 +3,7 @@
 pub mod a11y;
 pub mod background_effect;
 pub mod buffer;
+pub mod color_management;
 pub mod compositor;
 pub mod corner_radius;
 pub mod data_control;

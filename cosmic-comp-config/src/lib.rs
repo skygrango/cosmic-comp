@@ -112,6 +112,52 @@ pub struct CosmicCompConfig {
     pub cursor_shake_to_find: bool,
     pub activation_policy: ActivationPolicy,
     pub decoration_preference: DecorationPreference,
+    /// Live "SDR brightness" for experimental HDR outputs: linear SDR white is
+    /// mapped to this many cd/m² (80-500). None falls back to the per-output
+    /// config or the COSMIC_HDR_REFERENCE_WHITE environment default.
+    pub hdr_reference_white: Option<u16>,
+    /// Honor clients' `wp_tearing_control_v1` async hint with real async page
+    /// flips (uncapped frame rates for fullscreen games). Flips the kernel
+    /// refuses to tear fall back to synchronized presentation.
+    pub allow_tearing: bool,
+    /// Per-output override of [`Self::allow_tearing`], keyed by connector name.
+    pub allow_tearing_outputs: HashMap<String, bool>,
+    /// Per-output HDR toggle, keyed by connector name. Applied live; takes
+    /// precedence over the output config file and environment defaults.
+    pub hdr_enabled_outputs: HashMap<String, bool>,
+    /// Per-output override of [`Self::hdr_reference_white`], keyed by connector
+    /// name (e.g. "DP-2"). Values are clamped to
+    /// [`HDR_REFERENCE_WHITE_MIN`]..=[`HDR_REFERENCE_WHITE_MAX`] and to each
+    /// panel's EDID peak.
+    pub hdr_reference_white_outputs: HashMap<String, u16>,
+}
+
+/// Valid range for the HDR reference white ("SDR brightness"), in cd/m².
+/// Every clamp of user-supplied reference white must use these bounds; each
+/// panel's EDID peak further caps the effective value per output.
+pub const HDR_REFERENCE_WHITE_MIN: u16 = 80;
+pub const HDR_REFERENCE_WHITE_MAX: u16 = 2000;
+
+/// Runtime HDR status for one output, published by the compositor as
+/// cosmic-config *state* under the key `hdr_outputs`
+/// (`HashMap<String, HdrOutputStatus>` keyed by connector name). UIs use it to
+/// scale per-screen brightness sliders to what each panel can actually show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HdrOutputStatus {
+    /// The panel's peak luminance from EDID, in cd/m².
+    pub max_luminance: u16,
+    /// Current SDR reference white ("brightness"), in cd/m².
+    pub reference_white: u16,
+    /// Whether HDR signalling is active on this output.
+    pub active: bool,
+    /// Whether an HDR client currently bypasses SDR-to-PQ conversion
+    /// (fullscreen or output-covering passthrough).
+    #[serde(default)]
+    pub passthrough: bool,
+    /// Whether the panel supports HDR10 at all (EDID), regardless of the
+    /// current mode. Settings UIs show the HDR toggle based on this.
+    #[serde(default)]
+    pub capable: bool,
 }
 
 impl Default for CosmicCompConfig {
@@ -152,6 +198,11 @@ impl Default for CosmicCompConfig {
             cursor_shake_to_find: true,
             activation_policy: ActivationPolicy::default(),
             decoration_preference: DecorationPreference::default(),
+            allow_tearing: true,
+            allow_tearing_outputs: HashMap::new(),
+            hdr_enabled_outputs: HashMap::new(),
+            hdr_reference_white: None,
+            hdr_reference_white_outputs: HashMap::new(),
         }
     }
 }

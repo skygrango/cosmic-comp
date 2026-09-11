@@ -546,6 +546,7 @@ dependencies = [
  "async-task",
  "bitflags 2.13.2",
  "futures-core",
+ "nix 0.31.3",
  "polling",
  "rustix 1.1.4",
  "slab",
@@ -838,6 +839,7 @@ dependencies = [
  "libsystemd",
  "log-panics",
  "logind-zbus",
+ "nix 0.31.3",
  "ordered-float",
  "parking_lot",
  "png 0.18.1",
@@ -3174,7 +3176,7 @@ dependencies = [
  "hmac",
  "libc",
  "log",
- "nix",
+ "nix 0.29.0",
  "nom",
  "once_cell",
  "serde",
@@ -3594,6 +3596,18 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "memoffset",
+]
+
+[[package]]
+name = "nix"
+version = "0.31.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
+dependencies = [
+ "bitflags 2.13.2",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
 ]
 
 [[package]]
@@ -5118,12 +5132,14 @@ dependencies = [
  "tracing",
  "tracy-client",
  "udev",
+ "wayland-backend",
  "wayland-client",
  "wayland-cursor",
  "wayland-egl",
  "wayland-protocols",
  "wayland-protocols-misc",
  "wayland-protocols-wlr",
+ "wayland-scanner",
  "wayland-server",
  "winit",
  "x11rb",
