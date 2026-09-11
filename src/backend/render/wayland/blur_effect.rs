@@ -106,7 +106,10 @@ impl BlurShaders {
     }
 
     pub fn get<R: AsGlowRenderer>(renderer: &R) -> Self {
-        Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
+        let Some(glow) = renderer.glow_renderer() else {
+            panic!("BlurShaders requires a GlowRenderer");
+        };
+        Borrow::<GlesRenderer>::borrow(glow)
             .egl_context()
             .user_data()
             .get::<BlurShaders>()
@@ -222,6 +225,10 @@ impl BlurElement {
             return Ok(None);
         }
 
+        let Some(glow) = renderer.glow_renderer() else {
+            return Ok(None);
+        };
+
         let geo = geometry.to_physical_precise_round(output_scale);
         let mut extended_geo = geo;
         let radius = BLUR_PARAMS[(strength + 2).min(MAX_STEPS - 1)].extended_radius as f64;
@@ -266,7 +273,7 @@ impl BlurElement {
         let geometry = extended_geo.to_logical(output_scale);
         let extended_offset = Point::<f64, Physical>::new(radius, radius).to_logical(output_scale);
 
-        let renderer_id = renderer.glow_renderer().context_id();
+        let renderer_id = glow.context_id();
         let src = geometry.size.to_buffer(output_scale, Transform::Normal);
         let params = &BLUR_PARAMS[strength.min(MAX_STEPS - 1)];
 
@@ -378,7 +385,9 @@ where
     ) -> Result<(), <R>::Error> {
         let transform = frame.transformation();
         let tex_size = self.src.to_i32_round();
-        let glow_frame = <R as AsGlowRenderer>::glow_frame_mut(frame);
+        let Some(glow_frame) = <R as AsGlowRenderer>::glow_frame_mut(frame) else {
+            return Ok(());
+        };
         let gles_frame = BorrowMut::<GlesFrame<'_, '_>>::borrow_mut(glow_frame);
         let mut renderer = gles_frame.renderer();
 
@@ -399,14 +408,18 @@ where
                 .as_mut()
                 .create_buffer(Fourcc::Abgr8888, tex_size)
                 .map_err(R::from_gles_error)?;
-            *texture_entry = Some(R::tex_from_gl(&renderer.as_ref().context_id(), gl_texture));
+            let Some(tex) = R::tex_from_gl(&renderer.as_ref().context_id(), gl_texture) else {
+                return Ok(());
+            };
+            *texture_entry = Some(tex);
         }
 
-        let mut texture = R::tex_to_gl(
+        let Some(mut texture) = R::tex_to_gl(
             &renderer.as_ref().context_id(),
             texture_entry.as_ref().unwrap(),
-        )
-        .unwrap();
+        ) else {
+            return Ok(());
+        };
         let mut off_texture = renderer
             .as_mut()
             .create_buffer(Fourcc::Abgr8888, tex_size)
@@ -462,8 +475,10 @@ where
         let texture_ref = texture.lock().unwrap();
 
         if let Some(tex) = texture_ref.as_ref() {
-            BorrowMut::<GlesFrame>::borrow_mut(<R as AsGlowRenderer>::glow_frame_mut(frame))
-                .override_default_tex_program(self.render_shader.clone(), self.uniforms.clone());
+            if let Some(glow_frame) = <R as AsGlowRenderer>::glow_frame_mut(frame) {
+                BorrowMut::<GlesFrame>::borrow_mut(glow_frame)
+                    .override_default_tex_program(self.render_shader.clone(), self.uniforms.clone());
+            }
             frame.render_texture_from_to(
                 tex,
                 src,
@@ -473,8 +488,10 @@ where
                 Transform::Normal,
                 1.0,
             )?;
-            BorrowMut::<GlesFrame>::borrow_mut(<R as AsGlowRenderer>::glow_frame_mut(frame))
-                .clear_tex_program_override();
+            if let Some(glow_frame) = <R as AsGlowRenderer>::glow_frame_mut(frame) {
+                BorrowMut::<GlesFrame>::borrow_mut(glow_frame)
+                    .clear_tex_program_override();
+            }
         }
         Ok(())
     }

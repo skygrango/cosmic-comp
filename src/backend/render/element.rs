@@ -1,7 +1,7 @@
 use crate::{
     backend::{
         kms::render::gles::GbmGlowBackend,
-        render::{GlMultiError, wayland::SurfaceRenderElement},
+        render::{GlMultiError, VulkanMultiError, wayland::SurfaceRenderElement},
     },
     shell::{CosmicMappedRenderElement, WorkspaceRenderElement},
     utils::iced::IcedRenderElement,
@@ -11,10 +11,11 @@ use crate::{
 use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::{
     backend::{
-        allocator::dmabuf::Dmabuf,
+        allocator::{Fourcc, dmabuf::Dmabuf},
         drm::DrmDeviceFd,
         renderer::{
             Bind, Blit, ContextId, ExportMem, ImportAll, ImportMem, Offscreen, Renderer,
+            TextureFilter, sync::SyncPoint,
             element::{
                 Element, Id, Kind, RenderElement, UnderlyingStorage,
                 utils::{CropRenderElement, Relocate, RelocateRenderElement, RescaleRenderElement},
@@ -26,7 +27,7 @@ use smithay::{
         },
     },
     utils::{
-        Buffer as BufferCoords, Logical, Physical, Point, Rectangle, Scale, user_data::UserDataMap,
+        Buffer as BufferCoords, Logical, Physical, Point, Rectangle, Scale, Size, user_data::UserDataMap,
     },
 };
 
@@ -247,17 +248,20 @@ where
                 elem.draw(frame, src, dst, damage, opaque_regions, cache)
             }
             CosmicElement::Postprocess(elem) => {
-                let glow_frame = R::glow_frame_mut(frame);
-                RenderElement::<GlowRenderer>::draw(
-                    elem,
-                    glow_frame,
-                    src,
-                    dst,
-                    damage,
-                    opaque_regions,
-                    cache,
-                )
-                .map_err(R::from_gles_error)
+                if let Some(glow_frame) = R::glow_frame_mut(frame) {
+                    RenderElement::<GlowRenderer>::draw(
+                        elem,
+                        glow_frame,
+                        src,
+                        dst,
+                        damage,
+                        opaque_regions,
+                        cache,
+                    )
+                    .map_err(R::from_gles_error)
+                } else {
+                    Ok(())
+                }
             }
             CosmicElement::Zoom(elem) => elem.draw(frame, src, dst, damage, opaque_regions, cache),
             CosmicElement::Damage(elem) => {
@@ -265,17 +269,20 @@ where
             }
             #[cfg(feature = "debug")]
             CosmicElement::Egui(elem) => {
-                let glow_frame = R::glow_frame_mut(frame);
-                RenderElement::<GlowRenderer>::draw(
-                    elem,
-                    glow_frame,
-                    src,
-                    dst,
-                    damage,
-                    opaque_regions,
-                    cache,
-                )
-                .map_err(R::from_gles_error)
+                if let Some(glow_frame) = R::glow_frame_mut(frame) {
+                    RenderElement::<GlowRenderer>::draw(
+                        elem,
+                        glow_frame,
+                        src,
+                        dst,
+                        damage,
+                        opaque_regions,
+                        cache,
+                    )
+                    .map_err(R::from_gles_error)
+                } else {
+                    Ok(())
+                }
             }
         }
     }
@@ -287,15 +294,17 @@ where
             CosmicElement::Dnd(elem) => elem.underlying_storage(renderer),
             CosmicElement::MoveGrab(elem) => elem.underlying_storage(renderer),
             CosmicElement::Postprocess(elem) => {
-                let glow_renderer = renderer.glow_renderer_mut();
-                elem.underlying_storage(glow_renderer)
+                renderer
+                    .glow_renderer_mut()
+                    .and_then(|glow_renderer| elem.underlying_storage(glow_renderer))
             }
             CosmicElement::Zoom(elem) => elem.underlying_storage(renderer),
             CosmicElement::Damage(elem) => elem.underlying_storage(renderer),
             #[cfg(feature = "debug")]
             CosmicElement::Egui(elem) => {
-                let glow_renderer = renderer.glow_renderer_mut();
-                elem.underlying_storage(glow_renderer)
+                renderer
+                    .glow_renderer_mut()
+                    .and_then(|glow_renderer| elem.underlying_storage(glow_renderer))
             }
         }
     }
@@ -313,11 +322,14 @@ where
             CosmicElement::Dnd(elem) => elem.capture_framebuffer(frame, src, dst, cache),
             CosmicElement::MoveGrab(elem) => elem.capture_framebuffer(frame, src, dst, cache),
             CosmicElement::Postprocess(elem) => {
-                let glow_frame = R::glow_frame_mut(frame);
-                RenderElement::<GlowRenderer>::capture_framebuffer(
-                    elem, glow_frame, src, dst, cache,
-                )
-                .map_err(R::from_gles_error)
+                if let Some(glow_frame) = R::glow_frame_mut(frame) {
+                    RenderElement::<GlowRenderer>::capture_framebuffer(
+                        elem, glow_frame, src, dst, cache,
+                    )
+                    .map_err(R::from_gles_error)
+                } else {
+                    Ok(())
+                }
             }
             CosmicElement::Zoom(elem) => elem.capture_framebuffer(frame, src, dst, cache),
             CosmicElement::Damage(elem) => {
@@ -325,11 +337,14 @@ where
             }
             #[cfg(feature = "debug")]
             CosmicElement::Egui(elem) => {
-                let glow_frame = R::glow_frame_mut(frame);
-                RenderElement::<GlowRenderer>::capture_framebuffer(
-                    elem, glow_frame, src, dst, cache,
-                )
-                .map_err(R::from_gles_error)
+                if let Some(glow_frame) = R::glow_frame_mut(frame) {
+                    RenderElement::<GlowRenderer>::capture_framebuffer(
+                        elem, glow_frame, src, dst, cache,
+                    )
+                    .map_err(R::from_gles_error)
+                } else {
+                    Ok(())
+                }
             }
         }
     }
@@ -387,49 +402,68 @@ where
 
 pub trait AsGlowRenderer:
     Renderer
-    + Offscreen<GlesTexture>
-    + Offscreen<GlesRenderbuffer>
     + ImportAll
     + ImportMem
     + ExportMem
     + Bind<Dmabuf>
-    + Blit
 {
-    fn glow_renderer(&self) -> &GlowRenderer;
-    fn glow_renderer_mut(&mut self) -> &mut GlowRenderer;
+    fn glow_renderer(&self) -> Option<&GlowRenderer>;
+    fn glow_renderer_mut(&mut self) -> Option<&mut GlowRenderer>;
     fn glow_frame<'a, 'frame, 'buffer>(
         frame: &'a Self::Frame<'frame, 'buffer>,
-    ) -> &'a GlowFrame<'frame, 'buffer>;
+    ) -> Option<&'a GlowFrame<'frame, 'buffer>>;
     fn glow_frame_mut<'a, 'frame, 'buffer>(
         frame: &'a mut Self::Frame<'frame, 'buffer>,
-    ) -> &'a mut GlowFrame<'frame, 'buffer>;
-    fn tex_from_gl(context: &ContextId<GlesTexture>, texture: GlesTexture) -> Self::TextureId;
+    ) -> Option<&'a mut GlowFrame<'frame, 'buffer>>;
+    fn tex_from_gl(context: &ContextId<GlesTexture>, texture: GlesTexture) -> Option<Self::TextureId>;
     fn tex_to_gl(
         context: &ContextId<GlesTexture>,
         texture: &Self::TextureId,
     ) -> Option<GlesTexture>;
     fn from_gles_error(err: GlesError) -> Self::Error;
+
+    fn bind_glow_texture<'a>(
+        &mut self,
+        target: &'a mut GlesTexture,
+    ) -> Result<Self::Framebuffer<'a>, Self::Error>;
+    fn bind_glow_renderbuffer<'a>(
+        &mut self,
+        target: &'a mut GlesRenderbuffer,
+    ) -> Result<Self::Framebuffer<'a>, Self::Error>;
+    fn create_glow_renderbuffer(
+        &mut self,
+        format: Fourcc,
+        size: Size<i32, BufferCoords>,
+    ) -> Result<GlesRenderbuffer, Self::Error>;
+    fn blit(
+        &mut self,
+        from: &Self::Framebuffer<'_>,
+        to: &mut Self::Framebuffer<'_>,
+        src: Rectangle<i32, Physical>,
+        dst: Rectangle<i32, Physical>,
+        filter: TextureFilter,
+    ) -> Result<SyncPoint, Self::Error>;
 }
 
 impl AsGlowRenderer for GlowRenderer {
-    fn glow_renderer(&self) -> &GlowRenderer {
-        self
+    fn glow_renderer(&self) -> Option<&GlowRenderer> {
+        Some(self)
     }
-    fn glow_renderer_mut(&mut self) -> &mut GlowRenderer {
-        self
+    fn glow_renderer_mut(&mut self) -> Option<&mut GlowRenderer> {
+        Some(self)
     }
     fn glow_frame<'a, 'frame, 'buffer>(
         frame: &'a Self::Frame<'frame, 'buffer>,
-    ) -> &'a GlowFrame<'frame, 'buffer> {
-        frame
+    ) -> Option<&'a GlowFrame<'frame, 'buffer>> {
+        Some(frame)
     }
     fn glow_frame_mut<'a, 'frame, 'buffer>(
         frame: &'a mut Self::Frame<'frame, 'buffer>,
-    ) -> &'a mut GlowFrame<'frame, 'buffer> {
-        frame
+    ) -> Option<&'a mut GlowFrame<'frame, 'buffer>> {
+        Some(frame)
     }
-    fn tex_from_gl(_context: &ContextId<GlesTexture>, texture: GlesTexture) -> Self::TextureId {
-        texture
+    fn tex_from_gl(_context: &ContextId<GlesTexture>, texture: GlesTexture) -> Option<Self::TextureId> {
+        Some(texture)
     }
     fn tex_to_gl(
         _context: &ContextId<GlesTexture>,
@@ -440,27 +474,57 @@ impl AsGlowRenderer for GlowRenderer {
     fn from_gles_error(err: GlesError) -> Self::Error {
         err
     }
+
+    fn bind_glow_texture<'a>(
+        &mut self,
+        target: &'a mut GlesTexture,
+    ) -> Result<Self::Framebuffer<'a>, Self::Error> {
+        self.bind(target)
+    }
+    fn bind_glow_renderbuffer<'a>(
+        &mut self,
+        target: &'a mut GlesRenderbuffer,
+    ) -> Result<Self::Framebuffer<'a>, Self::Error> {
+        self.bind(target)
+    }
+    fn create_glow_renderbuffer(
+        &mut self,
+        format: Fourcc,
+        size: Size<i32, BufferCoords>,
+    ) -> Result<GlesRenderbuffer, Self::Error> {
+        Offscreen::<GlesRenderbuffer>::create_buffer(self, format, size)
+    }
+    fn blit(
+        &mut self,
+        from: &Self::Framebuffer<'_>,
+        to: &mut Self::Framebuffer<'_>,
+        src: Rectangle<i32, Physical>,
+        dst: Rectangle<i32, Physical>,
+        filter: TextureFilter,
+    ) -> Result<SyncPoint, Self::Error> {
+        Blit::blit(self, from, to, src, dst, filter)
+    }
 }
 
 impl AsGlowRenderer for GlMultiRenderer<'_> {
-    fn glow_renderer(&self) -> &GlowRenderer {
-        self.as_ref()
+    fn glow_renderer(&self) -> Option<&GlowRenderer> {
+        Some(self.as_ref())
     }
-    fn glow_renderer_mut(&mut self) -> &mut GlowRenderer {
-        self.as_mut()
+    fn glow_renderer_mut(&mut self) -> Option<&mut GlowRenderer> {
+        Some(self.as_mut())
     }
     fn glow_frame<'b, 'frame, 'buffer>(
         frame: &'b Self::Frame<'frame, 'buffer>,
-    ) -> &'b GlowFrame<'frame, 'buffer> {
-        frame.as_ref()
+    ) -> Option<&'b GlowFrame<'frame, 'buffer>> {
+        Some(frame.as_ref())
     }
     fn glow_frame_mut<'b, 'frame, 'buffer>(
         frame: &'b mut Self::Frame<'frame, 'buffer>,
-    ) -> &'b mut GlowFrame<'frame, 'buffer> {
-        frame.as_mut()
+    ) -> Option<&'b mut GlowFrame<'frame, 'buffer>> {
+        Some(frame.as_mut())
     }
-    fn tex_from_gl(context: &ContextId<GlesTexture>, texture: GlesTexture) -> Self::TextureId {
-        MultiTexture::from_native_texture::<GbmGlowBackend<DrmDeviceFd>>(context, texture).unwrap()
+    fn tex_from_gl(context: &ContextId<GlesTexture>, texture: GlesTexture) -> Option<Self::TextureId> {
+        Some(MultiTexture::from_native_texture::<GbmGlowBackend<DrmDeviceFd>>(context, texture).unwrap())
     }
     fn tex_to_gl(
         context: &ContextId<GlesTexture>,
@@ -470,6 +534,105 @@ impl AsGlowRenderer for GlMultiRenderer<'_> {
     }
     fn from_gles_error(err: GlesError) -> Self::Error {
         GlMultiError::Render(err)
+    }
+
+    fn bind_glow_texture<'a>(
+        &mut self,
+        target: &'a mut GlesTexture,
+    ) -> Result<Self::Framebuffer<'a>, Self::Error> {
+        self.bind(target)
+    }
+    fn bind_glow_renderbuffer<'a>(
+        &mut self,
+        target: &'a mut GlesRenderbuffer,
+    ) -> Result<Self::Framebuffer<'a>, Self::Error> {
+        self.bind(target)
+    }
+    fn create_glow_renderbuffer(
+        &mut self,
+        format: Fourcc,
+        size: Size<i32, BufferCoords>,
+    ) -> Result<GlesRenderbuffer, Self::Error> {
+        Offscreen::<GlesRenderbuffer>::create_buffer(self.as_mut(), format, size).map_err(GlMultiError::Render)
+    }
+    fn blit(
+        &mut self,
+        from: &Self::Framebuffer<'_>,
+        to: &mut Self::Framebuffer<'_>,
+        src: Rectangle<i32, Physical>,
+        dst: Rectangle<i32, Physical>,
+        filter: TextureFilter,
+    ) -> Result<SyncPoint, Self::Error> {
+        Blit::blit(self, from, to, src, dst, filter)
+    }
+}
+
+impl AsGlowRenderer for super::VulkanMultiRenderer<'_> {
+    fn glow_renderer(&self) -> Option<&GlowRenderer> {
+        None
+    }
+    fn glow_renderer_mut(&mut self) -> Option<&mut GlowRenderer> {
+        None
+    }
+    fn glow_frame<'b, 'frame, 'buffer>(
+        _frame: &'b Self::Frame<'frame, 'buffer>,
+    ) -> Option<&'b GlowFrame<'frame, 'buffer>> {
+        None
+    }
+    fn glow_frame_mut<'b, 'frame, 'buffer>(
+        _frame: &'b mut Self::Frame<'frame, 'buffer>,
+    ) -> Option<&'b mut GlowFrame<'frame, 'buffer>> {
+        None
+    }
+    fn tex_from_gl(_context: &ContextId<GlesTexture>, _texture: GlesTexture) -> Option<Self::TextureId> {
+        None
+    }
+    fn tex_to_gl(
+        _context: &ContextId<GlesTexture>,
+        _texture: &Self::TextureId,
+    ) -> Option<GlesTexture> {
+        None
+    }
+    fn from_gles_error(err: GlesError) -> Self::Error {
+        VulkanMultiError::Render(
+            smithay::backend::renderer::vulkan::Error::GlesError(err.to_string()),
+        )
+    }
+
+    fn bind_glow_texture<'a>(
+        &mut self,
+        _target: &'a mut GlesTexture,
+    ) -> Result<Self::Framebuffer<'a>, Self::Error> {
+        Err(VulkanMultiError::Render(
+            smithay::backend::renderer::vulkan::Error::UnsupportedPixelFormat,
+        ))
+    }
+    fn bind_glow_renderbuffer<'a>(
+        &mut self,
+        _target: &'a mut GlesRenderbuffer,
+    ) -> Result<Self::Framebuffer<'a>, Self::Error> {
+        Err(VulkanMultiError::Render(
+            smithay::backend::renderer::vulkan::Error::UnsupportedPixelFormat,
+        ))
+    }
+    fn create_glow_renderbuffer(
+        &mut self,
+        _format: Fourcc,
+        _size: Size<i32, BufferCoords>,
+    ) -> Result<GlesRenderbuffer, Self::Error> {
+        Err(VulkanMultiError::Render(
+            smithay::backend::renderer::vulkan::Error::UnsupportedPixelFormat,
+        ))
+    }
+    fn blit(
+        &mut self,
+        _from: &Self::Framebuffer<'_>,
+        _to: &mut Self::Framebuffer<'_>,
+        _src: Rectangle<i32, Physical>,
+        _dst: Rectangle<i32, Physical>,
+        _filter: TextureFilter,
+    ) -> Result<SyncPoint, Self::Error> {
+        Ok(SyncPoint::default())
     }
 }
 

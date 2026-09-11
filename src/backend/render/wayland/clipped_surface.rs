@@ -24,7 +24,10 @@ pub struct ClippingShader(pub GlesTexProgram);
 
 impl ClippingShader {
     pub fn get<R: AsGlowRenderer>(renderer: &R) -> GlesTexProgram {
-        Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
+        let Some(glow) = renderer.glow_renderer() else {
+            panic!("ClippingShader requires a GlowRenderer");
+        };
+        Borrow::<GlesRenderer>::borrow(glow)
             .egl_context()
             .user_data()
             .get::<ClippingShader>()
@@ -259,12 +262,16 @@ where
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), R::Error> {
-        BorrowMut::<GlesFrame>::borrow_mut(<R as AsGlowRenderer>::glow_frame_mut(frame))
-            .override_default_tex_program(self.program.clone(), self.uniforms.clone());
+        if let Some(glow_frame) = <R as AsGlowRenderer>::glow_frame_mut(frame) {
+            BorrowMut::<GlesFrame>::borrow_mut(glow_frame)
+                .override_default_tex_program(self.program.clone(), self.uniforms.clone());
+        }
         self.inner
             .draw(frame, src, dst, damage, opaque_regions, cache)?;
-        BorrowMut::<GlesFrame>::borrow_mut(<R as AsGlowRenderer>::glow_frame_mut(frame))
-            .clear_tex_program_override();
+        if let Some(glow_frame) = <R as AsGlowRenderer>::glow_frame_mut(frame) {
+            BorrowMut::<GlesFrame>::borrow_mut(glow_frame)
+                .clear_tex_program_override();
+        }
         Ok(())
     }
 
