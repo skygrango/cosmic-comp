@@ -106,8 +106,14 @@ use crate::backend::kms::render::vulkan::GbmVulkanBackend;
 
 pub type VulkanMultiRenderer<'a> =
     MultiRenderer<'a, 'a, GbmVulkanBackend<DrmDeviceFd>, GbmVulkanBackend<DrmDeviceFd>>;
-pub type VulkanMultiFrame<'a, 'frame, 'buffer> =
-    MultiFrame<'a, 'a, 'frame, 'buffer, GbmVulkanBackend<DrmDeviceFd>, GbmVulkanBackend<DrmDeviceFd>>;
+pub type VulkanMultiFrame<'a, 'frame, 'buffer> = MultiFrame<
+    'a,
+    'a,
+    'frame,
+    'buffer,
+    GbmVulkanBackend<DrmDeviceFd>,
+    GbmVulkanBackend<DrmDeviceFd>,
+>;
 pub type VulkanMultiError =
     MultiError<GbmVulkanBackend<DrmDeviceFd>, GbmVulkanBackend<DrmDeviceFd>>;
 
@@ -1156,7 +1162,9 @@ impl PostprocessState {
         let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
         let opaque_regions = vec![Rectangle::from_size(buffer_size)];
 
-        let glow = renderer.glow_renderer_mut().expect("GLES renderer required");
+        let glow = renderer
+            .glow_renderer_mut()
+            .expect("GLES renderer required");
         let texture = Offscreen::<GlesTexture>::create_buffer(glow, format, buffer_size)
             .map_err(R::from_gles_error)?;
         let texture_buffer = TextureRenderBuffer::from_texture(
@@ -1203,17 +1211,14 @@ impl PostprocessState {
             return Ok(());
         }
 
-        let glow = renderer.glow_renderer_mut().expect("GLES renderer required");
+        let glow = renderer
+            .glow_renderer_mut()
+            .expect("GLES renderer required");
         let texture = Offscreen::<GlesTexture>::create_buffer(glow, format, buffer_size)
             .map_err(R::from_gles_error)?;
 
-        let texture_buffer = TextureRenderBuffer::from_texture(
-            glow,
-            texture,
-            1,
-            Transform::Normal,
-            None,
-        );
+        let texture_buffer =
+            TextureRenderBuffer::from_texture(glow, texture, 1, Transform::Normal, None);
 
         let damage_tracker = OutputDamageTracker::new(size, scale, Transform::Normal);
 
@@ -1328,7 +1333,9 @@ where
             .texture
             .render()
             .draw::<_, RenderError<R::Error>>(|tex| {
-                let mut target = renderer.bind_glow_texture(tex).map_err(RenderError::Rendering)?;
+                let mut target = renderer
+                    .bind_glow_texture(tex)
+                    .map_err(RenderError::Rendering)?;
                 result = render_workspace(
                     gpu,
                     renderer,
@@ -1540,7 +1547,9 @@ where
                             // but then rustc tries to equate the lifetime of target with the lifetime of our temporary fb...
                             // So instead of duplicating all the code, we use a closure..
                             if let Some(tex) = postprocess_texture.as_mut() {
-                                let mut fb = renderer.bind_glow_texture(tex).map_err(RenderError::Rendering)?;
+                                let mut fb = renderer
+                                    .bind_glow_texture(tex)
+                                    .map_err(RenderError::Rendering)?;
                                 blit_to_buffer(renderer, &mut fb)
                                     .map_err(RenderError::Rendering)?;
                             } else {

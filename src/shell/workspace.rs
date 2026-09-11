@@ -2184,11 +2184,9 @@ where
             WorkspaceRenderElement::Fullscreen(elem) => elem.underlying_storage(renderer),
             WorkspaceRenderElement::FullscreenPopup(elem) => elem.underlying_storage(renderer),
             WorkspaceRenderElement::Window(elem) => elem.underlying_storage(renderer),
-            WorkspaceRenderElement::Backdrop(elem) => {
-                renderer
-                    .glow_renderer_mut()
-                    .and_then(|glow| elem.underlying_storage(glow))
-            }
+            WorkspaceRenderElement::Backdrop(elem) => renderer
+                .glow_renderer_mut()
+                .and_then(|glow| elem.underlying_storage(glow)),
         }
     }
 
@@ -2218,11 +2216,7 @@ where
             WorkspaceRenderElement::Backdrop(elem) => {
                 if let Some(glow_frame) = R::glow_frame_mut(frame) {
                     RenderElement::<GlowRenderer>::capture_framebuffer(
-                        elem,
-                        glow_frame,
-                        src,
-                        dst,
-                        cache,
+                        elem, glow_frame, src, dst, cache,
                     )
                     .map_err(R::from_gles_error)
                 } else {

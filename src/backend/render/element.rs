@@ -15,7 +15,7 @@ use smithay::{
         drm::DrmDeviceFd,
         renderer::{
             Bind, Blit, ContextId, ExportMem, ImportAll, ImportMem, Offscreen, Renderer,
-            TextureFilter, sync::SyncPoint,
+            TextureFilter,
             element::{
                 Element, Id, Kind, RenderElement, UnderlyingStorage,
                 utils::{CropRenderElement, Relocate, RelocateRenderElement, RescaleRenderElement},
@@ -23,11 +23,13 @@ use smithay::{
             gles::{GlesError, GlesRenderbuffer, GlesTexture, element::TextureShaderElement},
             glow::{GlowFrame, GlowRenderer},
             multigpu::MultiTexture,
+            sync::SyncPoint,
             utils::{CommitCounter, DamageSet, OpaqueRegions},
         },
     },
     utils::{
-        Buffer as BufferCoords, Logical, Physical, Point, Rectangle, Scale, Size, user_data::UserDataMap,
+        Buffer as BufferCoords, Logical, Physical, Point, Rectangle, Scale, Size,
+        user_data::UserDataMap,
     },
 };
 
@@ -293,19 +295,15 @@ where
             CosmicElement::Cursor(elem) => elem.underlying_storage(renderer),
             CosmicElement::Dnd(elem) => elem.underlying_storage(renderer),
             CosmicElement::MoveGrab(elem) => elem.underlying_storage(renderer),
-            CosmicElement::Postprocess(elem) => {
-                renderer
-                    .glow_renderer_mut()
-                    .and_then(|glow_renderer| elem.underlying_storage(glow_renderer))
-            }
+            CosmicElement::Postprocess(elem) => renderer
+                .glow_renderer_mut()
+                .and_then(|glow_renderer| elem.underlying_storage(glow_renderer)),
             CosmicElement::Zoom(elem) => elem.underlying_storage(renderer),
             CosmicElement::Damage(elem) => elem.underlying_storage(renderer),
             #[cfg(feature = "debug")]
-            CosmicElement::Egui(elem) => {
-                renderer
-                    .glow_renderer_mut()
-                    .and_then(|glow_renderer| elem.underlying_storage(glow_renderer))
-            }
+            CosmicElement::Egui(elem) => renderer
+                .glow_renderer_mut()
+                .and_then(|glow_renderer| elem.underlying_storage(glow_renderer)),
         }
     }
 
@@ -400,13 +398,7 @@ where
     }
 }
 
-pub trait AsGlowRenderer:
-    Renderer
-    + ImportAll
-    + ImportMem
-    + ExportMem
-    + Bind<Dmabuf>
-{
+pub trait AsGlowRenderer: Renderer + ImportAll + ImportMem + ExportMem + Bind<Dmabuf> {
     fn glow_renderer(&self) -> Option<&GlowRenderer>;
     fn glow_renderer_mut(&mut self) -> Option<&mut GlowRenderer>;
     fn glow_frame<'a, 'frame, 'buffer>(
@@ -415,7 +407,10 @@ pub trait AsGlowRenderer:
     fn glow_frame_mut<'a, 'frame, 'buffer>(
         frame: &'a mut Self::Frame<'frame, 'buffer>,
     ) -> Option<&'a mut GlowFrame<'frame, 'buffer>>;
-    fn tex_from_gl(context: &ContextId<GlesTexture>, texture: GlesTexture) -> Option<Self::TextureId>;
+    fn tex_from_gl(
+        context: &ContextId<GlesTexture>,
+        texture: GlesTexture,
+    ) -> Option<Self::TextureId>;
     fn tex_to_gl(
         context: &ContextId<GlesTexture>,
         texture: &Self::TextureId,
@@ -462,7 +457,10 @@ impl AsGlowRenderer for GlowRenderer {
     ) -> Option<&'a mut GlowFrame<'frame, 'buffer>> {
         Some(frame)
     }
-    fn tex_from_gl(_context: &ContextId<GlesTexture>, texture: GlesTexture) -> Option<Self::TextureId> {
+    fn tex_from_gl(
+        _context: &ContextId<GlesTexture>,
+        texture: GlesTexture,
+    ) -> Option<Self::TextureId> {
         Some(texture)
     }
     fn tex_to_gl(
@@ -523,8 +521,14 @@ impl AsGlowRenderer for GlMultiRenderer<'_> {
     ) -> Option<&'b mut GlowFrame<'frame, 'buffer>> {
         Some(frame.as_mut())
     }
-    fn tex_from_gl(context: &ContextId<GlesTexture>, texture: GlesTexture) -> Option<Self::TextureId> {
-        Some(MultiTexture::from_native_texture::<GbmGlowBackend<DrmDeviceFd>>(context, texture).unwrap())
+    fn tex_from_gl(
+        context: &ContextId<GlesTexture>,
+        texture: GlesTexture,
+    ) -> Option<Self::TextureId> {
+        Some(
+            MultiTexture::from_native_texture::<GbmGlowBackend<DrmDeviceFd>>(context, texture)
+                .unwrap(),
+        )
     }
     fn tex_to_gl(
         context: &ContextId<GlesTexture>,
@@ -553,7 +557,8 @@ impl AsGlowRenderer for GlMultiRenderer<'_> {
         format: Fourcc,
         size: Size<i32, BufferCoords>,
     ) -> Result<GlesRenderbuffer, Self::Error> {
-        Offscreen::<GlesRenderbuffer>::create_buffer(self.as_mut(), format, size).map_err(GlMultiError::Render)
+        Offscreen::<GlesRenderbuffer>::create_buffer(self.as_mut(), format, size)
+            .map_err(GlMultiError::Render)
     }
     fn blit(
         &mut self,
@@ -584,7 +589,10 @@ impl AsGlowRenderer for super::VulkanMultiRenderer<'_> {
     ) -> Option<&'b mut GlowFrame<'frame, 'buffer>> {
         None
     }
-    fn tex_from_gl(_context: &ContextId<GlesTexture>, _texture: GlesTexture) -> Option<Self::TextureId> {
+    fn tex_from_gl(
+        _context: &ContextId<GlesTexture>,
+        _texture: GlesTexture,
+    ) -> Option<Self::TextureId> {
         None
     }
     fn tex_to_gl(
@@ -594,9 +602,9 @@ impl AsGlowRenderer for super::VulkanMultiRenderer<'_> {
         None
     }
     fn from_gles_error(err: GlesError) -> Self::Error {
-        VulkanMultiError::Render(
-            smithay::backend::renderer::vulkan::Error::GlesError(err.to_string()),
-        )
+        VulkanMultiError::Render(smithay::backend::renderer::vulkan::Error::GlesError(
+            err.to_string(),
+        ))
     }
 
     fn bind_glow_texture<'a>(
@@ -626,13 +634,13 @@ impl AsGlowRenderer for super::VulkanMultiRenderer<'_> {
     }
     fn blit(
         &mut self,
-        _from: &Self::Framebuffer<'_>,
-        _to: &mut Self::Framebuffer<'_>,
-        _src: Rectangle<i32, Physical>,
-        _dst: Rectangle<i32, Physical>,
-        _filter: TextureFilter,
+        from: &Self::Framebuffer<'_>,
+        to: &mut Self::Framebuffer<'_>,
+        src: Rectangle<i32, Physical>,
+        dst: Rectangle<i32, Physical>,
+        filter: TextureFilter,
     ) -> Result<SyncPoint, Self::Error> {
-        Ok(SyncPoint::default())
+        Blit::blit(self, from, to, src, dst, filter)
     }
 }
 

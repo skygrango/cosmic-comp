@@ -275,7 +275,11 @@ where
     let SessionUserData { dt, offscreen } = &mut *session_user_data;
     let mut fb = offscreen
         .as_mut()
-        .map(|(_, tex)| renderer.bind_glow_renderbuffer(tex).map_err(DTError::Rendering))
+        .map(|(_, tex)| {
+            renderer
+                .bind_glow_renderbuffer(tex)
+                .map_err(DTError::Rendering)
+        })
         .transpose()?;
     let (result, buffers) = render_fn(
         &frame.buffer(),

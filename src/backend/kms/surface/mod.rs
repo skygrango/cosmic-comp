@@ -42,7 +42,7 @@ use smithay::{
         },
         egl::EGLContext,
         renderer::{
-            Bind, Blit, BufferType, Frame, ImportDma, Offscreen, Renderer, RendererSuper, Texture,
+            Bind, Blit, BufferType, Frame, Offscreen, Renderer, RendererSuper, Texture,
             TextureFilter, buffer_dimensions, buffer_type,
             damage::Error as RenderError,
             element::{
@@ -88,6 +88,7 @@ use smithay::{
         shm::{shm_format_to_fourcc, with_buffer_contents},
     },
 };
+use std::fmt;
 use tracing::{error, info, trace, warn};
 
 use std::{
@@ -106,7 +107,39 @@ use std::{
 mod timings;
 pub use self::timings::Timings;
 
-use super::{drm_helpers, render::gles::GbmGlowBackend};
+use super::{
+    drm_helpers,
+    render::{gles::GbmGlowBackend, vulkan::GbmVulkanBackend},
+};
+use smithay::backend::renderer::vulkan::VulkanRenderer;
+
+pub enum SurfaceNodeRenderer {
+    Egl(EGLContext),
+    Vulkan(VulkanRenderer),
+}
+
+impl fmt::Debug for SurfaceNodeRenderer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Egl(ctx) => f.debug_tuple("Egl").field(ctx).finish(),
+            Self::Vulkan(r) => f.debug_tuple("Vulkan").field(r).finish(),
+        }
+    }
+}
+
+pub enum SurfaceGpuApi {
+    Glow(GpuManager<GbmGlowBackend<DrmDeviceFd>>),
+    Vulkan(GpuManager<GbmVulkanBackend<DrmDeviceFd>>),
+}
+
+impl fmt::Debug for SurfaceGpuApi {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Glow(api) => f.debug_tuple("Glow").field(api).finish(),
+            Self::Vulkan(api) => f.debug_tuple("Vulkan").field(api).finish(),
+        }
+    }
+}
 
 static FULLSCREEN_SKIP_OTHER_SURFACE: LazyLock<bool> = LazyLock::new(|| {
     crate::utils::env::bool_var("COSMIC_FULLSCREEN_SKIP_OTHER_SURFACE").unwrap_or(true)
@@ -139,11 +172,13 @@ pub struct Surface {
     thread: Option<JoinHandle<()>>,
 
     dpms: bool,
+    pub is_vulkan: bool,
 }
 
 pub struct SurfaceThreadState {
     // rendering
-    api: GpuManager<GbmGlowBackend<DrmDeviceFd>>,
+    api: SurfaceGpuApi,
+    pub is_vulkan: bool,
     primary_node: Arc<RwLock<Option<DrmNode>>>,
     target_node: DrmNode,
     active: Arc<AtomicBool>,
@@ -225,7 +260,7 @@ pub enum ThreadCommand {
     NodeAdded {
         node: DrmNode,
         gbm: GbmAllocator<DrmDeviceFd>,
-        egl: EGLContext,
+        renderer: SurfaceNodeRenderer,
         sync: SyncSender<()>,
     },
     NodeRemoved {
@@ -271,6 +306,7 @@ impl Surface {
         screen_filter: ScreenFilter,
         shell: Arc<parking_lot::RwLock<Shell>>,
         startup_done: Arc<AtomicBool>,
+        is_vulkan: bool,
     ) -> Result<Self> {
         unsafe {
             let min_priority = libc::sched_get_priority_max(libc::SCHED_RR);
@@ -306,6 +342,7 @@ impl Surface {
                     tx2,
                     rx,
                     startup_done,
+                    is_vulkan,
                 ) {
                     error!("Surface thread crashed: {}", err);
                 }
@@ -347,14 +384,9 @@ impl Surface {
                             } else {
                                 // If we have freed the node, because it didn't have any active buffers/surfaces,
                                 // we might not be able to evaluate surface feedback yet.
-                                let render_formats =
-                                    kms.api.single_renderer(&source_node).ok()?.dmabuf_formats();
+                                let render_formats = kms.api.dmabuf_formats(&source_node)?;
                                 // In contrast we must have the target node, if we have an active surface
-                                let target_formats = kms
-                                    .api
-                                    .single_renderer(&target_node)
-                                    .unwrap()
-                                    .dmabuf_formats();
+                                let target_formats = kms.api.dmabuf_formats(&target_node).unwrap();
                                 let feedback = get_surface_dmabuf_feedback(
                                     source_node,
                                     target_node,
@@ -386,6 +418,7 @@ impl Surface {
             thread_token,
             thread: Some(thread),
             dpms: true,
+            is_vulkan,
         })
     }
 
@@ -397,13 +430,18 @@ impl Surface {
         self.active.load(Ordering::SeqCst)
     }
 
-    pub fn add_node(&mut self, node: DrmNode, gbm: GbmAllocator<DrmDeviceFd>, egl: EGLContext) {
+    pub fn add_node(
+        &mut self,
+        node: DrmNode,
+        gbm: GbmAllocator<DrmDeviceFd>,
+        renderer: SurfaceNodeRenderer,
+    ) {
         self.known_nodes.insert(node);
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let _ = self.thread_command.send(ThreadCommand::NodeAdded {
             node,
             gbm,
-            egl,
+            renderer,
             sync: tx,
         });
         let _ = rx.recv();
@@ -554,14 +592,24 @@ fn surface_thread(
     thread_sender: Sender<SurfaceCommand>,
     thread_receiver: Channel<ThreadCommand>,
     startup_done: Arc<AtomicBool>,
+    is_vulkan: bool,
 ) -> Result<()> {
     let name = output.name();
     profiling::register_thread!(&format!("Surface Thread {}", name));
 
     let mut event_loop = EventLoop::try_new().unwrap();
 
-    let api = GpuManager::new(GbmGlowBackend::<DrmDeviceFd>::default())
-        .context("Failed to initialize rendering api")?;
+    let api = if is_vulkan {
+        SurfaceGpuApi::Vulkan(
+            GpuManager::new(GbmVulkanBackend::<DrmDeviceFd>::default())
+                .context("Failed to initialize Vulkan rendering api")?,
+        )
+    } else {
+        SurfaceGpuApi::Glow(
+            GpuManager::new(GbmGlowBackend::<DrmDeviceFd>::default())
+                .context("Failed to initialize rendering api")?,
+        )
+    };
 
     #[cfg(feature = "debug")]
     let egui = {
@@ -585,6 +633,7 @@ fn surface_thread(
 
     let mut state = SurfaceThreadState {
         api,
+        is_vulkan,
         primary_node,
         target_node,
         active,
@@ -635,10 +684,10 @@ fn surface_thread(
             Event::Msg(ThreadCommand::NodeAdded {
                 node,
                 gbm,
-                egl,
+                renderer,
                 sync,
             }) => {
-                if let Err(err) = state.node_added(node, gbm, egl) {
+                if let Err(err) = state.node_added(node, gbm, renderer) {
                     warn!(?err, ?node, "Failed to add node to surface-thread");
                 }
                 let _ = sync.send(());
@@ -804,21 +853,35 @@ impl SurfaceThreadState {
         &mut self,
         node: DrmNode,
         gbm: GbmAllocator<DrmDeviceFd>,
-        egl: EGLContext,
+        renderer: SurfaceNodeRenderer,
     ) -> Result<()> {
-        let mut renderer =
-            unsafe { GlowRenderer::new(egl) }.context("Failed to create renderer")?;
-        init_shaders(renderer.borrow_mut()).context("Failed to initialize shaders")?;
-
-        self.api.as_mut().add_node(node, gbm, renderer);
+        match (&mut self.api, renderer) {
+            (SurfaceGpuApi::Glow(api), SurfaceNodeRenderer::Egl(egl)) => {
+                let mut renderer =
+                    unsafe { GlowRenderer::new(egl) }.context("Failed to create renderer")?;
+                init_shaders(renderer.borrow_mut()).context("Failed to initialize shaders")?;
+                api.as_mut().add_node(node, gbm, renderer);
+            }
+            (SurfaceGpuApi::Vulkan(api), SurfaceNodeRenderer::Vulkan(renderer)) => {
+                api.as_mut().add_node(node, gbm, renderer);
+            }
+            _ => anyhow::bail!("Mismatched surface node renderer and surface GPU API"),
+        }
 
         Ok(())
     }
 
     fn node_removed(&mut self, node: DrmNode) {
-        self.api.as_mut().remove_node(&node);
-        // force enumeration
-        let _ = self.api.devices();
+        match &mut self.api {
+            SurfaceGpuApi::Glow(api) => {
+                api.as_mut().remove_node(&node);
+                let _ = api.devices();
+            }
+            SurfaceGpuApi::Vulkan(api) => {
+                api.as_mut().remove_node(&node);
+                let _ = api.devices();
+            }
+        }
     }
 
     #[profiling::function]
@@ -1105,7 +1168,7 @@ impl SurfaceThreadState {
 
     #[profiling::function]
     fn redraw(&mut self, estimated_presentation: Duration) -> Result<()> {
-        let Some(compositor) = self.compositor.as_mut() else {
+        if self.compositor.is_none() {
             return Ok(());
         };
 
@@ -1120,17 +1183,19 @@ impl SurfaceThreadState {
             &self.shell.read(),
         );
 
-        // Acquiring a renderer can fail transiently when the underlying DRM
-        // device is lost (e.g. after a GPU reset).
-        let mut renderer = if render_node != self.target_node {
-            self.api
-                .renderer(&render_node, &self.target_node, compositor.format())
-                .map_err(|err| anyhow::format_err!("Failed to create renderer: {:?}", err))?
+        if self.is_vulkan {
+            self.redraw_vulkan(render_node, estimated_presentation)
         } else {
-            self.api
-                .single_renderer(&self.target_node)
-                .map_err(|err| anyhow::format_err!("Failed to create renderer: {:?}", err))?
-        };
+            self.redraw_glow(render_node, estimated_presentation)
+        }
+    }
+
+    fn redraw_glow(
+        &mut self,
+        render_node: DrmNode,
+        estimated_presentation: Duration,
+    ) -> Result<()> {
+        let compositor = self.compositor.as_mut().unwrap();
 
         self.timings.start_render(&self.clock);
 
@@ -1167,6 +1232,18 @@ impl SurfaceThreadState {
         if self.vrr_mode == AdaptiveSync::Enabled {
             vrr = has_active_fullscreen;
         }
+
+        let SurfaceGpuApi::Glow(api) = &mut self.api else {
+            unreachable!()
+        };
+
+        let mut renderer = if render_node != self.target_node {
+            api.renderer(&render_node, &self.target_node, compositor.format())
+                .map_err(|err| anyhow::format_err!("Failed to create renderer: {:?}", err))?
+        } else {
+            api.single_renderer(&self.target_node)
+                .map_err(|err| anyhow::format_err!("Failed to create renderer: {:?}", err))?
+        };
 
         let mut elements = output_elements(
             Some(&render_node),
@@ -1378,8 +1455,7 @@ impl SurfaceThreadState {
                 })
                 .context("Failed to draw to offscreen render target")?;
 
-            renderer = self
-                .api
+            renderer = api
                 .single_renderer(&self.target_node)
                 .map_err(|err| anyhow::format_err!("Failed to create renderer: {:?}", err))?;
 
@@ -1517,7 +1593,207 @@ impl SurfaceThreadState {
             }
         }
 
-        for device in self.api.devices_mut()? {
+        let SurfaceGpuApi::Glow(api) = &mut self.api else {
+            unreachable!()
+        };
+        for device in api.devices_mut()? {
+            device.renderer_mut().cleanup_texture_cache()?;
+        }
+
+        Ok(())
+    }
+
+    fn redraw_vulkan(
+        &mut self,
+        render_node: DrmNode,
+        estimated_presentation: Duration,
+    ) -> Result<()> {
+        let compositor = self.compositor.as_mut().unwrap();
+
+        self.timings.start_render(&self.clock);
+
+        let mut additional_frame_flags = FrameFlags::empty();
+        let mut remove_frame_flags = FrameFlags::empty();
+
+        let (has_active_fullscreen, fullscreen_drives_refresh_rate, animations_going) = {
+            let shell = self.shell.read();
+            let animations_going = shell.animations_going();
+            let output = self.mirroring.as_ref().unwrap_or(&self.output);
+            if let Some(fullscreen_surface) = output.is_foreground_fullscreen_occupied()
+                && fullscreen_surface.alive()
+            {
+                let min_vrr_frame_time = self
+                    .min_vrr_frame_time
+                    .unwrap_or(Duration::from_nanos(1_000_000_000 / 30));
+                let drives_refresh_rate = fullscreen_surface.wl_surface().is_some_and(|surface| {
+                    recursive_frame_time_estimation(&self.clock, &surface)
+                        .is_some_and(|dur| dur <= min_vrr_frame_time)
+                });
+                (true, drives_refresh_rate, animations_going)
+            } else {
+                (false, false, animations_going)
+            }
+        };
+
+        if has_active_fullscreen || animations_going {
+            remove_frame_flags |= FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT;
+        }
+
+        let mut vrr = matches!(self.vrr_mode, AdaptiveSync::Force);
+
+        if self.vrr_mode == AdaptiveSync::Enabled {
+            vrr = has_active_fullscreen;
+        }
+
+        let SurfaceGpuApi::Vulkan(api) = &mut self.api else {
+            unreachable!()
+        };
+
+        let mut renderer = if render_node != self.target_node {
+            api.renderer(&render_node, &self.target_node, compositor.format())
+                .map_err(|err| anyhow::format_err!("Failed to create renderer: {:?}", err))?
+        } else {
+            api.single_renderer(&self.target_node)
+                .map_err(|err| anyhow::format_err!("Failed to create renderer: {:?}", err))?
+        };
+
+        let elements = output_elements(
+            Some(&render_node),
+            &mut renderer,
+            &self.shell,
+            self.clock.now(),
+            self.mirroring.as_ref().unwrap_or(&self.output),
+            CursorMode::All,
+            #[cfg(not(feature = "debug"))]
+            None,
+            #[cfg(feature = "debug")]
+            Some((&self.egui, &self.timings)),
+            Some(self.target_node),
+        )
+        .map_err(|err| {
+            anyhow::format_err!("Failed to accumulate elements for rendering: {:?}", err)
+        })?;
+
+        if vrr && fullscreen_drives_refresh_rate && !self.timings.past_min_render_time(&self.clock)
+        {
+            additional_frame_flags |= FrameFlags::SKIP_CURSOR_ONLY_UPDATES;
+        };
+        self.timings.set_vrr(vrr);
+        self.timings.elements_done(&self.clock);
+
+        let mut has_cursor_mode_none = false;
+        let frames = if self.mirroring.is_none() {
+            take_screencopy_frames(&self.output, &elements, &mut has_cursor_mode_none)
+        } else {
+            Default::default()
+        };
+
+        if let Err(err) = compositor.with_compositor(|c| c.use_vrr(vrr)) {
+            warn!("Unable to set adaptive VRR state: {}", err);
+        }
+        let res = compositor.render_frame(
+            &mut renderer,
+            &elements,
+            CLEAR_COLOR,
+            self.frame_flags
+                .union(additional_frame_flags)
+                .difference(remove_frame_flags),
+        );
+        self.timings.draw_done(&self.clock);
+
+        match res {
+            Ok(frame_result) => {
+                let (_tx, rx) = std::sync::mpsc::channel();
+
+                let feedback = if !frame_result.is_empty && self.mirroring.is_none() {
+                    Some((
+                        self.shell
+                            .read()
+                            .take_presentation_feedback(&self.output, &frame_result.states),
+                        rx,
+                        estimated_presentation,
+                    ))
+                } else {
+                    None
+                };
+
+                // With Vulkan timeline semaphore exported to DRM syncobj, needs_sync() is false
+                // because the fence is exportable as IN_FENCE_FD. The CPU does not block waiting for the GPU.
+                if frame_result.needs_sync()
+                    && let PrimaryPlaneElement::Swapchain(elem) = &frame_result.primary_element
+                {
+                    elem.sync.wait()?;
+                }
+
+                match compositor.queue_frame(feedback) {
+                    x @ Ok(()) | x @ Err(FrameError::EmptyFrame) => {
+                        self.timings.submitted_for_presentation(&self.clock);
+
+                        if x.is_ok() {
+                            let new_state = QueueState::WaitingForVBlank {
+                                redraw_needed: false,
+                                fullscreen_request: false,
+                            };
+                            match mem::replace(&mut self.state, new_state) {
+                                QueueState::Idle => unreachable!(),
+                                QueueState::Queued(_) => (),
+                                QueueState::WaitingForVBlank { .. } => unreachable!(),
+                                QueueState::WaitingForEstimatedVBlank(estimated_vblank)
+                                | QueueState::WaitingForEstimatedVBlankAndQueued {
+                                    estimated_vblank,
+                                    ..
+                                } => {
+                                    self.loop_handle.remove(estimated_vblank);
+                                }
+                            };
+                        }
+
+                        for (_session, frame, _) in frames {
+                            frame.fail(CaptureFailureReason::Unknown);
+                        }
+
+                        if self.mirroring.is_none() {
+                            let _ = self
+                                .thread_sender
+                                .send(SurfaceCommand::RenderStates(frame_result.states));
+                            let _ = self.thread_sender.send(SurfaceCommand::SignalFIFO);
+                        }
+
+                        if x.is_ok() {
+                            if self.mirroring.is_none() {
+                                self.frame_callback_seq = self.frame_callback_seq.wrapping_add(1);
+                                let _ = self
+                                    .thread_sender
+                                    .send(SurfaceCommand::SendFrames(self.frame_callback_seq));
+                            }
+                        } else {
+                            let _ = self.vblank_frame.take();
+
+                            self.queue_estimated_vblank(
+                                estimated_presentation,
+                                additional_frame_flags
+                                    .contains(FrameFlags::SKIP_CURSOR_ONLY_UPDATES),
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        for (_session, frame, _) in frames {
+                            frame.fail(CaptureFailureReason::Unknown);
+                        }
+                        return Err(err).with_context(|| "Failed to submit result for display");
+                    }
+                };
+            }
+            Err(err) => {
+                compositor.reset_buffers();
+                anyhow::bail!("Rendering failed: {}", err);
+            }
+        }
+
+        let SurfaceGpuApi::Vulkan(api) = &mut self.api else {
+            unreachable!()
+        };
+        for device in api.devices_mut()? {
             device.renderer_mut().cleanup_texture_cache()?;
         }
 
@@ -1704,9 +1980,9 @@ fn get_surface_dmabuf_feedback(
     }
 }
 
-fn take_screencopy_frames(
+fn take_screencopy_frames<E: Element>(
     output: &Output,
-    elements: &[CosmicElement<GlMultiRenderer>],
+    elements: &[E],
     has_cursor_mode_none: &mut bool,
 ) -> Vec<(
     ScreencopySessionRef,
@@ -1959,7 +2235,9 @@ fn send_screencopy_result<'a>(
         sync,
         // Don't reference `Buffer`s since we blit from framebuffer/postprocess buffer
         vec![],
-    )? {
+    )
+    .map_err(RenderError::<<GlMultiRenderer as RendererSuper>::Error>::Rendering)?
+    {
         if frame_result.is_empty {
             data.frame
                 .success(transform, data.damage, presentation_time);

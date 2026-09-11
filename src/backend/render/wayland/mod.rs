@@ -98,7 +98,9 @@ pub fn push_render_elements_from_surface_tree<R>(
                                 radii,
                                 blur_strength,
                             );
-                            let elem: SurfaceRenderElement<R> = if renderer.glow_renderer().is_some()
+                            let elem: SurfaceRenderElement<R> = if renderer
+                                .glow_renderer()
+                                .is_some()
                                 && radii.iter().any(|r| *r != 0)
                                 && should_clip
                                 && ClippedSurfaceRenderElement::will_clip(

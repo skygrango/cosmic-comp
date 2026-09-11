@@ -109,6 +109,7 @@ features = [
     "backend_x11",
     "desktop",
     "renderer_glow",
+    "renderer_vulkan",
     "renderer_multi",
     "renderer_pixman",
     "wayland_frontend",
@@ -149,4 +150,5 @@ cosmic-protocols = { git = "https://github.com/skygrango/cosmic-protocols", bran
 
 [patch.crates-io]
 smithay-egui = { git = "https://github.com/Smithay/smithay-egui.git", rev = "6511552" }
-smithay = { git = "https://github.com/skygrango/smithay.git", rev = "7f8a08f" }
+#smithay = { git = "https://github.com/skygrango/smithay.git", rev = "7f8a08f" }
+smithay = { path = "smithay" }

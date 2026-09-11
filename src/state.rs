@@ -440,19 +440,30 @@ impl BackendData {
     ) -> Result<RendererRef<'_>, GlMultiError> {
         match self {
             BackendData::Kms(kms) => {
-                if let Some(nodes) = kms_node_cb(kms) {
-                    let nodes = nodes.into();
-                    Ok(RendererRef::GlMulti(kms.api.renderer(
-                        &nodes.render_node,
-                        &nodes.target_node,
-                        nodes.copy_format,
-                    )?))
-                } else {
-                    Ok(RendererRef::Glow(
-                        kms.software_renderer
-                            .as_mut()
-                            .expect("No Software Rendering"),
-                    ))
+                let nodes = kms_node_cb(kms).map(Into::into);
+                match &mut kms.api {
+                    crate::backend::kms::KmsGpuApi::Glow(api) => {
+                        if let Some(nodes) = nodes {
+                            Ok(RendererRef::GlMulti(api.renderer(
+                                &nodes.render_node,
+                                &nodes.target_node,
+                                nodes.copy_format,
+                            )?))
+                        } else {
+                            Ok(RendererRef::Glow(
+                                kms.software_renderer
+                                    .as_mut()
+                                    .expect("No Software Rendering"),
+                            ))
+                        }
+                    }
+                    crate::backend::kms::KmsGpuApi::Vulkan { .. } => {
+                        if let Some(renderer) = kms.software_renderer.as_mut() {
+                            Ok(RendererRef::Glow(renderer))
+                        } else {
+                            Err(smithay::backend::renderer::multigpu::Error::DeviceMissing)
+                        }
+                    }
                 }
             }
             BackendData::Winit(winit) => Ok(RendererRef::Glow(winit.backend.renderer())),
