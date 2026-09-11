@@ -216,7 +216,7 @@ pub fn init_backend(
     let use_vulkan = std::env::var("COSMIC_RENDERER").as_deref() == Ok("vulkan");
     let api = if use_vulkan {
         info!("Initializing Vulkan KMS backend");
-        let instance = Instance::new(Version::VERSION_1_2, None)
+        let instance = Instance::new(Version::VERSION_1_3, None)
             .context("Failed to initialize Vulkan instance")?;
         let api = GpuManager::new(GbmVulkanBackend::new())
             .context("Failed to initialize Vulkan gpu backend")?;
