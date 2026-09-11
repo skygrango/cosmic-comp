@@ -32,19 +32,9 @@ impl DrmLeaseHandler for State {
             .get_mut(&node)
             .ok_or(LeaseRejected::default())?
             .lock();
-        let mut renderer = match kms.api.single_renderer(&backend.inner.render_node) {
-            Ok(renderer) => renderer,
-            Err(err) => {
-                tracing::warn!(
-                    ?err,
-                    "Failed to create renderer to disable direct scanout, denying lease"
-                );
-                return Err(LeaseRejected::default());
-            }
-        };
-        if let Err(err) = backend.allow_overlay_scanout(
+        if let Err(err) = kms.api.allow_overlay_scanout(
+            &mut backend,
             false,
-            &mut renderer,
             &self.common.clock,
             &self.common.shell,
         ) {
@@ -114,16 +104,9 @@ impl DrmLeaseHandler for State {
             backend.inner.active_leases.retain(|l| l.id() != lease);
 
             if backend.inner.active_leases.is_empty() {
-                let mut renderer = match kms.api.single_renderer(&backend.inner.render_node) {
-                    Ok(renderer) => renderer,
-                    Err(err) => {
-                        tracing::warn!(?err, "Failed to create renderer to enable direct scanout.");
-                        return;
-                    }
-                };
-                if let Err(err) = backend.allow_overlay_scanout(
+                if let Err(err) = kms.api.allow_overlay_scanout(
+                    &mut backend,
                     true,
-                    &mut renderer,
                     &self.common.clock,
                     &self.common.shell,
                 ) {

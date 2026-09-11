@@ -1612,11 +1612,7 @@ where
             CosmicWindowRenderElement::Shadow(elem) | CosmicWindowRenderElement::Border(elem) => {
                 if let Some(glow_frame) = R::glow_frame_mut(frame) {
                     RenderElement::<GlowRenderer>::capture_framebuffer(
-                        elem,
-                        glow_frame,
-                        src,
-                        dst,
-                        cache,
+                        elem, glow_frame, src, dst, cache,
                     )
                     .map_err(R::from_gles_error)
                 } else {

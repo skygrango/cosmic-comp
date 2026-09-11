@@ -476,8 +476,10 @@ where
 
         if let Some(tex) = texture_ref.as_ref() {
             if let Some(glow_frame) = <R as AsGlowRenderer>::glow_frame_mut(frame) {
-                BorrowMut::<GlesFrame>::borrow_mut(glow_frame)
-                    .override_default_tex_program(self.render_shader.clone(), self.uniforms.clone());
+                BorrowMut::<GlesFrame>::borrow_mut(glow_frame).override_default_tex_program(
+                    self.render_shader.clone(),
+                    self.uniforms.clone(),
+                );
             }
             frame.render_texture_from_to(
                 tex,
@@ -489,8 +491,7 @@ where
                 1.0,
             )?;
             if let Some(glow_frame) = <R as AsGlowRenderer>::glow_frame_mut(frame) {
-                BorrowMut::<GlesFrame>::borrow_mut(glow_frame)
-                    .clear_tex_program_override();
+                BorrowMut::<GlesFrame>::borrow_mut(glow_frame).clear_tex_program_override();
             }
         }
         Ok(())

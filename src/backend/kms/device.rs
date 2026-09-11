@@ -2,11 +2,18 @@
 
 use crate::{
     backend::{
-        kms::render::gles::GbmGlowBackend,
-        render::{CLEAR_COLOR, CursorMode, GlMultiRenderer, init_shaders, output_elements},
+        kms::{
+            render::{gles::GbmGlowBackend, vulkan::GbmVulkanBackend},
+            surface::{Surface, SurfaceNodeRenderer},
+        },
+        render::{
+            CLEAR_COLOR, CursorMode,
+            element::{AsGlowRenderer, CosmicElement},
+            init_shaders, output_elements,
+        },
     },
     config::{CompTransformDef, EdidProduct, ScreenFilter},
-    shell::Shell,
+    shell::{CosmicMappedRenderElement, Shell, WorkspaceRenderElement},
     utils::{env::dev_list_var, prelude::*},
     wayland::handlers::image_copy_capture::PendingImageCopyData,
 };
@@ -17,6 +24,7 @@ use smithay::{
     backend::{
         allocator::{
             Format, Fourcc,
+            dmabuf::Dmabuf,
             format::FormatSet,
             gbm::{GbmAllocator, GbmDevice},
         },
@@ -27,8 +35,12 @@ use smithay::{
             output::{DrmOutputManager, LockedDrmOutputManager},
         },
         egl::{EGLContext, EGLDevice, EGLDisplay, context::ContextPriority},
-        renderer::glow::GlowRenderer,
+        renderer::{
+            Bind, ImportDma, Renderer, Texture, element::RenderElement, glow::GlowRenderer,
+            vulkan::VulkanRenderer,
+        },
         session::{Session, libseat::LibSeatSession},
+        vulkan::PhysicalDevice,
     },
     desktop::utils::OutputPresentationFeedback,
     output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel},
@@ -59,13 +71,18 @@ use std::{
     time::Duration,
 };
 
-use super::{drm_helpers, surface::Surface};
+use super::drm_helpers;
 
 #[derive(Debug)]
 pub struct EGLInternals {
     pub display: EGLDisplay,
     pub device: EGLDevice,
     pub context: EGLContext,
+}
+
+#[derive(Debug)]
+pub struct VulkanInternals {
+    pub phd: PhysicalDevice,
 }
 
 pub type LockedGbmDrmOutputManager<'a> = LockedDrmOutputManager<
@@ -124,6 +141,10 @@ pub struct InnerDevice {
     pub render_node: DrmNode,
     pub is_software: bool,
     pub egl: Option<EGLInternals>,
+    pub vulkan: Option<VulkanInternals>,
+    pub vulkan_phd: Option<PhysicalDevice>,
+    pub is_vulkan: bool,
+    pub fd: DrmDeviceFd,
 
     pub outputs: HashMap<connector::Handle, Output>,
     pub surfaces: HashMap<crtc::Handle, Surface>,
@@ -236,6 +257,7 @@ impl State {
             }
         }
 
+        let vulkan_instance = self.backend.kms().vulkan_instance().cloned();
         let mut device = Device::new(
             dev,
             path,
@@ -243,6 +265,7 @@ impl State {
             &mut self.common,
             dh,
             None,
+            vulkan_instance.as_ref(),
         )?;
         let connectors = device.enumerate_surfaces()?.added; // There are no removed outputs on newly added devices
         let mut wl_outputs = Vec::new();
@@ -417,9 +440,7 @@ impl State {
             }
 
             // These contain a reference to the file descriptor
-            backend.api.as_mut().remove_node(&device.inner.render_node);
-            // trigger enumeration
-            let _ = backend.api.devices();
+            backend.api.remove_node(&device.inner.render_node);
 
             for surface in backend
                 .drm_devices
@@ -428,6 +449,7 @@ impl State {
             {
                 surface.remove_node(device.inner.render_node);
             }
+            let vulkan_instance = backend.vulkan_instance().cloned();
             let syncobj_guard =
                 if is_primary && let Some(syncobj_state) = backend.syncobj_state.as_mut() {
                     Some(syncobj_state.close_device())
@@ -455,6 +477,7 @@ impl State {
                 &mut self.common,
                 dh,
                 Some(reusable),
+                vulkan_instance.as_ref(),
             )?;
 
             if let Some(guard) = syncobj_guard {
@@ -520,6 +543,7 @@ impl State {
                                     self.common.config.dynamic_conf.screen_filter().clone(),
                                     self.common.shell.clone(),
                                     self.common.startup_done.clone(),
+                                    new_device.inner.is_vulkan,
                                 ) {
                                     Ok(data) => {
                                         new_device.inner.surfaces.insert(crtc, data);
@@ -615,7 +639,7 @@ impl State {
             if let Some(token) = device.event_token.take() {
                 self.common.event_loop_handle.remove(token);
             }
-            backend.api.as_mut().remove_node(&device.inner.render_node);
+            backend.api.remove_node(&device.inner.render_node);
             backend
                 .primary_node
                 .write()
@@ -684,6 +708,7 @@ impl Device {
         common: &mut Common,
         dh: &DisplayHandle,
         reuse: Option<ReusableDevice>,
+        vulkan_instance: Option<&smithay::backend::vulkan::Instance>,
     ) -> Result<Self> {
         let path = path.as_ref();
         let fd = DrmDeviceFd::new(DeviceFd::from(
@@ -703,27 +728,70 @@ impl Device {
             .with_context(|| format!("Failed to initialize drm device for: {}", path.display()))?;
         let dev_node = DrmNode::from_dev_id(dev)?;
 
-        let gbm = GbmDevice::new(fd)
+        let gbm = GbmDevice::new(fd.clone())
             .with_context(|| format!("Failed to initialize GBM device for {}", path.display()))?;
-        let (render_node, render_formats, texture_formats, is_software) = {
-            let egl = init_egl(&gbm)?;
+        let (render_node, render_formats, texture_formats, is_software, egl, vulkan_phd, is_vulkan) =
+            if let Some(instance) = vulkan_instance {
+                let phd = PhysicalDevice::enumerate(instance)?
+                    .find(|phd| {
+                        if let Ok(Some(primary)) = phd.primary_node() {
+                            if primary == dev_node {
+                                return true;
+                            }
+                        }
+                        if let Ok(Some(render)) = phd.render_node() {
+                            if render == dev_node {
+                                return true;
+                            }
+                        }
+                        false
+                    })
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Failed to find matching Vulkan physical device for DRM node {:?}",
+                            dev_node
+                        )
+                    })?;
 
-            let render_node = egl
-                .device
-                .try_get_render_node()
-                .ok()
-                .and_then(std::convert::identity)
-                .unwrap_or(dev_node);
-            let render_formats = egl.context.dmabuf_render_formats().clone();
-            let texture_formats = egl.context.dmabuf_texture_formats().clone();
+                let render_node = phd.render_node().ok().flatten().unwrap_or(dev_node);
+                let is_software =
+                    phd.ty() == smithay::backend::vulkan::ash::vk::PhysicalDeviceType::CPU;
+                let temp_renderer = VulkanRenderer::new(&phd, Some(fd.clone()))
+                    .context("Failed to create temporary Vulkan renderer to query formats")?;
+                let render_formats = temp_renderer.dmabuf_formats();
+                let texture_formats = render_formats.clone();
 
-            (
-                render_node,
-                render_formats,
-                texture_formats,
-                egl.device.is_software(),
-            )
-        };
+                (
+                    render_node,
+                    render_formats,
+                    texture_formats,
+                    is_software,
+                    None,
+                    Some(phd),
+                    true,
+                )
+            } else {
+                let egl = init_egl(&gbm)?;
+
+                let render_node = egl
+                    .device
+                    .try_get_render_node()
+                    .ok()
+                    .and_then(std::convert::identity)
+                    .unwrap_or(dev_node);
+                let render_formats = egl.context.dmabuf_render_formats().clone();
+                let texture_formats = egl.context.dmabuf_texture_formats().clone();
+
+                (
+                    render_node,
+                    render_formats,
+                    texture_formats,
+                    egl.device.is_software(),
+                    None,
+                    None,
+                    false,
+                )
+            };
 
         let token = common
             .event_loop_handle
@@ -792,7 +860,11 @@ impl Device {
                 dev_node,
                 render_node,
                 is_software,
-                egl: None,
+                egl,
+                vulkan: None,
+                vulkan_phd,
+                is_vulkan,
+                fd,
 
                 outputs: HashMap::new(),
                 surfaces: HashMap::new(),
@@ -884,14 +956,22 @@ impl Device {
 }
 
 impl LockedDevice<'_> {
-    fn allow_frame_flags(
+    fn allow_frame_flags<R>(
         &mut self,
         flag: bool,
         flags: FrameFlags,
-        renderer: &mut GlMultiRenderer,
+        renderer: &mut R,
         clock: &Clock<Monotonic>,
         shell: &Arc<parking_lot::RwLock<Shell>>,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        R: Renderer + Bind<Dmabuf> + AsGlowRenderer,
+        R::TextureId: Texture + Send + Clone + 'static,
+        R::Error: Send + Sync + 'static,
+        CosmicElement<R>: RenderElement<R>,
+        CosmicMappedRenderElement<R>: RenderElement<R>,
+        WorkspaceRenderElement<R>: RenderElement<R>,
+    {
         for surface in self.inner.surfaces.values_mut() {
             surface.allow_frame_flags(flag, flags);
         }
@@ -935,13 +1015,21 @@ impl LockedDevice<'_> {
         Ok(())
     }
 
-    pub fn allow_overlay_scanout(
+    pub fn allow_overlay_scanout<R>(
         &mut self,
         flag: bool,
-        renderer: &mut GlMultiRenderer,
+        renderer: &mut R,
         clock: &Clock<Monotonic>,
         shell: &Arc<parking_lot::RwLock<Shell>>,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        R: Renderer + Bind<Dmabuf> + AsGlowRenderer,
+        R::TextureId: Texture + Send + Clone + 'static,
+        R::Error: Send + Sync + 'static,
+        CosmicElement<R>: RenderElement<R>,
+        CosmicMappedRenderElement<R>: RenderElement<R>,
+        WorkspaceRenderElement<R>: RenderElement<R>,
+    {
         self.allow_frame_flags(
             flag,
             FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT,
@@ -951,13 +1039,21 @@ impl LockedDevice<'_> {
         )
     }
 
-    pub fn allow_primary_scanout_any(
+    pub fn allow_primary_scanout_any<R>(
         &mut self,
         flag: bool,
-        renderer: &mut GlMultiRenderer,
+        renderer: &mut R,
         clock: &Clock<Monotonic>,
         shell: &Arc<parking_lot::RwLock<Shell>>,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        R: Renderer + Bind<Dmabuf> + AsGlowRenderer,
+        R::TextureId: Texture + Send + Clone + 'static,
+        R::Error: Send + Sync + 'static,
+        CosmicElement<R>: RenderElement<R>,
+        CosmicMappedRenderElement<R>: RenderElement<R>,
+        WorkspaceRenderElement<R>: RenderElement<R>,
+    {
         self.allow_frame_flags(
             flag,
             FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY,
@@ -1071,6 +1167,7 @@ impl InnerDevice {
                     screen_filter,
                     shell,
                     startup_done,
+                    self.is_vulkan,
                 ) {
                     Ok(data) => {
                         self.surfaces.insert(crtc, data);
@@ -1139,6 +1236,39 @@ impl InnerDevice {
         }
     }
 
+    pub fn update_vulkan(
+        &mut self,
+        primary_node: Option<&DrmNode>,
+        api: &mut GbmVulkanBackend<DrmDeviceFd>,
+    ) -> Result<bool> {
+        if self.in_use(primary_node) {
+            if self.vulkan.is_none() {
+                let phd = self
+                    .vulkan_phd
+                    .as_ref()
+                    .context("No Vulkan physical device found")?;
+                let renderer = VulkanRenderer::new(phd, Some(self.fd.clone()))
+                    .context("Failed to create Vulkan renderer")?;
+                api.add_node(
+                    self.render_node,
+                    GbmAllocator::new(
+                        self.gbm.clone(),
+                        GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
+                    ),
+                    renderer,
+                );
+                self.vulkan = Some(VulkanInternals { phd: phd.clone() });
+            }
+            Ok(true)
+        } else {
+            if self.vulkan.is_some() {
+                let _ = self.vulkan.take();
+                api.remove_node(&self.render_node);
+            }
+            Ok(false)
+        }
+    }
+
     pub fn update_surface_nodes<'b>(
         &mut self,
         used_devices: &HashSet<DrmNode>,
@@ -1153,35 +1283,68 @@ impl InnerDevice {
                 surface.remove_node(*gone_device);
             }
             for new_device in used_devices.difference(&known_nodes) {
-                let (render_node, egl, gbm) = if self.render_node == *new_device {
-                    // we need to make sure to do partial borrows here, as device.surfaces is borrowed mutable
-                    (
-                        self.render_node,
-                        self.egl.as_ref().unwrap(),
-                        self.gbm.clone(),
-                    )
-                } else {
-                    let device = others
-                        .iter()
-                        .find(|d| d.render_node == *new_device)
-                        .unwrap();
-                    (
-                        device.render_node,
-                        device.egl.as_ref().unwrap(),
-                        device.gbm.clone(),
-                    )
-                };
+                if self.is_vulkan {
+                    let (render_node, phd, fd, gbm) = if self.render_node == *new_device {
+                        (
+                            self.render_node,
+                            self.vulkan.as_ref().unwrap().phd.clone(),
+                            self.fd.clone(),
+                            self.gbm.clone(),
+                        )
+                    } else {
+                        let device = others
+                            .iter()
+                            .find(|d| d.render_node == *new_device)
+                            .unwrap();
+                        (
+                            device.render_node,
+                            device.vulkan.as_ref().unwrap().phd.clone(),
+                            device.fd.clone(),
+                            device.gbm.clone(),
+                        )
+                    };
 
-                surface.add_node(
-                    render_node,
-                    GbmAllocator::new(gbm, GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT),
-                    EGLContext::new_shared_with_priority(
-                        &egl.display,
-                        &egl.context,
-                        ContextPriority::High,
-                    )
-                    .context("Failed to create shared EGL context")?,
-                );
+                    let renderer = VulkanRenderer::new(&phd, Some(fd))
+                        .context("Failed to create Vulkan renderer for surface")?;
+
+                    surface.add_node(
+                        render_node,
+                        GbmAllocator::new(gbm, GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT),
+                        SurfaceNodeRenderer::Vulkan(renderer),
+                    );
+                } else {
+                    let (render_node, egl, gbm) = if self.render_node == *new_device {
+                        // we need to make sure to do partial borrows here, as device.surfaces is borrowed mutable
+                        (
+                            self.render_node,
+                            self.egl.as_ref().unwrap(),
+                            self.gbm.clone(),
+                        )
+                    } else {
+                        let device = others
+                            .iter()
+                            .find(|d| d.render_node == *new_device)
+                            .unwrap();
+                        (
+                            device.render_node,
+                            device.egl.as_ref().unwrap(),
+                            device.gbm.clone(),
+                        )
+                    };
+
+                    surface.add_node(
+                        render_node,
+                        GbmAllocator::new(gbm, GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT),
+                        SurfaceNodeRenderer::Egl(
+                            EGLContext::new_shared_with_priority(
+                                &egl.display,
+                                &egl.context,
+                                ContextPriority::High,
+                            )
+                            .context("Failed to create shared EGL context")?,
+                        ),
+                    );
+                }
             }
         }
 

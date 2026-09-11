@@ -183,12 +183,11 @@ impl ApiDevice for GbmVulkanDevice {
 #[cfg(test)]
 mod test {
     use super::*;
-    use smithay::backend::renderer::{
-        multigpu::MultiRenderer,
-        Bind, ExportMem, ImportDma, ImportMem, Renderer,
-    };
-    use smithay::backend::drm::DrmDeviceFd;
     use smithay::backend::allocator::dmabuf::Dmabuf;
+    use smithay::backend::drm::DrmDeviceFd;
+    use smithay::backend::renderer::{
+        Bind, ExportMem, ImportDma, ImportMem, Renderer, multigpu::MultiRenderer,
+    };
 
     use smithay::backend::renderer::ImportAll;
 
@@ -196,18 +195,34 @@ mod test {
     where
         R: Renderer + Bind<Dmabuf> + ImportAll + ImportDma + ImportMem + ExportMem,
         R::TextureId: Clone + Send + 'static,
-    {}
+    {
+    }
 
     fn assert_drm_output_bounds<'a, R>()
     where
         R: Renderer + Bind<Dmabuf>,
         R::TextureId: smithay::backend::renderer::Texture + 'static,
         R::Error: std::error::Error + Send + Sync + 'static,
-    {}
+    {
+    }
 
     #[test]
     fn test_vulkan_multi_renderer_traits() {
-        assert_traits::<MultiRenderer<'static, 'static, GbmVulkanBackend<DrmDeviceFd>, GbmVulkanBackend<DrmDeviceFd>>>();
-        assert_drm_output_bounds::<MultiRenderer<'static, 'static, GbmVulkanBackend<DrmDeviceFd>, GbmVulkanBackend<DrmDeviceFd>>>();
+        assert_traits::<
+            MultiRenderer<
+                'static,
+                'static,
+                GbmVulkanBackend<DrmDeviceFd>,
+                GbmVulkanBackend<DrmDeviceFd>,
+            >,
+        >();
+        assert_drm_output_bounds::<
+            MultiRenderer<
+                'static,
+                'static,
+                GbmVulkanBackend<DrmDeviceFd>,
+                GbmVulkanBackend<DrmDeviceFd>,
+            >,
+        >();
     }
 }

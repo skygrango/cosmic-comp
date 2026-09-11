@@ -1468,26 +1468,26 @@ where
             CosmicMappedRenderElement::Window(elem) => elem.underlying_storage(renderer),
             CosmicMappedRenderElement::TiledStack(elem) => elem.underlying_storage(renderer),
             CosmicMappedRenderElement::TiledWindow(elem) => elem.underlying_storage(renderer),
-            CosmicMappedRenderElement::TiledOverlay(elem) => {
-                renderer.glow_renderer_mut().and_then(|glow| elem.underlying_storage(glow))
-            }
+            CosmicMappedRenderElement::TiledOverlay(elem) => renderer
+                .glow_renderer_mut()
+                .and_then(|glow| elem.underlying_storage(glow)),
             CosmicMappedRenderElement::MovingStack(elem) => elem.underlying_storage(renderer),
             CosmicMappedRenderElement::MovingWindow(elem) => elem.underlying_storage(renderer),
             CosmicMappedRenderElement::GrabbedStack(elem) => elem.underlying_storage(renderer),
             CosmicMappedRenderElement::GrabbedWindow(elem) => elem.underlying_storage(renderer),
-            CosmicMappedRenderElement::FocusIndicator(elem) => {
-                renderer.glow_renderer_mut().and_then(|glow| elem.underlying_storage(glow))
-            }
-            CosmicMappedRenderElement::Overlay(elem) => {
-                renderer.glow_renderer_mut().and_then(|glow| elem.underlying_storage(glow))
-            }
+            CosmicMappedRenderElement::FocusIndicator(elem) => renderer
+                .glow_renderer_mut()
+                .and_then(|glow| elem.underlying_storage(glow)),
+            CosmicMappedRenderElement::Overlay(elem) => renderer
+                .glow_renderer_mut()
+                .and_then(|glow| elem.underlying_storage(glow)),
             CosmicMappedRenderElement::StackHoverIndicator(elem) => {
                 elem.underlying_storage(renderer)
             }
             #[cfg(feature = "debug")]
-            CosmicMappedRenderElement::Egui(elem) => {
-                renderer.glow_renderer_mut().and_then(|glow| elem.underlying_storage(glow))
-            }
+            CosmicMappedRenderElement::Egui(elem) => renderer
+                .glow_renderer_mut()
+                .and_then(|glow| elem.underlying_storage(glow)),
         }
     }
 
@@ -1514,11 +1514,7 @@ where
             CosmicMappedRenderElement::TiledOverlay(elem) => {
                 if let Some(glow_frame) = R::glow_frame_mut(frame) {
                     RenderElement::<GlowRenderer>::capture_framebuffer(
-                        elem,
-                        glow_frame,
-                        src,
-                        dst,
-                        cache,
+                        elem, glow_frame, src, dst, cache,
                     )
                     .map_err(R::from_gles_error)
                 } else {
@@ -1540,11 +1536,7 @@ where
             CosmicMappedRenderElement::FocusIndicator(elem) => {
                 if let Some(glow_frame) = R::glow_frame_mut(frame) {
                     RenderElement::<GlowRenderer>::capture_framebuffer(
-                        elem,
-                        glow_frame,
-                        src,
-                        dst,
-                        cache,
+                        elem, glow_frame, src, dst, cache,
                     )
                     .map_err(R::from_gles_error)
                 } else {
@@ -1554,11 +1546,7 @@ where
             CosmicMappedRenderElement::Overlay(elem) => {
                 if let Some(glow_frame) = R::glow_frame_mut(frame) {
                     RenderElement::<GlowRenderer>::capture_framebuffer(
-                        elem,
-                        glow_frame,
-                        src,
-                        dst,
-                        cache,
+                        elem, glow_frame, src, dst, cache,
                     )
                     .map_err(R::from_gles_error)
                 } else {

@@ -269,8 +269,7 @@ where
         self.inner
             .draw(frame, src, dst, damage, opaque_regions, cache)?;
         if let Some(glow_frame) = <R as AsGlowRenderer>::glow_frame_mut(frame) {
-            BorrowMut::<GlesFrame>::borrow_mut(glow_frame)
-                .clear_tex_program_override();
+            BorrowMut::<GlesFrame>::borrow_mut(glow_frame).clear_tex_program_override();
         }
         Ok(())
     }
