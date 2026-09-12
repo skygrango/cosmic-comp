@@ -764,8 +764,11 @@ impl Device {
                     phd.ty() == smithay::backend::vulkan::ash::vk::PhysicalDeviceType::CPU;
                 let temp_renderer = VulkanRenderer::new(&phd, Some(fd.clone()))
                     .context("Failed to create temporary Vulkan renderer to query formats")?;
-                let render_formats = temp_renderer.dmabuf_formats();
-                let texture_formats = render_formats.clone();
+                let texture_formats = temp_renderer.dmabuf_formats();
+                let render_formats = smithay::backend::renderer::Bind::<
+                    smithay::backend::allocator::dmabuf::Dmabuf,
+                >::supported_formats(&temp_renderer)
+                .unwrap_or_else(|| texture_formats.clone());
 
                 (
                     render_node,

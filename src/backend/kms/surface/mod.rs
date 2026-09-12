@@ -61,7 +61,7 @@ use smithay::{
                 element::TextureShaderElement,
             },
             glow::GlowRenderer,
-            multigpu::{ApiDevice, Error as MultiError, GpuManager},
+            multigpu::{ApiDevice, Error as MultiError, GpuManager, is_same_gpu},
             sync::SyncPoint,
             utils::with_renderer_surface_state,
         },
@@ -94,7 +94,7 @@ use smithay::{
     },
 };
 use std::fmt;
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use std::{
     borrow::{Borrow, BorrowMut},
@@ -1123,6 +1123,7 @@ impl SurfaceThreadState {
         let Some(compositor) = self.compositor.as_mut() else {
             return;
         };
+        trace!(?metadata, state = ?self.state, "surface on_vblank");
 
         // handle edge-cases right after resume
         if !matches!(
@@ -1521,7 +1522,7 @@ impl SurfaceThreadState {
             unreachable!()
         };
 
-        let mut renderer = if render_node != self.target_node {
+        let mut renderer = if !is_same_gpu(&render_node, &self.target_node) {
             api.renderer(&render_node, &self.target_node, compositor.format())
                 .map_err(|err| anyhow::format_err!("Failed to create renderer: {:?}", err))?
         } else {
@@ -1918,7 +1919,13 @@ impl SurfaceThreadState {
         let mut additional_frame_flags = FrameFlags::empty();
         let mut remove_frame_flags = FrameFlags::empty();
 
-        let (has_active_fullscreen, fullscreen_drives_refresh_rate, animations_going) = {
+        let (
+            has_active_fullscreen,
+            fullscreen_drives_refresh_rate,
+            animations_going,
+            _prefers_async,
+            is_fullscreen_scanout_compatible,
+        ) = {
             let shell = self.shell.read();
             let animations_going = shell.animations_going();
             let output = self.mirroring.as_ref().unwrap_or(&self.output);
@@ -1932,11 +1939,43 @@ impl SurfaceThreadState {
                     recursive_frame_time_estimation(&self.clock, &surface)
                         .is_some_and(|dur| dur <= min_vrr_frame_time)
                 });
-                (true, drives_refresh_rate, animations_going)
+                let prefers_async = fullscreen_surface.prefers_async;
+                let is_fullscreen_scanout_compatible =
+                    is_scanout_compatible(self.hdr_enabled, fullscreen_surface.is_hdr);
+                (
+                    true,
+                    drives_refresh_rate,
+                    animations_going,
+                    prefers_async,
+                    is_fullscreen_scanout_compatible,
+                )
             } else {
-                (false, false, animations_going)
+                (false, false, animations_going, false, false)
             }
         };
+
+        let allow_primary_scanout = has_active_fullscreen
+            && is_fullscreen_scanout_compatible
+            && self.screen_filter.is_noop()
+            && self.mirroring.is_none()
+            && !bool_var("COSMIC_DISABLE_DIRECT_SCANOUT").unwrap_or(false);
+
+        if self.is_scanout != allow_primary_scanout {
+            if allow_primary_scanout {
+                error!("Eable SCANOUT");
+            } else {
+                error!("Disable SCANOUT");
+            }
+            self.is_scanout = allow_primary_scanout;
+        }
+
+        if allow_primary_scanout {
+            additional_frame_flags |= FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
+                | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY;
+        } else {
+            remove_frame_flags |= FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
+                | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY;
+        }
 
         if has_active_fullscreen || animations_going {
             remove_frame_flags |= FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT;
@@ -1952,13 +1991,18 @@ impl SurfaceThreadState {
             unreachable!()
         };
 
-        let mut renderer = if render_node != self.target_node {
+        let mut renderer = if !is_same_gpu(&render_node, &self.target_node) {
             api.renderer(&render_node, &self.target_node, compositor.format())
                 .map_err(|err| anyhow::format_err!("Failed to create renderer: {:?}", err))?
         } else {
             api.single_renderer(&self.target_node)
                 .map_err(|err| anyhow::format_err!("Failed to create renderer: {:?}", err))?
         };
+
+        renderer.as_mut().set_hdr_output(self.hdr_config);
+        if let Some(target) = renderer.target_as_mut() {
+            target.set_hdr_output(self.hdr_config);
+        }
 
         let elements = output_elements(
             Some(&render_node),
@@ -1994,18 +2038,42 @@ impl SurfaceThreadState {
         if let Err(err) = compositor.with_compositor(|c| c.use_vrr(vrr)) {
             warn!("Unable to set adaptive VRR state: {}", err);
         }
-        let res = compositor.render_frame(
-            &mut renderer,
-            &elements,
-            CLEAR_COLOR,
-            self.frame_flags
-                .union(additional_frame_flags)
-                .difference(remove_frame_flags),
+        let effective_flags = self
+            .frame_flags
+            .union(additional_frame_flags)
+            .difference(remove_frame_flags);
+        debug!(
+            render_node = ?render_node,
+            target_node = ?self.target_node,
+            elem_count = elements.len(),
+            frame_flags = ?effective_flags,
+            vrr,
+            allow_primary_scanout,
+            "redraw_vulkan executing render_frame"
         );
+        for (i, elem) in elements.iter().enumerate() {
+            debug!(
+                "  elem #{i}: id={:?}, geo={:?}",
+                elem.id(),
+                elem.geometry(self.output.current_scale().fractional_scale().into())
+            );
+        }
+
+        let res = compositor.render_frame(&mut renderer, &elements, CLEAR_COLOR, effective_flags);
         self.timings.draw_done(&self.clock);
 
         match res {
             Ok(frame_result) => {
+                debug!(
+                    is_empty = frame_result.is_empty,
+                    needs_sync = frame_result.needs_sync(),
+                    is_swapchain = matches!(
+                        frame_result.primary_element,
+                        PrimaryPlaneElement::Swapchain(_)
+                    ),
+                    states_len = frame_result.states.states.len(),
+                    "redraw_vulkan render_frame Ok"
+                );
                 let (_tx, rx) = std::sync::mpsc::channel();
 
                 let feedback = if !frame_result.is_empty && self.mirroring.is_none() {
@@ -2028,7 +2096,9 @@ impl SurfaceThreadState {
                     elem.sync.wait()?;
                 }
 
-                match compositor.queue_frame(feedback) {
+                let queue_res = compositor.queue_frame(feedback);
+                debug!(?queue_res, "redraw_vulkan queue_frame result");
+                match queue_res {
                     x @ Ok(()) | x @ Err(FrameError::EmptyFrame) => {
                         self.timings.submitted_for_presentation(&self.clock);
 
@@ -2063,6 +2133,14 @@ impl SurfaceThreadState {
                         }
 
                         if x.is_ok() {
+                            if let Some(hdr_state) =
+                                self.output.user_data().get::<drm_helpers::HdrOutputState>()
+                            {
+                                // TEST_ONLY validation is not enough to advertise HDR to
+                                // clients. Publish it only after the real frame commit was
+                                // accepted by KMS.
+                                hdr_state.commit();
+                            }
                             if self.mirroring.is_none() {
                                 self.frame_callback_seq = self.frame_callback_seq.wrapping_add(1);
                                 let _ = self
@@ -2192,6 +2270,12 @@ impl SurfaceThreadState {
     }
 }
 
+impl Drop for SurfaceThreadState {
+    fn drop(&mut self) {
+        drop(self.compositor.take());
+    }
+}
+
 fn source_node_for_surface(w: &WlSurface) -> Option<DrmNode> {
     with_renderer_surface_state(w, |state| {
         state
@@ -2210,7 +2294,7 @@ fn render_node_for_output(
     target_node: &DrmNode,
     shell: &Shell,
 ) -> DrmNode {
-    if target_node == primary_node {
+    if is_same_gpu(target_node, primary_node) {
         return *target_node;
     }
 
@@ -2233,7 +2317,7 @@ fn render_node_for_output(
     .flat_map(|w| w.wl_surface().and_then(|s| source_node_for_surface(&s)))
     .collect::<Vec<_>>();
 
-    if nodes.contains(target_node) || nodes.is_empty() {
+    if nodes.iter().any(|node| is_same_gpu(node, target_node)) || nodes.is_empty() {
         *target_node
     } else {
         *primary_node
@@ -2265,7 +2349,7 @@ fn get_surface_dmabuf_feedback(
 
     let mut builder = DmabufFeedbackBuilder::new(render_node.dev_id(), render_formats.clone());
 
-    if target_node != render_node {
+    if !is_same_gpu(&target_node, &render_node) {
         builder = builder.add_preference_tranche(
             target_node.dev_id(),
             zwp_linux_dmabuf_feedback_v1::TrancheFlags::Sampling,
