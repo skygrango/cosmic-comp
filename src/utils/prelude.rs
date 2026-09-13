@@ -361,7 +361,16 @@ impl OutputExt for Output {
             let (output_hdr_enabled, output_ref_white) = user_data
                 .get::<crate::backend::kms::drm_helpers::HdrOutputState>()
                 .and_then(|s| s.get().or_else(|| s.staged()))
-                .map(|hdr| (true, if hdr.reference_white > 0 { hdr.reference_white } else { 203 }))
+                .map(|hdr| {
+                    (
+                        true,
+                        if hdr.reference_white > 0 {
+                            hdr.reference_white
+                        } else {
+                            203
+                        },
+                    )
+                })
                 .unwrap_or((false, 203));
 
             // Query hardware scanout capabilities from output
@@ -449,7 +458,16 @@ impl OutputExt for Output {
             .user_data()
             .get::<crate::backend::kms::drm_helpers::HdrOutputState>()
             .and_then(|s| s.get().or_else(|| s.staged()))
-            .map(|hdr| (true, if hdr.reference_white > 0 { hdr.reference_white } else { 203 }))
+            .map(|hdr| {
+                (
+                    true,
+                    if hdr.reference_white > 0 {
+                        hdr.reference_white
+                    } else {
+                        203
+                    },
+                )
+            })
             .unwrap_or((false, 203));
         let caps = self.scanout_capabilities().unwrap_or_default();
         let plan =

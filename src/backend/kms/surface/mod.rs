@@ -1529,7 +1529,8 @@ impl SurfaceThreadState {
                                         ?scanout_plan,
                                         "Hardware color state rejected; falling back to shader"
                                     );
-                                    let _ = compositor.use_crtc_color_state(CrtcColorState::default());
+                                    let _ =
+                                        compositor.use_crtc_color_state(CrtcColorState::default());
                                     self.active_scanout_plan = ScanoutPlan::DirectPassthrough;
                                     self.failed_scanout_plan = Some(scanout_plan);
                                     allow_primary_scanout = false;
@@ -1871,7 +1872,12 @@ impl SurfaceThreadState {
                     frame_result.primary_element,
                     PrimaryPlaneElement::Swapchain(_)
                 );
-                if is_swapchain && self.active_scanout_plan.requires_crtc_color_state().is_some() {
+                if is_swapchain
+                    && self
+                        .active_scanout_plan
+                        .requires_crtc_color_state()
+                        .is_some()
+                {
                     let _ = compositor.use_crtc_color_state(CrtcColorState::default());
                     self.active_scanout_plan = ScanoutPlan::DirectPassthrough;
                 }
@@ -2087,7 +2093,8 @@ impl SurfaceThreadState {
                                         ?scanout_plan,
                                         "Hardware color state rejected; falling back to Vulkan shader"
                                     );
-                                    let _ = compositor.use_crtc_color_state(CrtcColorState::default());
+                                    let _ =
+                                        compositor.use_crtc_color_state(CrtcColorState::default());
                                     self.active_scanout_plan = ScanoutPlan::DirectPassthrough;
                                     self.failed_scanout_plan = Some(scanout_plan);
                                     allow_primary_scanout = false;
@@ -2226,7 +2233,12 @@ impl SurfaceThreadState {
                     frame_result.primary_element,
                     PrimaryPlaneElement::Swapchain(_)
                 );
-                if is_swapchain && self.active_scanout_plan.requires_crtc_color_state().is_some() {
+                if is_swapchain
+                    && self
+                        .active_scanout_plan
+                        .requires_crtc_color_state()
+                        .is_some()
+                {
                     let _ = compositor.use_crtc_color_state(CrtcColorState::default());
                     self.active_scanout_plan = ScanoutPlan::DirectPassthrough;
                 }
@@ -3244,11 +3256,11 @@ mod tests {
 
     #[test]
     fn test_plane_colorop_scrgb_to_pq_hardware_state() {
-        use smithay::backend::drm::color::{
-            DrmColorCtm, PlaneColorConversion, ScanoutPlan,
-        };
+        use smithay::backend::drm::color::{DrmColorCtm, PlaneColorConversion, ScanoutPlan};
 
-        let plan = ScanoutPlan::PlaneColorop(PlaneColorConversion::ScRgbToPq { reference_white: 203 });
+        let plan = ScanoutPlan::PlaneColorop(PlaneColorConversion::ScRgbToPq {
+            reference_white: 203,
+        });
         assert!(plan.allows_primary_scanout());
         assert!(plan.requires_plane_colorop().is_some());
 
@@ -3272,13 +3284,19 @@ mod tests {
         let m02 = DrmColorCtm::from_s31_32(ctm.matrix[2]);
         let r0 = m00 + m01 + m02;
         let expected_scale = 203.0 / 10000.0;
-        assert!((r0 - expected_scale).abs() < 2e-6, "r0={r0} expected={expected_scale}");
+        assert!(
+            (r0 - expected_scale).abs() < 2e-6,
+            "r0={r0} expected={expected_scale}"
+        );
 
         // Verify HDR highlight (e.g. 1000 nits = 4.926 in scRGB) is scaled to <= 1.0
         let highlight_scrgb = 1000.0 / 203.0;
         let highlight_linear = r0 * highlight_scrgb;
         assert!((highlight_linear - 0.100).abs() < 1e-4);
-        assert!(highlight_linear <= 1.0, "Highlight must not overflow 1D LUT input domain [0, 1]!");
+        assert!(
+            highlight_linear <= 1.0,
+            "Highlight must not overflow 1D LUT input domain [0, 1]!"
+        );
 
         // Verify negative scRGB value in wide gamut (BT.2020 pure green in Rec.709: R = -0.4677)
         let wide_gamut_green = [-0.4677, 1.0772, -0.0298];
@@ -3288,9 +3306,12 @@ mod tests {
         let m20 = DrmColorCtm::from_s31_32(ctm.matrix[6]);
         let m21 = DrmColorCtm::from_s31_32(ctm.matrix[7]);
         let m22 = DrmColorCtm::from_s31_32(ctm.matrix[8]);
-        let out_r = m00 * wide_gamut_green[0] + m01 * wide_gamut_green[1] + m02 * wide_gamut_green[2];
-        let out_g = m10 * wide_gamut_green[0] + m11 * wide_gamut_green[1] + m12 * wide_gamut_green[2];
-        let out_b = m20 * wide_gamut_green[0] + m21 * wide_gamut_green[1] + m22 * wide_gamut_green[2];
+        let out_r =
+            m00 * wide_gamut_green[0] + m01 * wide_gamut_green[1] + m02 * wide_gamut_green[2];
+        let out_g =
+            m10 * wide_gamut_green[0] + m11 * wide_gamut_green[1] + m12 * wide_gamut_green[2];
+        let out_b =
+            m20 * wide_gamut_green[0] + m21 * wide_gamut_green[1] + m22 * wide_gamut_green[2];
         assert!(out_r >= -1e-4, "Out R must be non-negative: {out_r}");
         assert!(out_g > 0.0, "Out G must be positive: {out_g}");
         assert!(out_b >= -1e-4, "Out B must be non-negative: {out_b}");
@@ -3307,9 +3328,12 @@ mod tests {
             DrmColorCtm, PlaneColorConversion, ScanoutPlan, encode_pq,
         };
 
-        let plan = ScanoutPlan::PlaneColorop(PlaneColorConversion::SrgbToPq { reference_white: 335 });
+        let plan = ScanoutPlan::PlaneColorop(PlaneColorConversion::SrgbToPq {
+            reference_white: 335,
+        });
         assert!(plan.allows_primary_scanout());
         assert!(plan.requires_plane_colorop().is_some());
+        assert!(plan.requires_crtc_color_state().is_some());
 
         let conv = plan.requires_plane_colorop().unwrap();
         let color_state = conv.to_crtc_color_state(4096, 4096);
@@ -3321,48 +3345,64 @@ mod tests {
         assert_eq!(degamma_lut[0].red, 0);
         assert_eq!(degamma_lut[4095].red, 65535);
 
-        // CTM is unscaled Rec.709 to BT.2020 matrix (row sum = 1.0)
+        // CTM is scaled Rec.709 to BT.2020 matrix (row sum = scale)
         assert!(color_state.ctm.is_some());
         let ctm = color_state.ctm.unwrap();
+        let scale = 335.0 / 10000.0;
         let m00 = DrmColorCtm::from_s31_32(ctm.matrix[0]);
         let m01 = DrmColorCtm::from_s31_32(ctm.matrix[1]);
         let m02 = DrmColorCtm::from_s31_32(ctm.matrix[2]);
         let r0 = m00 + m01 + m02;
-        assert!((r0 - 1.0).abs() < 2e-6, "r0={r0} must be 1.0 (unscaled CTM)");
+        assert!(
+            (r0 - scale).abs() < 2e-6,
+            "r0={r0} must be scale={scale} (scaled CTM)"
+        );
 
-        // Gamma LUT maps linear [0, 1] to PQ [0, ref_white] with 0.0 nits true black
+        // Gamma LUT maps linear [0, 1] to canonical 10,000-nit PQ
         assert!(color_state.gamma_lut.is_some());
         let gamma_lut = color_state.gamma_lut.unwrap();
         assert_eq!(gamma_lut.len(), 4096);
-        assert_eq!(gamma_lut[0].red, 0, "Black level must not be raised (no washed out SDR)");
+        assert_eq!(
+            gamma_lut[0].red, 0,
+            "Black level must not be raised (no washed out SDR)"
+        );
         assert_eq!(gamma_lut[0].green, 0);
         assert_eq!(gamma_lut[0].blue, 0);
+        assert_eq!(gamma_lut[4095].red, 65535);
 
+        let idx_335 = (scale * 4095.0) as usize;
         let expected_white = (encode_pq(335.0 / 10000.0) * 65535.0).round() as u16;
-        assert_eq!(gamma_lut[4095].red, expected_white);
-        assert!(gamma_lut[1].red < 7000);
+        assert!((gamma_lut[idx_335].red as i32 - expected_white as i32).abs() < 500);
     }
 
     #[test]
     fn test_hardware_scanout_color_schemes_report() {
-        use smithay::reexports::drm::control::Device as ControlDevice;
-        use smithay::reexports::drm::Device as BasicDevice;
-        use smithay::reexports::drm::ClientCapability;
         use smithay::backend::allocator::Fourcc;
-        use smithay::backend::drm::color::{
-            CrtcColorCapabilities, DrmScanoutCapabilities,
-        };
         use smithay::backend::drm::DrmDeviceFd;
+        use smithay::backend::drm::color::{CrtcColorCapabilities, DrmScanoutCapabilities};
+        use smithay::reexports::drm::ClientCapability;
+        use smithay::reexports::drm::Device as BasicDevice;
+        use smithay::reexports::drm::control::Device as ControlDevice;
         use smithay::utils::DeviceFd;
 
-        println!("\n================================================================================");
-        println!("               HARDWARE SCANOUT COLOR SUPPORT DIAGNOSTIC REPORT                 ");
-        println!("================================================================================");
+        println!(
+            "\n================================================================================"
+        );
+        println!(
+            "               HARDWARE SCANOUT COLOR SUPPORT DIAGNOSTIC REPORT                 "
+        );
+        println!(
+            "================================================================================"
+        );
 
         let mut cards_found = 0;
         for card_idx in 0..8 {
             let path = format!("/dev/dri/card{}", card_idx);
-            let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).open(&path) else {
+            let Ok(file) = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+            else {
                 continue;
             };
             cards_found += 1;
@@ -3373,14 +3413,17 @@ mod tests {
             let _ = drm_fd.set_client_capability(ClientCapability::Atomic, true);
             let _ = drm_fd.set_client_capability(ClientCapability::PlaneColorPipeline, true);
 
-            let driver_info = drm_fd.get_driver().map(|d| {
-                format!(
-                    "{} (date: {}, desc: {})",
-                    d.name().to_string_lossy(),
-                    d.date().to_string_lossy(),
-                    d.description().to_string_lossy()
-                )
-            }).unwrap_or_else(|e| format!("unknown (err: {:?})", e));
+            let driver_info = drm_fd
+                .get_driver()
+                .map(|d| {
+                    format!(
+                        "{} (date: {}, desc: {})",
+                        d.name().to_string_lossy(),
+                        d.date().to_string_lossy(),
+                        d.description().to_string_lossy()
+                    )
+                })
+                .unwrap_or_else(|e| format!("unknown (err: {:?})", e));
 
             println!("\n[GPU Device] {}", path);
             println!("  Driver: {}", driver_info);
@@ -3424,15 +3467,30 @@ mod tests {
                     }
                 }
 
-                let mode_str = crtc_info.mode().map(|m| {
-                    format!("{}x{} @ {}Hz", m.size().0, m.size().1, m.vrefresh())
-                }).unwrap_or_else(|| "Inactive/Disabled".to_string());
+                let mode_str = crtc_info
+                    .mode()
+                    .map(|m| format!("{}x{} @ {}Hz", m.size().0, m.size().1, m.vrefresh()))
+                    .unwrap_or_else(|| "Inactive/Disabled".to_string());
 
                 println!("\n  [CRTC {:?}] Mode: {}", crtc_handle, mode_str);
-                println!("    - Hardware GAMMA_LUT:   {} (Max entries: {})", if has_gamma_lut { "YES" } else { "NO" }, gamma_lut_size);
-                println!("    - Hardware DEGAMMA_LUT: {} (Max entries: {})", if has_degamma_lut { "YES" } else { "NO" }, degamma_lut_size);
-                println!("    - Hardware CTM:         {} (S31.32 3x3 matrix)", if has_ctm { "YES" } else { "NO" });
-                println!("    - Adaptive Sync (VRR):  {}", if has_vrr { "YES" } else { "NO" });
+                println!(
+                    "    - Hardware GAMMA_LUT:   {} (Max entries: {})",
+                    if has_gamma_lut { "YES" } else { "NO" },
+                    gamma_lut_size
+                );
+                println!(
+                    "    - Hardware DEGAMMA_LUT: {} (Max entries: {})",
+                    if has_degamma_lut { "YES" } else { "NO" },
+                    degamma_lut_size
+                );
+                println!(
+                    "    - Hardware CTM:         {} (S31.32 3x3 matrix)",
+                    if has_ctm { "YES" } else { "NO" }
+                );
+                println!(
+                    "    - Adaptive Sync (VRR):  {}",
+                    if has_vrr { "YES" } else { "NO" }
+                );
 
                 for plane_handle in plane_handles.iter() {
                     let Ok(plane_info) = drm_fd.get_plane(*plane_handle) else {
@@ -3460,7 +3518,10 @@ mod tests {
                         }
                     }
 
-                    if plane_type != "Primary" || crtc_info.mode().is_none() || plane_info.crtc() != Some(*crtc_handle) {
+                    if plane_type != "Primary"
+                        || crtc_info.mode().is_none()
+                        || plane_info.crtc() != Some(*crtc_handle)
+                    {
                         continue;
                     }
 
@@ -3473,13 +3534,22 @@ mod tests {
                         if let Ok(fourcc) = Fourcc::try_from(*f) {
                             supported_fourccs.push(fourcc);
                             match fourcc {
-                                Fourcc::Argb8888 | Fourcc::Xrgb8888 | Fourcc::Abgr8888 | Fourcc::Xbgr8888 => {
+                                Fourcc::Argb8888
+                                | Fourcc::Xrgb8888
+                                | Fourcc::Abgr8888
+                                | Fourcc::Xbgr8888 => {
                                     supports_sdr_8bit = true;
                                 }
-                                Fourcc::Abgr2101010 | Fourcc::Xbgr2101010 | Fourcc::Argb2101010 | Fourcc::Xrgb2101010 => {
+                                Fourcc::Abgr2101010
+                                | Fourcc::Xbgr2101010
+                                | Fourcc::Argb2101010
+                                | Fourcc::Xrgb2101010 => {
                                     supports_10bit = true;
                                 }
-                                Fourcc::Abgr16161616f | Fourcc::Xbgr16161616f | Fourcc::Argb16161616f | Fourcc::Xrgb16161616f => {
+                                Fourcc::Abgr16161616f
+                                | Fourcc::Xbgr16161616f
+                                | Fourcc::Argb16161616f
+                                | Fourcc::Xrgb16161616f => {
                                     supports_fp16 = true;
                                 }
                                 _ => {}
@@ -3488,10 +3558,22 @@ mod tests {
                     }
 
                     println!("\n    [Primary Plane {:?}]", plane_handle);
-                    println!("      - COLOR_PIPELINE (Colorop uAPI): {}", if has_color_pipeline { "YES" } else { "NO" });
-                    println!("      - 8-bit SDR (XR24/AR24/XB24/AB24): {}", if supports_sdr_8bit { "YES" } else { "NO" });
-                    println!("      - 10-bit HDR (XB30/AB30/XR30/AR30): {}", if supports_10bit { "YES" } else { "NO" });
-                    println!("      - 16-bit Float (XB4H/AB4H/XR4H/AR4H): {}", if supports_fp16 { "YES" } else { "NO" });
+                    println!(
+                        "      - COLOR_PIPELINE (Colorop uAPI): {}",
+                        if has_color_pipeline { "YES" } else { "NO" }
+                    );
+                    println!(
+                        "      - 8-bit SDR (XR24/AR24/XB24/AB24): {}",
+                        if supports_sdr_8bit { "YES" } else { "NO" }
+                    );
+                    println!(
+                        "      - 10-bit HDR (XB30/AB30/XR30/AR30): {}",
+                        if supports_10bit { "YES" } else { "NO" }
+                    );
+                    println!(
+                        "      - 16-bit Float (XB4H/AB4H/XR4H/AR4H): {}",
+                        if supports_fp16 { "YES" } else { "NO" }
+                    );
 
                     let caps = DrmScanoutCapabilities {
                         crtc_color: CrtcColorCapabilities {
@@ -3507,9 +3589,16 @@ mod tests {
                         supports_10bit,
                     };
 
-                    println!("\n    ----------------------------------------------------------------------------");
-                    println!("    EVALUATING SCANOUT SCHEMES ACROSS COLOR SPACES (CRTC {:?})", crtc_handle);
-                    println!("    ----------------------------------------------------------------------------");
+                    println!(
+                        "\n    ----------------------------------------------------------------------------"
+                    );
+                    println!(
+                        "    EVALUATING SCANOUT SCHEMES ACROSS COLOR SPACES (CRTC {:?})",
+                        crtc_handle
+                    );
+                    println!(
+                        "    ----------------------------------------------------------------------------"
+                    );
 
                     struct TestCase {
                         output_hdr: bool,
@@ -3564,7 +3653,10 @@ mod tests {
                     ];
 
                     for tc in test_cases {
-                        println!("\n    [*] Mode: {}  |  Content: {}", tc.output_name, tc.content_name);
+                        println!(
+                            "\n    [*] Mode: {}  |  Content: {}",
+                            tc.output_name, tc.content_name
+                        );
                         let plan = caps.evaluate_scanout_plan(tc.output_hdr, tc.desc.as_ref(), 203);
 
                         let passthrough_possible = match (tc.output_hdr, &tc.desc) {
@@ -3574,42 +3666,77 @@ mod tests {
                             _ => false,
                         };
                         if passthrough_possible {
-                            println!("      [Tier 1: DirectPassthrough]  SUPPORTED (Zero GPU/Display transformation)");
+                            println!(
+                                "      [Tier 1: DirectPassthrough]  SUPPORTED (Zero GPU/Display transformation)"
+                            );
                         } else {
-                            println!("      [Tier 1: DirectPassthrough]  UNSUPPORTED (Reason: Color space or EOTF mismatch between content and display)");
+                            println!(
+                                "      [Tier 1: DirectPassthrough]  UNSUPPORTED (Reason: Color space or EOTF mismatch between content and display)"
+                            );
                         }
 
                         if caps.supports_plane_colorop {
-                            println!("      [Tier 2A: PlaneColorop]      SUPPORTED (Plane COLOR_PIPELINE hardware)");
+                            println!(
+                                "      [Tier 2A: PlaneColorop]      SUPPORTED (Plane COLOR_PIPELINE hardware)"
+                            );
                         } else {
-                            println!("      [Tier 2A: PlaneColorop]      UNSUPPORTED (Reason: Kernel driver does not expose COLOR_PIPELINE property)");
+                            println!(
+                                "      [Tier 2A: PlaneColorop]      UNSUPPORTED (Reason: Kernel driver does not expose COLOR_PIPELINE property)"
+                            );
                         }
 
                         let crtc_hardware_possible = match (tc.output_hdr, &tc.desc) {
-                            (false, Some(d)) if d.windows_scrgb => caps.supports_scrgb_hardware_scanout(),
-                            (false, Some(d)) if d.is_pq_bt2020() => caps.crtc_color.has_degamma_lut && caps.crtc_color.has_ctm && caps.crtc_color.has_gamma_lut,
-                            (true, Some(d)) if d.windows_scrgb => caps.supports_scrgb_hardware_scanout(),
-                            (true, Some(d)) if !d.is_hdr() => caps.supports_sdr_to_hdr_hardware_scanout(),
+                            (false, Some(d)) if d.windows_scrgb => {
+                                caps.supports_scrgb_hardware_scanout()
+                            }
+                            (false, Some(d)) if d.is_pq_bt2020() => {
+                                caps.crtc_color.has_degamma_lut
+                                    && caps.crtc_color.has_ctm
+                                    && caps.crtc_color.has_gamma_lut
+                            }
+                            (true, Some(d)) if d.windows_scrgb => {
+                                caps.supports_scrgb_hardware_scanout()
+                            }
+                            (true, Some(d)) if !d.is_hdr() => {
+                                caps.supports_sdr_to_hdr_hardware_scanout()
+                            }
                             (true, None) => caps.supports_sdr_to_hdr_hardware_scanout(),
                             _ => false,
                         };
                         if crtc_hardware_possible {
-                            println!("      [Tier 2B: CrtcHardware]      SUPPORTED (CRTC DEGAMMA+CTM+GAMMA available, blob format verified)");
+                            println!(
+                                "      [Tier 2B: CrtcHardware]      SUPPORTED (CRTC DEGAMMA+CTM+GAMMA available, blob format verified)"
+                            );
                         } else {
                             let mut reasons = Vec::new();
-                            if !caps.crtc_color.has_gamma_lut { reasons.push("CRTC lacks GAMMA_LUT"); }
-                            if !caps.crtc_color.has_ctm { reasons.push("CRTC lacks CTM"); }
-                            if !caps.crtc_color.has_degamma_lut { reasons.push("CRTC lacks DEGAMMA_LUT"); }
-                            if tc.desc.as_ref().is_some_and(|d| d.windows_scrgb) && !caps.supports_fp16 {
+                            if !caps.crtc_color.has_gamma_lut {
+                                reasons.push("CRTC lacks GAMMA_LUT");
+                            }
+                            if !caps.crtc_color.has_ctm {
+                                reasons.push("CRTC lacks CTM");
+                            }
+                            if !caps.crtc_color.has_degamma_lut {
+                                reasons.push("CRTC lacks DEGAMMA_LUT");
+                            }
+                            if tc.desc.as_ref().is_some_and(|d| d.windows_scrgb)
+                                && !caps.supports_fp16
+                            {
                                 reasons.push("Primary plane lacks FP16 format");
                             }
                             if reasons.is_empty() {
-                                reasons.push("Conversion scheme not applicable or direct scanout preferred");
+                                reasons.push(
+                                    "Conversion scheme not applicable or direct scanout preferred",
+                                );
                             }
-                            println!("      [Tier 2B: CrtcHardware]      UNSUPPORTED (Reason: {})", reasons.join(", "));
+                            println!(
+                                "      [Tier 2B: CrtcHardware]      UNSUPPORTED (Reason: {})",
+                                reasons.join(", ")
+                            );
                         }
 
-                        println!("      [Tier 3: VulkanShaderFlip]   SUPPORTED (Vulkan compute/raster shader converts in VRAM before scanout)");
+                        println!(
+                            "      [Tier 3: VulkanShaderFlip]   SUPPORTED (Vulkan compute/raster shader converts in VRAM before scanout)"
+                        );
                         println!("      => Final Selected Plan: {:?}", plan);
                     }
                 }
@@ -3619,6 +3746,8 @@ mod tests {
         if cards_found == 0 {
             println!("  No /dev/dri/card* accessible in current environment.");
         }
-        println!("\n================================================================================\n");
+        println!(
+            "\n================================================================================\n"
+        );
     }
 }
