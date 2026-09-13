@@ -107,6 +107,9 @@ pub fn screenshot_window(state: &mut State, surface: &CosmicSurface) {
             .and_then(|renderer| match renderer {
                 RendererRef::Glow(renderer) => render_window(renderer, surface),
                 RendererRef::GlMulti(mut renderer) => render_window(&mut renderer, surface),
+                RendererRef::VulkanMulti(_) => {
+                    anyhow::bail!("Window context menu screenshot not implemented for Vulkan; use xdg-desktop-portal-cosmic")
+                }
             });
         if let Err(err) = res {
             warn!(?err, "Failed to take screenshot")

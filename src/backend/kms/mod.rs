@@ -455,7 +455,7 @@ fn determine_primary_gpu(
 }
 
 /// Create `GlowRenderer` for `EGL_MESA_device_software` device, if present
-fn software_renderer() -> anyhow::Result<GlowRenderer> {
+pub(crate) fn software_renderer() -> anyhow::Result<GlowRenderer> {
     let mut devices = EGLDevice::enumerate()?;
     let device = devices
         .find(|device| {

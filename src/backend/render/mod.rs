@@ -132,24 +132,17 @@ pub fn set_hdr_client_blend<R: AsGlowRenderer>(renderer: &mut R, config: Option<
 pub enum RendererRef<'a> {
     Glow(&'a mut GlowRenderer),
     GlMulti(GlMultiRenderer<'a>),
+    VulkanMulti(VulkanMultiRenderer<'a>),
 }
 
-impl AsRef<GlowRenderer> for RendererRef<'_> {
-    fn as_ref(&self) -> &GlowRenderer {
-        match self {
-            Self::Glow(renderer) => renderer,
-            Self::GlMulti(renderer) => renderer.as_ref(),
-        }
-    }
-}
-
-impl AsMut<GlowRenderer> for RendererRef<'_> {
-    fn as_mut(&mut self) -> &mut GlowRenderer {
-        match self {
-            Self::Glow(renderer) => renderer,
-            Self::GlMulti(renderer) => renderer.as_mut(),
-        }
-    }
+#[derive(Debug, thiserror::Error)]
+pub enum OffscreenError {
+    #[error("GL multi error: {0}")]
+    Gl(#[from] GlMultiError),
+    #[error("Vulkan multi error: {0}")]
+    Vulkan(#[from] VulkanMultiError),
+    #[error("Device missing")]
+    DeviceMissing,
 }
 
 pub static CLEAR_COLOR: Color32F = Color32F::new(0.153, 0.161, 0.165, 1.0);

@@ -1776,4 +1776,24 @@ mod test {
             break;
         }
     }
+
+    #[test]
+    fn test_vulkan_software_renderer_offscreen_fallback() {
+        let renderer_res = crate::backend::kms::software_renderer();
+        if let Ok(mut renderer) = renderer_res {
+            let size = smithay::utils::Size::from((100, 100));
+            let mut ref_renderer = crate::backend::render::RendererRef::Glow(&mut renderer);
+            let constraints =
+                crate::wayland::handlers::image_copy_capture::constraints_for_renderer(
+                    size,
+                    &mut ref_renderer,
+                );
+            assert_eq!(constraints.size, size);
+            assert!(
+                constraints.shm.contains(
+                    &smithay::reexports::wayland_server::protocol::wl_shm::Format::Abgr8888
+                )
+            );
+        }
+    }
 }

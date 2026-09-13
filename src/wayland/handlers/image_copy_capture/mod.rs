@@ -401,8 +401,8 @@ fn constraints_for_output(output: &Output, backend: &mut BackendData) -> Option<
             kms.target_node_for_output(output)
                 .or(*kms.primary_node.read().unwrap())
         })
-        .unwrap();
-    Some(constraints_for_renderer(mode, renderer.as_mut()))
+        .ok()?;
+    Some(constraints_for_renderer(mode, &mut renderer))
 }
 
 fn constraints_for_toplevel(
@@ -423,12 +423,27 @@ fn constraints_for_toplevel(
 
             dma_node.or(*kms.primary_node.read().unwrap())
         })
-        .unwrap();
+        .ok()?;
 
-    Some(constraints_for_renderer(size, renderer.as_mut()))
+    Some(constraints_for_renderer(size, &mut renderer))
 }
 
-fn constraints_for_renderer(
+pub(crate) fn constraints_for_renderer(
+    size: Size<i32, BufferCoords>,
+    renderer: &mut crate::backend::render::RendererRef<'_>,
+) -> BufferConstraints {
+    match renderer {
+        crate::backend::render::RendererRef::Glow(glow) => constraints_for_glow(size, glow),
+        crate::backend::render::RendererRef::GlMulti(multi) => {
+            constraints_for_glow(size, multi.as_mut())
+        }
+        crate::backend::render::RendererRef::VulkanMulti(vulkan) => {
+            constraints_for_vulkan(size, vulkan)
+        }
+    }
+}
+
+pub(crate) fn constraints_for_glow(
     size: Size<i32, BufferCoords>,
     renderer: &mut GlowRenderer,
 ) -> BufferConstraints {
@@ -468,6 +483,46 @@ fn constraints_for_renderer(
                 .into_iter()
                 .collect::<Vec<_>>(),
         });
+    }
+
+    constraints
+}
+
+fn constraints_for_vulkan(
+    size: Size<i32, BufferCoords>,
+    renderer: &mut crate::backend::render::VulkanMultiRenderer<'_>,
+) -> BufferConstraints {
+    use smithay::backend::renderer::ImportDma;
+    let mut constraints = BufferConstraints {
+        size,
+        shm: vec![
+            ShmFormat::Abgr8888,
+            ShmFormat::Xbgr8888,
+            ShmFormat::Argb8888,
+            ShmFormat::Xrgb8888,
+            ShmFormat::Abgr2101010,
+            ShmFormat::Xbgr2101010,
+            ShmFormat::Argb2101010,
+            ShmFormat::Xrgb2101010,
+        ],
+        dma: None,
+    };
+
+    let node = *renderer.node();
+    let dma_formats = renderer.dmabuf_formats();
+    if !dma_formats.is_empty() {
+        let formats = dma_formats
+            .iter()
+            .fold(
+                HashMap::<Fourcc, Vec<Modifier>>::new(),
+                |mut map, format| {
+                    map.entry(format.code).or_default().push(format.modifier);
+                    map
+                },
+            )
+            .into_iter()
+            .collect::<Vec<_>>();
+        constraints.dma = Some(DmabufConstraints { node, formats });
     }
 
     constraints

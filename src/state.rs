@@ -3,7 +3,7 @@
 use crate::{
     backend::{
         kms::{KmsGuard, KmsState},
-        render::{GlMultiError, RendererRef},
+        render::{OffscreenError, RendererRef},
         winit::WinitState,
         x11::X11State,
     },
@@ -447,7 +447,7 @@ impl BackendData {
     pub fn offscreen_renderer<N: Into<KmsNodes>, F: FnOnce(&mut KmsState) -> Option<N>>(
         &mut self,
         kms_node_cb: F,
-    ) -> Result<RendererRef<'_>, GlMultiError> {
+    ) -> Result<RendererRef<'_>, OffscreenError> {
         match self {
             BackendData::Kms(kms) => {
                 let nodes = kms_node_cb(kms).map(Into::into);
@@ -460,18 +460,30 @@ impl BackendData {
                                 nodes.copy_format,
                             )?))
                         } else {
-                            Ok(RendererRef::Glow(
-                                kms.software_renderer
-                                    .as_mut()
-                                    .expect("No Software Rendering"),
-                            ))
+                            if kms.software_renderer.is_none() {
+                                kms.software_renderer =
+                                    crate::backend::kms::software_renderer().ok();
+                            }
+                            if let Some(renderer) = kms.software_renderer.as_mut() {
+                                Ok(RendererRef::Glow(renderer))
+                            } else {
+                                Err(OffscreenError::DeviceMissing)
+                            }
                         }
                     }
-                    crate::backend::kms::KmsGpuApi::Vulkan { .. } => {
-                        if let Some(renderer) = kms.software_renderer.as_mut() {
-                            Ok(RendererRef::Glow(renderer))
+                    crate::backend::kms::KmsGpuApi::Vulkan { api, .. } => {
+                        if let Some(nodes) = nodes {
+                            Ok(RendererRef::VulkanMulti(api.renderer(
+                                &nodes.render_node,
+                                &nodes.target_node,
+                                nodes.copy_format,
+                            )?))
+                        } else if let Some(primary_node) = *kms.primary_node.read().unwrap() {
+                            Ok(RendererRef::VulkanMulti(
+                                api.single_renderer(&primary_node)?,
+                            ))
                         } else {
-                            Err(smithay::backend::renderer::multigpu::Error::DeviceMissing)
+                            Err(OffscreenError::DeviceMissing)
                         }
                     }
                 }
@@ -786,8 +798,19 @@ impl State {
             ToplevelCaptureSourceState::new_with_filter::<State, _>(dh, client_not_sandboxed);
         let image_copy_capture_state =
             ImageCopyCaptureState::new_with_filter::<Self, _>(dh, client_not_sandboxed);
-        let shm_state =
-            ShmState::new::<Self>(dh, vec![wl_shm::Format::Xbgr8888, wl_shm::Format::Abgr8888]);
+        let shm_state = ShmState::new::<Self>(
+            dh,
+            vec![
+                wl_shm::Format::Xbgr8888,
+                wl_shm::Format::Abgr8888,
+                wl_shm::Format::Argb8888,
+                wl_shm::Format::Xrgb8888,
+                wl_shm::Format::Abgr2101010,
+                wl_shm::Format::Xbgr2101010,
+                wl_shm::Format::Argb2101010,
+                wl_shm::Format::Xrgb2101010,
+            ],
+        );
         let cursor_shape_manager_state = CursorShapeManagerState::new::<State>(dh);
         let seat_state = SeatState::<Self>::new();
         let viewporter_state = ViewporterState::new::<Self>(dh);
