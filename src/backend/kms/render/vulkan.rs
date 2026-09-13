@@ -951,7 +951,7 @@ mod test {
             );
             assert!(render_tex_res.is_ok());
 
-            let sync = frame.finish().expect("frame.finish failed");
+            let _sync = frame.finish().expect("frame.finish failed");
 
             use smithay::backend::renderer::ExportMem;
             let mapping = renderer
@@ -1154,7 +1154,7 @@ mod test {
 
     #[test]
     fn test_vulkan_xrgb_cursor_trail_prevention() {
-        use smithay::backend::renderer::{Bind, Color32F, ExportMem, Frame, ImportMem, Renderer};
+        use smithay::backend::renderer::{Bind, ExportMem, Frame, ImportMem, Renderer};
         use smithay::backend::vulkan::ash::vk;
         use smithay::backend::vulkan::image::VulkanImage;
         use smithay::backend::vulkan::{Instance, PhysicalDevice, version::Version};

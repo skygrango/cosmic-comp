@@ -1,12 +1,13 @@
 use cosmic_comp_config::output::comp::{AdaptiveSync, OutputConfig, OutputState};
 use parking_lot::RwLock;
 use smithay::{
-    backend::drm::VrrSupport as Support,
+    backend::drm::{DrmScanoutCapabilities, ScanoutPlan, VrrSupport as Support},
     desktop::utils::with_surfaces_surface_tree,
     output::{Output, WeakOutput},
     reexports::wayland_server::{Client, protocol::wl_surface::WlSurface},
     utils::Rectangle,
     wayland::{
+        color::management::ImageDescription,
         compositor::{Barrier, CompositorHandler},
         seat::WaylandFocus,
         tearing_control::prefer_async_from_states,
@@ -57,6 +58,9 @@ pub trait OutputExt {
     fn set_avg_frametime(&self, duration: Option<Duration>);
     fn get_avg_frametime(&self) -> Option<Duration>;
 
+    fn scanout_capabilities(&self) -> Option<DrmScanoutCapabilities>;
+    fn set_scanout_capabilities(&self, caps: DrmScanoutCapabilities);
+
     fn set_fullscreen_occupied(&self, occupied: Option<FullscreenOccupied>);
     fn is_foreground_fullscreen_occupied(&self) -> Option<FullscreenOccupied>;
     fn refresh_fullscreen_occupied_flags(&self);
@@ -65,12 +69,15 @@ pub trait OutputExt {
 struct Vrr(AtomicU8);
 struct VrrSupport(AtomicU8);
 struct Mirroring(Mutex<Option<WeakOutput>>);
+struct OutputScanoutCapabilities(RwLock<Option<DrmScanoutCapabilities>>);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FullscreenOccupied {
     pub surface: CosmicSurface,
     pub prefers_async: bool,
     pub is_hdr: bool,
+    pub color_description: Option<ImageDescription>,
+    pub scanout_plan: ScanoutPlan,
 }
 
 impl std::ops::Deref for FullscreenOccupied {
@@ -82,11 +89,18 @@ impl std::ops::Deref for FullscreenOccupied {
 }
 
 impl FullscreenOccupied {
-    pub fn new(surface: CosmicSurface, prefers_async: bool, is_hdr: bool) -> Self {
+    pub fn new(
+        surface: CosmicSurface,
+        prefers_async: bool,
+        is_hdr: bool,
+        color_description: Option<ImageDescription>,
+    ) -> Self {
         Self {
             surface,
             prefers_async,
             is_hdr,
+            color_description,
+            scanout_plan: ScanoutPlan::DirectPassthrough,
         }
     }
 
@@ -106,6 +120,8 @@ struct WeakFullscreenOccupied {
     surface: WeakCosmicSurface,
     prefers_async: bool,
     is_hdr: bool,
+    color_description: Option<ImageDescription>,
+    scanout_plan: ScanoutPlan,
 }
 
 struct OutputFullscreenOccupied(RwLock<Option<WeakFullscreenOccupied>>);
@@ -302,7 +318,25 @@ impl OutputExt for Output {
         *self.user_data().get::<AvgFrameTime>()?.0.read()
     }
 
-    fn set_fullscreen_occupied(&self, occupied: Option<FullscreenOccupied>) {
+    fn scanout_capabilities(&self) -> Option<DrmScanoutCapabilities> {
+        let user_data = self.user_data();
+        let guard = user_data.get::<OutputScanoutCapabilities>()?.0.read();
+        guard.clone()
+    }
+
+    fn set_scanout_capabilities(&self, caps: DrmScanoutCapabilities) {
+        let user_data = self.user_data();
+        user_data.insert_if_missing_threadsafe(|| {
+            OutputScanoutCapabilities(parking_lot::RwLock::new(None))
+        });
+        *user_data
+            .get::<OutputScanoutCapabilities>()
+            .unwrap()
+            .0
+            .write() = Some(caps);
+    }
+
+    fn set_fullscreen_occupied(&self, mut occupied: Option<FullscreenOccupied>) {
         let user_data = self.user_data();
         user_data.insert_if_missing_threadsafe(|| {
             OutputFullscreenOccupied(parking_lot::RwLock::new(None))
@@ -313,6 +347,7 @@ impl OutputExt for Output {
                 current.surface.upgrade().as_ref() != Some(&next.surface)
                     || current.is_hdr != next.is_hdr
                     || current.prefers_async != next.prefers_async
+                    || current.color_description != next.color_description
             }
             (None, None) => false,
             _ => true,
@@ -320,10 +355,50 @@ impl OutputExt for Output {
         if !should_update {
             return;
         }
+
+        if let Some(ref mut occ) = occupied {
+            // Check output HDR status and reference white
+            let (output_hdr_enabled, output_ref_white) = user_data
+                .get::<crate::backend::kms::drm_helpers::HdrOutputState>()
+                .and_then(|s| s.get().or_else(|| s.staged()))
+                .map(|hdr| (true, if hdr.reference_white > 0 { hdr.reference_white } else { 203 }))
+                .unwrap_or((false, 203));
+
+            // Query hardware scanout capabilities from output
+            let caps = self.scanout_capabilities().unwrap_or_default();
+
+            // Perform color inspection if not already set on occupied
+            if occ.color_description.is_none() {
+                if let Some(wl_surf) = occ.surface.wl_surface() {
+                    occ.color_description = surface_tree_color_description(&wl_surf);
+                }
+            }
+
+            // Determine scanout plan using smithay's evaluate_scanout_plan
+            let plan = caps.evaluate_scanout_plan(
+                output_hdr_enabled,
+                occ.color_description.as_ref(),
+                output_ref_white,
+            );
+
+            tracing::info!(
+                output = %self.name(),
+                output_hdr = output_hdr_enabled,
+                output_ref_white,
+                color_desc = ?occ.color_description,
+                ?plan,
+                "Fullscreen occupied: evaluated hardware scanout plan"
+            );
+
+            occ.scanout_plan = plan;
+        }
+
         *lock.write() = occupied.map(|occ| WeakFullscreenOccupied {
             surface: occ.surface.downgrade(),
             prefers_async: occ.prefers_async,
             is_hdr: occ.is_hdr,
+            color_description: occ.color_description,
+            scanout_plan: occ.scanout_plan,
         });
     }
 
@@ -336,6 +411,8 @@ impl OutputExt for Output {
             surface,
             prefers_async: weak_occ.prefers_async,
             is_hdr: weak_occ.is_hdr,
+            color_description: weak_occ.color_description.clone(),
+            scanout_plan: weak_occ.scanout_plan,
         })
     }
 
@@ -343,7 +420,7 @@ impl OutputExt for Output {
         let Some(state) = self.user_data().get::<OutputFullscreenOccupied>() else {
             return;
         };
-        let (surface, current_async) = {
+        let (surface, current_async, current_desc) = {
             let guard = state.0.read();
             let Some(weak_occ) = guard.as_ref() else {
                 return;
@@ -351,21 +428,40 @@ impl OutputExt for Output {
             let Some(surface) = weak_occ.surface.upgrade() else {
                 return;
             };
-            (surface, weak_occ.prefers_async)
+            (
+                surface,
+                weak_occ.prefers_async,
+                weak_occ.color_description.clone(),
+            )
         };
         let prefers_async = surface
             .wl_surface()
             .as_deref()
             .is_some_and(surface_tree_prefers_async);
-        if current_async == prefers_async {
+        let color_desc = surface
+            .wl_surface()
+            .as_deref()
+            .and_then(surface_tree_color_description);
+        if current_async == prefers_async && current_desc == color_desc {
             return;
         }
+        let (output_hdr_enabled, output_ref_white) = self
+            .user_data()
+            .get::<crate::backend::kms::drm_helpers::HdrOutputState>()
+            .and_then(|s| s.get().or_else(|| s.staged()))
+            .map(|hdr| (true, if hdr.reference_white > 0 { hdr.reference_white } else { 203 }))
+            .unwrap_or((false, 203));
+        let caps = self.scanout_capabilities().unwrap_or_default();
+        let plan =
+            caps.evaluate_scanout_plan(output_hdr_enabled, color_desc.as_ref(), output_ref_white);
         let mut guard = state.0.write();
         let Some(weak_occ) = guard.as_mut() else {
             return;
         };
         if weak_occ.surface.upgrade().as_ref() == Some(&surface) {
             weak_occ.prefers_async = prefers_async;
+            weak_occ.color_description = color_desc;
+            weak_occ.scanout_plan = plan;
         }
     }
 }
@@ -383,18 +479,22 @@ pub fn surface_tree_prefers_async(surface: &WlSurface) -> bool {
     found
 }
 
+pub fn surface_tree_color_description(surface: &WlSurface) -> Option<ImageDescription> {
+    let mut desc = None;
+    with_surfaces_surface_tree(surface, |_, states| {
+        if desc.is_none() {
+            if let (Some(d), _) =
+                smithay::wayland::color::management::surface_description_from_states(states)
+            {
+                desc = Some(d);
+            }
+        }
+    });
+    desc
+}
+
 pub fn surface_tree_is_hdr(surface: &WlSurface) -> bool {
     let mut found = false;
-    // with_surfaces_surface_tree(surface, |_, states| {
-    //     if states
-    //         .data_map
-    //         .get::<smithay::backend::renderer::utils::RendererSurfaceStateUserData>()
-    //         .and_then(|data| data.lock().ok())
-    //         .is_some_and(|state| state.is_hdr())
-    //     {
-    //         found = true;
-    //     }
-    // });
     with_surfaces_surface_tree(surface, |_, states| {
         if smithay::wayland::color::management::surface_description_from_states(states)
             .0
