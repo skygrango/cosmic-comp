@@ -398,7 +398,7 @@ pub fn get_property_val(
         let info = device.get_property(prop)?;
         if Some(name) == info.name().to_str().ok() {
             let val_type = info.value_type();
-            return Ok((val_type, val));
+            return Ok((val_type.clone(), val));
         }
     }
     anyhow::bail!("No prop found for {}", name)
@@ -454,7 +454,7 @@ pub fn get_max_bpc(
 
     let info = dev.get_property(handle)?;
     let range = match info.value_type() {
-        property::ValueType::UnsignedRange(x, y) => (x as u32)..(y as u32),
+        property::ValueType::UnsignedRange(x, y) => (*x as u32)..(*y as u32),
         _ => return Err(anyhow!("max bpc has wrong value type")),
     };
 

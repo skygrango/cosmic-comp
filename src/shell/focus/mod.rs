@@ -7,13 +7,12 @@ use crate::{
 use indexmap::IndexSet;
 use smithay::{
     backend::input::InputTime,
-    desktop::{PopupUngrabStrategy, layer_map_for_output, space::SpaceElement},
+    desktop::{PopupUngrabStrategy, layer_map_for_output},
     input::{Seat, pointer::MotionEvent},
     output::Output,
     reexports::wayland_server::{Resource, protocol::wl_surface::WlSurface},
     utils::{IsAlive, Point, SERIAL_COUNTER, Serial},
     wayland::{
-        color::management::get_surface_description,
         pointer_constraints::with_pointer_constraint,
         seat::WaylandFocus,
         selection::{data_device::set_data_device_focus, primary_selection::set_primary_focus},
@@ -22,7 +21,7 @@ use smithay::{
 };
 use std::{borrow::Cow, hash::Hash, mem, sync::Mutex};
 
-use tracing::{debug, error, trace};
+use tracing::{debug, trace};
 
 pub use self::order::{Stage, render_input_order};
 use self::target::{KeyboardFocusTarget, WindowGroup};
@@ -369,13 +368,18 @@ impl Shell {
                                 .as_deref()
                                 .is_some_and(surface_tree_is_hdr);
 
-                            //error!("fullscreen is hdr:{:?}", is_hdr);
+                            let color_description = fs
+                                .surface
+                                .wl_surface()
+                                .as_deref()
+                                .and_then(surface_tree_color_description);
 
-                            output.set_fullscreen_occupied(Some(FullscreenOccupied {
-                                surface: fs.surface.clone(),
+                            output.set_fullscreen_occupied(Some(FullscreenOccupied::new(
+                                fs.surface.clone(),
                                 prefers_async,
                                 is_hdr,
-                            }));
+                                color_description,
+                            )));
                             true
                         } else {
                             false

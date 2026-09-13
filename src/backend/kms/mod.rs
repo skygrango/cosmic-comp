@@ -1606,6 +1606,18 @@ impl KmsGuard<'_> {
                             primary_formats,
                             Some(overlay_formats).filter(|f| !f.indexset().is_empty()),
                         );
+                        if let Ok(caps) = compositor_ref.scanout_capabilities() {
+                            tracing::info!(
+                                output = %surface.output.name(),
+                                supports_fp16 = caps.supports_fp16,
+                                supports_10bit = caps.supports_10bit,
+                                has_degamma = caps.crtc_color.has_degamma_lut,
+                                has_ctm = caps.crtc_color.has_ctm,
+                                has_gamma = caps.crtc_color.has_gamma_lut,
+                                "Established DRM hardware scanout capabilities"
+                            );
+                            surface.output.set_scanout_capabilities(caps);
+                        }
                         std::mem::drop(compositor_ref);
 
                         surface.output.set_adaptive_sync_support(vrr_support);
