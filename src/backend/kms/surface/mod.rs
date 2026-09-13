@@ -931,7 +931,10 @@ fn surface_thread(
                     compositor.with_compositor(|c| c.reset_buffer_ages());
                 }
                 if enabled {
-                    state.frame_flags.remove(FrameFlags::ALLOW_SCANOUT);
+                    state.frame_flags.remove(
+                        FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
+                            | FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT,
+                    );
                 } else {
                     state.frame_flags.insert(FrameFlags::DEFAULT);
                     if bool_var("COSMIC_DISABLE_DIRECT_SCANOUT").unwrap_or(false) {
@@ -1005,7 +1008,12 @@ fn surface_thread(
                 state.queue_redraw(false, false);
             }
             Event::Msg(ThreadCommand::AllowFrameFlags(flag, mut flags)) => {
-                if state.hdr_enabled || bool_var("COSMIC_DISABLE_DIRECT_SCANOUT").unwrap_or(false) {
+                if state.hdr_enabled {
+                    flags.remove(
+                        FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
+                            | FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT,
+                    );
+                } else if bool_var("COSMIC_DISABLE_DIRECT_SCANOUT").unwrap_or(false) {
                     flags.remove(FrameFlags::ALLOW_SCANOUT);
                 }
                 if bool_var("COSMIC_DISABLE_OVERLAY_SCANOUT").unwrap_or(false) {
@@ -1018,7 +1026,10 @@ fn surface_thread(
                     state.frame_flags.remove(flags);
                 }
                 if state.hdr_enabled {
-                    state.frame_flags.remove(FrameFlags::ALLOW_SCANOUT);
+                    state.frame_flags.remove(
+                        FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
+                            | FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT,
+                    );
                 }
             }
             Event::Closed | Event::Msg(ThreadCommand::End) => {
@@ -1567,7 +1578,8 @@ impl SurfaceThreadState {
 
         if allow_primary_scanout {
             additional_frame_flags |= FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
-                | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY;
+                | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY
+                | FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT;
         } else {
             remove_frame_flags |= FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
                 | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY;
@@ -1872,22 +1884,12 @@ impl SurfaceThreadState {
                     frame_result.primary_element,
                     PrimaryPlaneElement::Swapchain(_)
                 );
-                if is_swapchain
-                    && self
-                        .active_scanout_plan
-                        .requires_crtc_color_state()
-                        .is_some()
-                {
-                    let _ = compositor.use_crtc_color_state(CrtcColorState::default());
-                    self.active_scanout_plan = ScanoutPlan::DirectPassthrough;
-                }
-
                 let actual_scanout = !is_swapchain && allow_primary_scanout;
                 if self.swapchin_is_scanout != actual_scanout {
                     if actual_scanout {
-                        error!(plan = ?scanout_plan, "Swapchin Enable SCANOUT with plan: {:?}", scanout_plan);
+                        error!(plan = ?scanout_plan, "Swapchain Enable SCANOUT with plan: {:?}", scanout_plan);
                     } else {
-                        error!("Disable SCANOUT");
+                        error!("Swapchain Disable SCANOUT");
                     }
                     self.swapchin_is_scanout = actual_scanout;
                 }
@@ -2131,7 +2133,8 @@ impl SurfaceThreadState {
 
         if allow_primary_scanout {
             additional_frame_flags |= FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
-                | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY;
+                | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY
+                | FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT;
         } else {
             remove_frame_flags |= FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
                 | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY;
@@ -2233,20 +2236,10 @@ impl SurfaceThreadState {
                     frame_result.primary_element,
                     PrimaryPlaneElement::Swapchain(_)
                 );
-                if is_swapchain
-                    && self
-                        .active_scanout_plan
-                        .requires_crtc_color_state()
-                        .is_some()
-                {
-                    let _ = compositor.use_crtc_color_state(CrtcColorState::default());
-                    self.active_scanout_plan = ScanoutPlan::DirectPassthrough;
-                }
-
                 let actual_scanout = !is_swapchain && allow_primary_scanout;
                 if self.swapchin_is_scanout != actual_scanout {
                     if actual_scanout {
-                        error!(plan = ?scanout_plan, "Swapchin Enable SCANOUT with plan: {:?}", scanout_plan);
+                        error!(plan = ?scanout_plan, "Swapchain Enable SCANOUT with plan: {:?}", scanout_plan);
                     } else {
                         error!("Swapchain Disable SCANOUT");
                     }
