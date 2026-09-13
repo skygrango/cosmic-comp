@@ -5,14 +5,14 @@ use smithay::{
     backend::{
         allocator::{Buffer, Fourcc, format::get_transparent},
         renderer::{
-            BufferType, Color32F, ExportMem, ImportAll, ImportMem, Offscreen, Renderer,
-            buffer_dimensions, buffer_type,
+            Bind, BufferType, Color32F, ExportMem, ImportAll, ImportMem, Offscreen, Renderer,
+            Texture, buffer_dimensions, buffer_type,
             damage::{Error as DTError, OutputDamageTracker, RenderOutputResult},
             element::{
                 RenderElement, UnderlyingStorage,
                 utils::{Relocate, RelocateRenderElement},
             },
-            gles::{GlesError, GlesRenderbuffer},
+            gles::{GlesError, HdrOutputConfig},
             sync::SyncPoint,
             utils::with_renderer_surface_state,
         },
@@ -35,9 +35,11 @@ use smithay::{
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
+use smithay::backend::vulkan::image::VulkanImage;
+
 use crate::{
     backend::render::{
-        CursorMode, ElementFilter, RendererRef,
+        CursorMode, ElementFilter, RendererRef, VulkanMultiError, VulkanMultiRenderer,
         cursor::{self, CursorRenderElement},
         element::{AsGlowRenderer, CosmicElement, DamageElement},
         render_workspace,
@@ -48,7 +50,8 @@ use crate::{
     utils::prelude::{PointExt, PointGlobalExt, RectExt, RectLocalExt, SeatExt},
     wayland::{
         handlers::image_copy_capture::{
-            SessionData, SessionUserData, constraints_for_output, constraints_for_toplevel,
+            OffscreenBuffer, SessionData, SessionUserData, constraints_for_output,
+            constraints_for_toplevel,
         },
         protocols::workspace::WorkspaceHandle,
     },
@@ -245,13 +248,14 @@ where
         .map_err(|_| DTError::OutputNoMode(OutputNoMode))?;
 
         // Re-allocate if context id, size, or format are different
-        session_user_data
-            .offscreen
-            .take_if(|(context_id, renderbuffer)| {
+        session_user_data.offscreen.take_if(|buffer| match buffer {
+            OffscreenBuffer::Gles(context_id, renderbuffer) => {
                 renderer.glow_renderer().map(|r| r.context_id()).as_ref() != Some(context_id)
                     || renderbuffer.size() != size
                     || renderbuffer.format() != Some(format)
-            });
+            }
+            _ => true,
+        });
 
         if session_user_data.offscreen.is_none() {
             let Some(glow) = renderer.glow_renderer() else {
@@ -261,7 +265,7 @@ where
             let renderbuffer = renderer
                 .create_glow_renderbuffer(format, size)
                 .map_err(DTError::Rendering)?;
-            session_user_data.offscreen = Some((context_id, renderbuffer));
+            session_user_data.offscreen = Some(OffscreenBuffer::Gles(context_id, renderbuffer));
             // If we're allocating a new offscreen buffer, we need to re-render everything
             // (or copy the contexts of the shm buffer)
             age = 0;
@@ -273,14 +277,101 @@ where
     }
 
     let SessionUserData { dt, offscreen } = &mut *session_user_data;
-    let mut fb = offscreen
-        .as_mut()
-        .map(|(_, tex)| {
+    let mut fb = match offscreen.as_mut() {
+        Some(OffscreenBuffer::Gles(_, tex)) => Some(
             renderer
                 .bind_glow_renderbuffer(tex)
-                .map_err(DTError::Rendering)
+                .map_err(DTError::Rendering)?,
+        ),
+        _ => None,
+    };
+    let (result, buffers) = render_fn(
+        &frame.buffer(),
+        renderer,
+        fb.as_mut(),
+        dt,
+        age,
+        frame.damage(),
+    )?;
+
+    submit_buffer(
+        frame,
+        renderer,
+        fb.as_mut(),
+        transform,
+        result.damage.map(|x| x.as_slice()),
+        result.sync,
+        buffers,
+    )
+    .map_err(DTError::Rendering)
+}
+
+pub fn render_session_vulkan<F>(
+    renderer: &mut VulkanMultiRenderer<'_>,
+    session: &SessionData,
+    frame: Frame,
+    transform: Transform,
+    hdr_config: Option<HdrOutputConfig>,
+    render_fn: F,
+) -> Result<Option<PendingImageCopyData>, DTError<VulkanMultiError>>
+where
+    F: for<'d> FnOnce(
+        &WlBuffer,
+        &mut VulkanMultiRenderer<'_>,
+        Option<&mut <VulkanMultiRenderer<'_> as smithay::backend::renderer::RendererSuper>::Framebuffer<'_>>,
+        &'d mut OutputDamageTracker,
+        usize,
+        Vec<Rectangle<i32, BufferCoords>>,
+    ) -> Result<
+        (
+            RenderOutputResult<'d>,
+            Vec<smithay::backend::renderer::utils::Buffer>,
+        ),
+        DTError<VulkanMultiError>,
+    >,
+{
+    renderer.as_mut().set_hdr_output(hdr_config);
+    if let Some(target) = renderer.target_as_mut() {
+        target.set_hdr_output(hdr_config);
+    }
+
+    let mut session_user_data = session.lock().unwrap();
+
+    let buffer = frame.buffer();
+
+    let mut age = 1;
+    if matches!(buffer_type(&buffer), Some(BufferType::Shm)) {
+        let size = buffer_dimensions(&buffer).ok_or(DTError::OutputNoMode(OutputNoMode))?;
+        let format = with_buffer_contents(&buffer, |_, _, data| {
+            shm_format_to_fourcc(data.format)
+                .expect("We should be able to convert all hardcoded shm screencopy formats")
         })
-        .transpose()?;
+        .map_err(|_| DTError::OutputNoMode(OutputNoMode))?;
+
+        session_user_data.offscreen.take_if(|buffer| match buffer {
+            OffscreenBuffer::Vulkan(img) => {
+                img.width() != size.w as u32
+                    || img.height() != size.h as u32
+                    || Texture::format(img) != Some(format)
+            }
+            _ => true,
+        });
+
+        if session_user_data.offscreen.is_none() {
+            let image = Offscreen::<VulkanImage>::create_buffer(renderer, format, size)
+                .map_err(DTError::Rendering)?;
+            session_user_data.offscreen = Some(OffscreenBuffer::Vulkan(image));
+            age = 0;
+        }
+    } else {
+        session_user_data.offscreen = None;
+    }
+
+    let SessionUserData { dt, offscreen } = &mut *session_user_data;
+    let mut fb = match offscreen.as_mut() {
+        Some(OffscreenBuffer::Vulkan(img)) => Some(renderer.bind(img).map_err(DTError::Rendering)?),
+        _ => None,
+    };
     let (result, buffers) = render_fn(
         &frame.buffer(),
         renderer,
@@ -507,6 +598,63 @@ pub fn render_workspace_to_buffer(
                 session.user_data().get::<SessionData>().unwrap(),
                 frame,
                 transform,
+                |buffer, renderer, offscreen, dt, age, additional_damage| {
+                    render_fn(
+                        buffer,
+                        renderer,
+                        offscreen,
+                        dt,
+                        age,
+                        additional_damage,
+                        draw_cursor,
+                        common,
+                        &output,
+                        (handle, idx),
+                    )
+                },
+            ) {
+                Ok(frame) => frame,
+                Err(err) => {
+                    tracing::warn!(?err, "Failed to render to screencopy buffer");
+                    None
+                }
+            }
+        }
+        RendererRef::VulkanMulti(mut renderer) => {
+            let is_hdr_buffer = match buffer_type(&buffer) {
+                Some(BufferType::Dma) => get_dmabuf(&buffer)
+                    .ok()
+                    .map(|dmabuf| match dmabuf.format().code {
+                        Fourcc::Abgr2101010
+                        | Fourcc::Xbgr2101010
+                        | Fourcc::Argb2101010
+                        | Fourcc::Xrgb2101010 => true,
+                        _ => false,
+                    })
+                    .unwrap_or(false),
+                Some(BufferType::Shm) => with_buffer_contents(&buffer, |_, _, data| match data.format {
+                    smithay::reexports::wayland_server::protocol::wl_shm::Format::Abgr2101010
+                    | smithay::reexports::wayland_server::protocol::wl_shm::Format::Xbgr2101010
+                    | smithay::reexports::wayland_server::protocol::wl_shm::Format::Argb2101010
+                    | smithay::reexports::wayland_server::protocol::wl_shm::Format::Xrgb2101010 => true,
+                    _ => false,
+                })
+                .unwrap_or(false),
+                _ => false,
+            };
+
+            let hdr_config = if is_hdr_buffer {
+                Some(HdrOutputConfig::default())
+            } else {
+                Some(HdrOutputConfig::sdr_tonemapping())
+            };
+
+            match render_session_vulkan(
+                &mut renderer,
+                session.user_data().get::<SessionData>().unwrap(),
+                frame,
+                transform,
+                hdr_config,
                 |buffer, renderer, offscreen, dt, age, additional_damage| {
                     render_fn(
                         buffer,
@@ -797,6 +945,69 @@ pub fn render_window_to_buffer(
                 None
             }
         },
+        RendererRef::VulkanMulti(mut renderer) => {
+            let is_hdr_buffer = match buffer_type(&buffer) {
+                Some(BufferType::Dma) => get_dmabuf(&buffer)
+                    .map(|d| match d.format().code {
+                        Fourcc::Abgr2101010
+                        | Fourcc::Xbgr2101010
+                        | Fourcc::Argb2101010
+                        | Fourcc::Xrgb2101010
+                        | Fourcc::Abgr16161616f => true,
+                        _ => false,
+                    })
+                    .unwrap_or(false),
+                Some(BufferType::Shm) => with_buffer_contents(&buffer, |_, _, data| {
+                    match data
+                    .format
+                {
+                    smithay::reexports::wayland_server::protocol::wl_shm::Format::Abgr2101010
+                    | smithay::reexports::wayland_server::protocol::wl_shm::Format::Xbgr2101010
+                    | smithay::reexports::wayland_server::protocol::wl_shm::Format::Argb2101010
+                    | smithay::reexports::wayland_server::protocol::wl_shm::Format::Xrgb2101010 => {
+                        true
+                    }
+                    _ => false,
+                }
+                })
+                .unwrap_or(false),
+                _ => false,
+            };
+
+            let hdr_config = if is_hdr_buffer {
+                Some(HdrOutputConfig::default())
+            } else {
+                Some(HdrOutputConfig::sdr_tonemapping())
+            };
+
+            match render_session_vulkan(
+                &mut renderer,
+                session.user_data().get::<SessionData>().unwrap(),
+                frame,
+                Transform::Normal,
+                hdr_config,
+                |buffer, renderer, offscreen, dt, age, additional_damage| {
+                    render_fn(
+                        buffer,
+                        renderer,
+                        offscreen,
+                        dt,
+                        age,
+                        additional_damage,
+                        draw_cursor,
+                        common,
+                        toplevel,
+                        geometry,
+                    )
+                },
+            ) {
+                Ok(frame) => frame,
+                Err(err) => {
+                    tracing::warn!(?err, "Failed to render to screencopy buffer");
+                    None
+                }
+            }
+        }
     };
 
     if let Some(pending_image_copy_data) = result {
@@ -943,6 +1154,33 @@ pub fn render_cursor_to_buffer(
                 session.user_data().get::<SessionData>().unwrap(),
                 frame,
                 Transform::Normal,
+                |buffer, renderer, offscreen, dt, age, additional_damage| {
+                    render_fn(
+                        buffer,
+                        renderer,
+                        offscreen,
+                        dt,
+                        age,
+                        additional_damage,
+                        common,
+                        seat,
+                    )
+                },
+            ) {
+                Ok(frame) => frame,
+                Err(err) => {
+                    tracing::warn!(?err, "Failed to render to screencopy buffer");
+                    None
+                }
+            }
+        }
+        RendererRef::VulkanMulti(mut renderer) => {
+            match render_session_vulkan(
+                &mut renderer,
+                session.user_data().get::<SessionData>().unwrap(),
+                frame,
+                Transform::Normal,
+                None,
                 |buffer, renderer, offscreen, dt, age, additional_damage| {
                     render_fn(
                         buffer,

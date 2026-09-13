@@ -21,9 +21,15 @@ type PendingImageCopyBuffers = Mutex<Vec<(SessionRef, Frame)>>;
 
 pub type SessionData = Mutex<SessionUserData>;
 
+#[derive(Debug)]
+pub enum OffscreenBuffer {
+    Gles(ContextId<GlesTexture>, GlesRenderbuffer),
+    Vulkan(smithay::backend::vulkan::image::VulkanImage),
+}
+
 pub struct SessionUserData {
     pub dt: OutputDamageTracker,
-    pub offscreen: Option<(ContextId<GlesTexture>, GlesRenderbuffer)>,
+    pub offscreen: Option<OffscreenBuffer>,
 }
 
 impl SessionUserData {

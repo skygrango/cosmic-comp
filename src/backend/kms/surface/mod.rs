@@ -5,7 +5,7 @@ use crate::{
         kms::surface::timings::SAMPLE_TIME_WINDOW,
         render::{
             CLEAR_COLOR, CursorMode, GlMultiError, GlMultiRenderer, PostprocessOutputConfig,
-            PostprocessShader, PostprocessState,
+            PostprocessShader, PostprocessState, VulkanMultiRenderer,
             element::{CosmicElement, DamageElement},
             init_shaders, output_elements, postprocess_intermediate_format, set_hdr_client_blend,
         },
@@ -2074,7 +2074,7 @@ impl SurfaceThreadState {
                     states_len = frame_result.states.states.len(),
                     "redraw_vulkan render_frame Ok"
                 );
-                let (_tx, rx) = std::sync::mpsc::channel();
+                let (tx, rx) = std::sync::mpsc::channel();
 
                 let feedback = if !frame_result.is_empty && self.mirroring.is_none() {
                     Some((
@@ -2121,8 +2121,19 @@ impl SurfaceThreadState {
                             };
                         }
 
-                        for (_session, frame, _) in frames {
-                            frame.fail(CaptureFailureReason::Unknown);
+                        let now = self.clock.now();
+                        for (session, frame, res) in frames {
+                            if let Err(err) = send_screencopy_result_vulkan(
+                                &mut renderer,
+                                &self.output,
+                                &tx,
+                                &frame_result,
+                                &elements,
+                                (&session, frame, res),
+                                now.into(),
+                            ) {
+                                tracing::warn!(?err, "Failed to screencopy in Vulkan");
+                            }
                         }
 
                         if self.mirroring.is_none() {
@@ -2468,18 +2479,31 @@ fn send_screencopy_result<'a>(
     ),
     presentation_time: Duration,
 ) -> Result<()> {
-    let (damage, _) = res?;
+    let (damage, _) = match res {
+        Ok(damage) => damage,
+        Err(err) => {
+            frame.fail(CaptureFailureReason::Unknown);
+            return Err(err.into());
+        }
+    };
 
     let mut sync = SyncPoint::default();
     let mut dmabuf_clone;
     let mut render_buffer;
     let buffer = frame.buffer();
     let mut shm_buffer = false;
-    let buffer_size = buffer_dimensions(&buffer).ok_or(RenderError::<
-        <GlMultiRenderer as RendererSuper>::Error,
-    >::Rendering(
-        MultiError::ImportFailed
-    ))?;
+    let buffer_size = match buffer_dimensions(&buffer) {
+        Some(size) => size,
+        None => {
+            frame.fail(CaptureFailureReason::Unknown);
+            return Err(
+                RenderError::<<GlMultiRenderer as RendererSuper>::Error>::Rendering(
+                    MultiError::ImportFailed,
+                )
+                .into(),
+            );
+        }
+    };
     let mut fb = if let Ok(dmabuf) = get_dmabuf(&buffer) {
         dmabuf_clone = dmabuf.clone();
         Some(
@@ -2646,7 +2670,159 @@ fn send_screencopy_result<'a>(
     )
     .map_err(RenderError::<<GlMultiRenderer as RendererSuper>::Error>::Rendering)?
     {
-        if frame_result.is_empty {
+        if shm_buffer || frame_result.is_empty {
+            data.frame
+                .success(transform, data.damage, presentation_time);
+        } else {
+            let _ = tx.send(data);
+        }
+    }
+
+    Ok(())
+}
+
+fn send_screencopy_result_vulkan<'a>(
+    renderer: &mut VulkanMultiRenderer<'a>,
+    output: &Output,
+    tx: &std::sync::mpsc::Sender<PendingImageCopyData>,
+    frame_result: &RenderFrameResult<
+        GbmBuffer,
+        GbmFramebuffer,
+        CosmicElement<VulkanMultiRenderer<'a>>,
+    >,
+    elements: &[CosmicElement<VulkanMultiRenderer<'a>>],
+    (session, frame, res): (
+        &ScreencopySessionRef,
+        ScreencopyFrame,
+        Result<(Option<Vec<Rectangle<i32, Physical>>>, RenderElementStates), OutputNoMode>,
+    ),
+    presentation_time: Duration,
+) -> Result<()> {
+    let (damage, _) = match res {
+        Ok(damage) => damage,
+        Err(err) => {
+            frame.fail(CaptureFailureReason::Unknown);
+            return Err(err.into());
+        }
+    };
+
+    let mut sync = SyncPoint::default();
+    let mut dmabuf_clone;
+    let mut render_buffer;
+    let buffer = frame.buffer();
+    let mut shm_buffer = false;
+    let buffer_size = match buffer_dimensions(&buffer) {
+        Some(size) => size,
+        None => {
+            frame.fail(CaptureFailureReason::Unknown);
+            return Err(
+                RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(
+                    MultiError::ImportFailed,
+                )
+                .into(),
+            );
+        }
+    };
+    let mut fb = if let Ok(dmabuf) = get_dmabuf(&buffer) {
+        dmabuf_clone = dmabuf.clone();
+        Some(
+            renderer
+                .bind(&mut dmabuf_clone)
+                .map_err(RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering)?,
+        )
+    } else {
+        shm_buffer = true;
+        let format = with_buffer_contents(&buffer, |_, _, data| shm_format_to_fourcc(data.format))
+            .map_err(|_| OutputNoMode)?
+            .expect("We should be able to convert all hardcoded shm screencopy formats");
+
+        render_buffer = Offscreen::<smithay::backend::vulkan::image::VulkanImage>::create_buffer(
+            renderer,
+            format,
+            buffer_size,
+        )
+        .map_err(RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering)?;
+        Some(
+            renderer
+                .bind(&mut render_buffer)
+                .map_err(RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering)?,
+        )
+    };
+
+    if let Some(ref damage) = damage {
+        let (output_size, output_scale, output_transform) = (
+            output.current_mode().ok_or(OutputNoMode)?.size,
+            output.current_scale().fractional_scale(),
+            output.current_transform(),
+        );
+
+        let filter = (!session.draw_cursor())
+            .then(|| {
+                elements.iter().filter_map(|elem| {
+                    if let CosmicElement::Cursor(_) = elem {
+                        Some(elem.id().clone())
+                    } else {
+                        None
+                    }
+                })
+            })
+            .into_iter()
+            .flatten();
+
+        // If the screen is rotated, we must convert damage to match output.
+        let adjusted = damage
+            .iter()
+            .copied()
+            .map(|rect| {
+                let logical = rect.to_logical(1);
+                logical
+                    .to_buffer(
+                        1,
+                        output_transform.invert(),
+                        &buffer_size.to_logical(1, output_transform),
+                    )
+                    .to_logical(1, Transform::Normal, &buffer_size)
+                    .to_physical(1)
+            })
+            .collect::<Vec<_>>();
+
+        sync = frame_result
+            .blit_frame_result(
+                output_size,
+                output_transform,
+                output_scale,
+                renderer,
+                fb.as_mut().unwrap(),
+                adjusted,
+                filter,
+            )
+            .map_err(|err| match err {
+                BlitFrameResultError::Rendering(err) => {
+                    RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(err)
+                }
+                BlitFrameResultError::Export(_) => {
+                    RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(
+                        MultiError::DeviceMissing,
+                    )
+                }
+            })?;
+    }
+
+    let transform = output.current_transform();
+
+    if let Some(data) = submit_buffer(
+        frame,
+        renderer,
+        shm_buffer.then_some(fb.as_mut().unwrap()),
+        transform,
+        damage.as_deref(),
+        sync,
+        // Don't reference `Buffer`s since we blit from framebuffer/postprocess buffer
+        vec![],
+    )
+    .map_err(RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering)?
+    {
+        if shm_buffer || frame_result.is_empty {
             data.frame
                 .success(transform, data.damage, presentation_time);
         } else {

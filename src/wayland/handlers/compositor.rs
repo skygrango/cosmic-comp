@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-use crate::{
-    shell::grabs::SeatMoveGrabState,
-    state::ClientState,
-    utils::prelude::*,
-};
+use crate::{shell::grabs::SeatMoveGrabState, state::ClientState, utils::prelude::*};
 use calloop::{
     Interest,
     timer::{TimeoutAction, Timer},
