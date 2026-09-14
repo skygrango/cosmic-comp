@@ -694,6 +694,102 @@ mod test {
     }
 
     #[test]
+    fn test_vulkan_push_descriptor_capability() {
+        use smithay::backend::vulkan::{Instance, PhysicalDevice, version::Version};
+
+        let Ok(instance) = Instance::new(Version::VERSION_1_3, None) else {
+            return;
+        };
+
+        for phd in PhysicalDevice::enumerate(&instance).unwrap() {
+            if phd.api_version() < Version::VERSION_1_3 {
+                continue;
+            }
+
+            let Ok(renderer) = VulkanRenderer::new(&phd, None) else {
+                continue;
+            };
+
+            let supports_push = renderer.supports_push_descriptor();
+            println!(
+                "Device {:?} supports_push_descriptor: {}",
+                phd.name(),
+                supports_push
+            );
+            if phd.has_device_extension(smithay::backend::vulkan::ash::khr::push_descriptor::NAME) {
+                assert!(supports_push);
+                assert!(renderer.device().vk_khr_push_descriptor().is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn test_vulkan_memory_budget_capability() {
+        use smithay::backend::vulkan::{Instance, PhysicalDevice, version::Version};
+
+        let Ok(instance) = Instance::new(Version::VERSION_1_3, None) else {
+            return;
+        };
+
+        for phd in PhysicalDevice::enumerate(&instance).unwrap() {
+            if phd.api_version() < Version::VERSION_1_3 {
+                continue;
+            }
+
+            let Ok(renderer) = VulkanRenderer::new(&phd, None) else {
+                continue;
+            };
+
+            let supports_budget = renderer.supports_memory_budget();
+            eprintln!(
+                "Device {:?} supports_memory_budget: {}",
+                phd.name(),
+                supports_budget
+            );
+            if phd.has_device_extension(smithay::backend::vulkan::ash::ext::memory_budget::NAME) {
+                assert!(supports_budget);
+                let budget = renderer.memory_budget();
+                assert!(budget.is_some());
+                let budget = budget.unwrap();
+                eprintln!(
+                    "VRAM total budget: {} MB, usage: {} MB (ratio: {:.2}%)",
+                    budget.total_budget() / (1024 * 1024),
+                    budget.total_usage() / (1024 * 1024),
+                    budget.usage_ratio() * 100.0
+                );
+                assert!(budget.total_budget() > 0);
+            }
+        }
+    }
+
+    #[test]
+    fn test_vulkan_dynamic_rendering_capability() {
+        use smithay::backend::vulkan::{Instance, PhysicalDevice, version::Version};
+
+        let Ok(instance) = Instance::new(Version::VERSION_1_3, None) else {
+            return;
+        };
+
+        for phd in PhysicalDevice::enumerate(&instance).unwrap() {
+            if phd.api_version() < Version::VERSION_1_3 {
+                continue;
+            }
+
+            let Ok(renderer) = VulkanRenderer::new(&phd, None) else {
+                continue;
+            };
+
+            let supports_dynamic = renderer.supports_dynamic_rendering();
+            eprintln!(
+                "Device {:?} supports_dynamic_rendering: {}",
+                phd.name(),
+                supports_dynamic
+            );
+            assert!(supports_dynamic);
+        }
+    }
+
+    #[test]
     fn test_vulkan_render_clear_and_texture() {
         use smithay::backend::renderer::{Bind, Color32F, Frame, ImportMem, Renderer};
         use smithay::backend::vulkan::ash::vk;
