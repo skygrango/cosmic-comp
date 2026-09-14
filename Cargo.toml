@@ -151,9 +151,10 @@ cosmic-protocols = { git = "https://github.com/skygrango/cosmic-protocols", bran
 
 [patch.crates-io]
 smithay-egui = { git = "https://github.com/Smithay/smithay-egui.git", rev = "6511552" }
+drm = { git = "https://github.com/skygrango/drm-rs.git", rev = "79d3d68" }
+drm-ffi = { git = "https://github.com/skygrango/drm-rs.git", rev = "79d3d68" }
+drm-sys = { git = "https://github.com/skygrango/drm-rs.git", rev = "79d3d68" }
+gbm = { git = "https://github.com/skygrango/gbm.rs.git", rev = "4001b10" }
 #smithay = { git = "https://github.com/skygrango/smithay.git", rev = "7f8a08f" }
 smithay = { path = "smithay" }
-drm = { path = "smithay/drm-rs" }
-drm-ffi = { path = "smithay/drm-rs/drm-ffi" }
-drm-sys = { path = "smithay/drm-rs/drm-ffi/drm-sys" }
-gbm = { path = "smithay/gbm-rs" }
+

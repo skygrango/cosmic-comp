@@ -415,13 +415,15 @@ fn sort_constraints_for_hdr(constraints: &mut BufferConstraints, is_hdr: bool) {
             });
         }
     } else {
-        constraints.shm.retain(|f| !matches!(
-            f,
-            ShmFormat::Abgr2101010
-                | ShmFormat::Xbgr2101010
-                | ShmFormat::Argb2101010
-                | ShmFormat::Xrgb2101010
-        ));
+        constraints.shm.retain(|f| {
+            !matches!(
+                f,
+                ShmFormat::Abgr2101010
+                    | ShmFormat::Xbgr2101010
+                    | ShmFormat::Argb2101010
+                    | ShmFormat::Xrgb2101010
+            )
+        });
         constraints.shm.sort_by_key(|f| match f {
             ShmFormat::Abgr8888 => 0,
             ShmFormat::Xbgr8888 => 1,
