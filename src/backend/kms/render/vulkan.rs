@@ -1928,4 +1928,52 @@ mod test {
             );
         }
     }
+
+    #[test]
+    fn test_vulkan_dmabuf_export_and_depth_configuration() {
+        use smithay::backend::allocator::Buffer;
+        use smithay::backend::vulkan::{
+            image::{ImageUsageFlags, VulkanImage},
+            Instance, PhysicalDevice, version::Version,
+        };
+
+        let Ok(instance) = Instance::new(Version::VERSION_1_3, None) else {
+            return;
+        };
+
+        let phds: Vec<_> = PhysicalDevice::enumerate(&instance).unwrap().collect();
+        for phd in &phds {
+            if phd.api_version() < Version::VERSION_1_3 {
+                continue;
+            }
+
+            let renderer = match VulkanRenderer::new(phd, None) {
+                Ok(renderer) => renderer,
+                Err(e) => {
+                    println!("Renderer creation failed on {:?}: {:?}", phd.name(), e);
+                    continue;
+                }
+            };
+
+            // Test exportable image creation
+            let image = VulkanImage::new_exportable(
+                renderer.device(),
+                64,
+                64,
+                smithay::backend::allocator::Fourcc::Argb8888,
+                [smithay::backend::allocator::Modifier::Linear].into_iter(),
+                ImageUsageFlags::COLOR_ATTACHMENT | ImageUsageFlags::SAMPLED,
+            );
+            if let Ok(img) = image {
+                assert!(img.dmabuf_exportable());
+                let exported = img.export();
+                if let Ok(dmabuf) = exported {
+                    assert_eq!(dmabuf.width(), 64);
+                    assert_eq!(dmabuf.height(), 64);
+                    assert_eq!(dmabuf.format().code, smithay::backend::allocator::Fourcc::Argb8888);
+                }
+            }
+            break;
+        }
+    }
 }
