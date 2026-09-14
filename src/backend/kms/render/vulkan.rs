@@ -1933,8 +1933,9 @@ mod test {
     fn test_vulkan_dmabuf_export_and_depth_configuration() {
         use smithay::backend::allocator::Buffer;
         use smithay::backend::vulkan::{
+            Instance, PhysicalDevice,
             image::{ImageUsageFlags, VulkanImage},
-            Instance, PhysicalDevice, version::Version,
+            version::Version,
         };
 
         let Ok(instance) = Instance::new(Version::VERSION_1_3, None) else {
@@ -1970,8 +1971,143 @@ mod test {
                 if let Ok(dmabuf) = exported {
                     assert_eq!(dmabuf.width(), 64);
                     assert_eq!(dmabuf.height(), 64);
-                    assert_eq!(dmabuf.format().code, smithay::backend::allocator::Fourcc::Argb8888);
+                    assert_eq!(
+                        dmabuf.format().code,
+                        smithay::backend::allocator::Fourcc::Argb8888
+                    );
                 }
+            }
+            break;
+        }
+    }
+
+    #[test]
+    fn test_vulkan_cursor_element_underlying_storage() {
+        use crate::backend::render::{cursor::CursorRenderElement, element::CosmicElement};
+        use smithay::backend::allocator::Fourcc;
+        use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
+        use smithay::backend::drm::DrmDeviceFd;
+        use smithay::backend::renderer::element::{
+            Element, Kind, RenderElement, UnderlyingStorage,
+            memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
+            utils::{RelocateRenderElement, RescaleRenderElement},
+        };
+        use smithay::backend::renderer::multigpu::GpuManager;
+        use smithay::backend::vulkan::{Instance, PhysicalDevice, version::Version};
+        use smithay::utils::{Physical, Point, Transform};
+
+        let Ok(instance) = Instance::new(Version::VERSION_1_3, None) else {
+            return;
+        };
+
+        for phd in PhysicalDevice::enumerate(&instance).unwrap() {
+            if phd.api_version() < Version::VERSION_1_3 {
+                continue;
+            }
+
+            let mut renderer = match VulkanRenderer::new(&phd, None) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+
+            let cursor_data = vec![255u8; 32 * 32 * 4];
+            let mem_buffer = MemoryRenderBuffer::from_slice(
+                &cursor_data,
+                Fourcc::Argb8888,
+                (32, 32),
+                1,
+                Transform::Normal,
+                None,
+            );
+
+            let elem = MemoryRenderBufferRenderElement::from_buffer(
+                &mut renderer,
+                Point::<f64, Physical>::from((10.0, 20.0)),
+                &mem_buffer,
+                None,
+                None,
+                None,
+                Kind::Cursor,
+            )
+            .expect("Failed to create MemoryRenderBufferRenderElement");
+
+            assert_eq!(elem.kind(), Kind::Cursor);
+            let storage = RenderElement::<VulkanRenderer>::underlying_storage(&elem, &mut renderer);
+            assert!(storage.is_some());
+            if let Some(UnderlyingStorage::Memory(buf)) = storage {
+                assert_eq!(buf.size(), (32, 32).into());
+                assert_eq!(buf.format(), Fourcc::Argb8888);
+            } else {
+                panic!("Expected UnderlyingStorage::Memory");
+            }
+
+            // Also test with GbmVulkanBackend and VulkanMultiRenderer if DRM node is available
+            let Ok(file) = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/dri/card1")
+            else {
+                break;
+            };
+            let owned: rustix::fd::OwnedFd = file.into();
+            let drm_fd = DrmDeviceFd::new(smithay::utils::DeviceFd::from(owned));
+            let Ok(gbm) = GbmDevice::new(drm_fd.clone()) else {
+                break;
+            };
+            let Ok(renderer_gbm) = VulkanRenderer::new(&phd, Some(drm_fd.clone())) else {
+                break;
+            };
+            let node = phd
+                .render_node()
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| smithay::backend::drm::DrmNode::from_file(&drm_fd).unwrap());
+
+            let mut backend = GbmVulkanBackend::new();
+            backend.add_node(
+                node,
+                GbmAllocator::new(gbm, GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT),
+                renderer_gbm,
+            );
+
+            let mut manager = GpuManager::new(backend)
+                .expect("GpuManager should initialize with GbmVulkanBackend");
+            let mut single = manager
+                .single_renderer(&node)
+                .expect("single_renderer should succeed for added node");
+
+            let elem_multi = MemoryRenderBufferRenderElement::from_buffer(
+                &mut single,
+                Point::<f64, Physical>::from((10.0, 20.0)),
+                &mem_buffer,
+                None,
+                None,
+                None,
+                Kind::Cursor,
+            )
+            .expect("Failed to create MemoryRenderBufferRenderElement for VulkanMultiRenderer");
+
+            let cursor_elem: CursorRenderElement<_> = CursorRenderElement::Static(elem_multi);
+            let relocated = RelocateRenderElement::from_element(
+                cursor_elem,
+                Point::from((0, 0)),
+                smithay::backend::renderer::element::utils::Relocate::Relative,
+            );
+            let rescaled1 = RescaleRenderElement::from_element(relocated, Point::from((0, 0)), 1.0);
+            let rescaled2 = RescaleRenderElement::from_element(rescaled1, Point::from((0, 0)), 1.0);
+            let cosmic_elem: CosmicElement<_> = CosmicElement::Cursor(rescaled2);
+
+            assert_eq!(cosmic_elem.kind(), Kind::Cursor);
+            let multi_storage = RenderElement::<crate::backend::render::VulkanMultiRenderer<'_>>::underlying_storage(&cosmic_elem, &mut single);
+            assert!(
+                multi_storage.is_some(),
+                "Cursor element must expose underlying_storage in VulkanMultiRenderer for hardware cursor scanout!"
+            );
+            if let Some(UnderlyingStorage::Memory(buf)) = multi_storage {
+                assert_eq!(buf.size(), (32, 32).into());
+                assert_eq!(buf.format(), Fourcc::Argb8888);
+            } else {
+                panic!("Expected UnderlyingStorage::Memory");
             }
             break;
         }
