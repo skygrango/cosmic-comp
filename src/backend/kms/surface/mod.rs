@@ -1303,7 +1303,7 @@ impl SurfaceThreadState {
             self.output
                 .set_avg_frametime(self.timings.avg_frametime(SAMPLE_TIME_WINDOW));
 
-            while let Ok(pending_image_copy_data) = frames.recv() {
+            while let Ok(pending_image_copy_data) = frames.try_recv() {
                 pending_image_copy_data.send_success_when_ready(
                     self.output.current_transform(),
                     &self.loop_handle,
