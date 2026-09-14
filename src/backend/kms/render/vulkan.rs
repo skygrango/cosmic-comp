@@ -521,6 +521,12 @@ mod test {
             let mut manager = GpuManager::new(backend).expect("GpuManager init");
             let mut single = manager.single_renderer(&node).expect("single_renderer");
 
+            let supported_modifiers = formats
+                .iter()
+                .filter(|f| f.code == smithay::backend::allocator::Fourcc::Argb8888)
+                .map(|f| f.modifier)
+                .collect::<Vec<_>>();
+
             // Allocate a client dmabuf
             use smithay::backend::allocator::{Buffer, dmabuf::AsDmabuf};
             let client_gbm = gbm_allocator
@@ -528,11 +534,17 @@ mod test {
                     64,
                     64,
                     smithay::backend::allocator::Fourcc::Argb8888,
-                    &[smithay::backend::allocator::Modifier::Unrecognized(
-                        144115188757872388,
-                    )],
+                    &supported_modifiers,
                 )
-                .expect("Failed to allocate client dmabuf with modifier 144115188757872388");
+                .or_else(|_| {
+                    gbm_allocator.create_buffer(
+                        64,
+                        64,
+                        smithay::backend::allocator::Fourcc::Argb8888,
+                        &[smithay::backend::allocator::Modifier::Linear],
+                    )
+                })
+                .expect("Failed to allocate client dmabuf");
             let client_dmabuf = client_gbm.export().expect("export client dmabuf");
             println!(
                 "client_dmabuf allocation: (format: {:?}, node: {:?})",
@@ -702,15 +714,18 @@ mod test {
                 continue;
             };
 
+            let mut usage = vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::SAMPLED;
+            if renderer.supports_optimal_host_copy() {
+                usage |= vk::ImageUsageFlags::HOST_TRANSFER_EXT;
+            }
             let mut target_image = VulkanImage::new(
                 renderer.device(),
                 64,
                 64,
                 vk::Format::R8G8B8A8_UNORM,
-                vk::ImageUsageFlags::STORAGE
-                    | vk::ImageUsageFlags::TRANSFER_SRC
-                    | vk::ImageUsageFlags::SAMPLED
-                    | vk::ImageUsageFlags::HOST_TRANSFER_EXT,
+                usage,
                 false,
             )
             .expect("Failed to create target VulkanImage");
@@ -795,15 +810,18 @@ mod test {
                 continue;
             };
 
+            let mut usage = vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::SAMPLED;
+            if renderer.supports_optimal_host_copy() {
+                usage |= vk::ImageUsageFlags::HOST_TRANSFER_EXT;
+            }
             let mut target_image = VulkanImage::new(
                 renderer.device(),
                 64,
                 64,
                 vk::Format::A2B10G10R10_UNORM_PACK32,
-                vk::ImageUsageFlags::STORAGE
-                    | vk::ImageUsageFlags::TRANSFER_SRC
-                    | vk::ImageUsageFlags::SAMPLED
-                    | vk::ImageUsageFlags::HOST_TRANSFER_EXT,
+                usage,
                 false,
             )
             .expect("Failed to create target VulkanImage AB30");
@@ -903,15 +921,18 @@ mod test {
 
             renderer.set_hdr_output(Some(HdrOutputConfig::default()));
 
+            let mut usage = vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::SAMPLED;
+            if renderer.supports_optimal_host_copy() {
+                usage |= vk::ImageUsageFlags::HOST_TRANSFER_EXT;
+            }
             let mut target_image = VulkanImage::new(
                 renderer.device(),
                 64,
                 64,
                 vk::Format::A2B10G10R10_UNORM_PACK32,
-                vk::ImageUsageFlags::STORAGE
-                    | vk::ImageUsageFlags::TRANSFER_SRC
-                    | vk::ImageUsageFlags::SAMPLED
-                    | vk::ImageUsageFlags::HOST_TRANSFER_EXT,
+                usage,
                 false,
             )
             .expect("Failed to create target VulkanImage AB30 HDR");
@@ -1015,15 +1036,18 @@ mod test {
             };
 
             // Framebuffer: 64x64 RGBA
+            let mut usage = vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::SAMPLED;
+            if renderer.supports_optimal_host_copy() {
+                usage |= vk::ImageUsageFlags::HOST_TRANSFER_EXT;
+            }
             let mut target_image = VulkanImage::new(
                 renderer.device(),
                 64,
                 64,
                 vk::Format::R8G8B8A8_UNORM,
-                vk::ImageUsageFlags::STORAGE
-                    | vk::ImageUsageFlags::TRANSFER_SRC
-                    | vk::ImageUsageFlags::SAMPLED
-                    | vk::ImageUsageFlags::HOST_TRANSFER_EXT,
+                usage,
                 false,
             )
             .expect("Failed to create target VulkanImage");
@@ -1172,15 +1196,18 @@ mod test {
                 continue;
             };
 
+            let mut usage = vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::SAMPLED;
+            if renderer.supports_optimal_host_copy() {
+                usage |= vk::ImageUsageFlags::HOST_TRANSFER_EXT;
+            }
             let mut target_image = VulkanImage::new(
                 renderer.device(),
                 64,
                 64,
                 vk::Format::R8G8B8A8_UNORM,
-                vk::ImageUsageFlags::STORAGE
-                    | vk::ImageUsageFlags::TRANSFER_SRC
-                    | vk::ImageUsageFlags::SAMPLED
-                    | vk::ImageUsageFlags::HOST_TRANSFER_EXT,
+                usage,
                 false,
             )
             .expect("Failed to create target image");
@@ -1287,15 +1314,18 @@ mod test {
 
             renderer.set_hdr_output(Some(HdrOutputConfig::default()));
 
+            let mut usage = vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::SAMPLED;
+            if renderer.supports_optimal_host_copy() {
+                usage |= vk::ImageUsageFlags::HOST_TRANSFER_EXT;
+            }
             let mut target_image = VulkanImage::new(
                 renderer.device(),
                 64,
                 64,
                 vk::Format::A2B10G10R10_UNORM_PACK32,
-                vk::ImageUsageFlags::STORAGE
-                    | vk::ImageUsageFlags::TRANSFER_SRC
-                    | vk::ImageUsageFlags::SAMPLED
-                    | vk::ImageUsageFlags::HOST_TRANSFER_EXT,
+                usage,
                 false,
             )
             .expect("Failed to create target image");
@@ -1417,15 +1447,18 @@ mod test {
             };
             renderer.set_hdr_output(Some(config));
 
+            let mut usage = vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::SAMPLED;
+            if renderer.supports_optimal_host_copy() {
+                usage |= vk::ImageUsageFlags::HOST_TRANSFER_EXT;
+            }
             let mut target_image = VulkanImage::new(
                 renderer.device(),
                 64,
                 64,
                 vk::Format::A2B10G10R10_UNORM_PACK32,
-                vk::ImageUsageFlags::STORAGE
-                    | vk::ImageUsageFlags::TRANSFER_SRC
-                    | vk::ImageUsageFlags::SAMPLED
-                    | vk::ImageUsageFlags::HOST_TRANSFER_EXT,
+                usage,
                 false,
             )
             .expect("Failed to create target VulkanImage");
@@ -1595,15 +1628,18 @@ mod test {
             };
             renderer.set_hdr_output(Some(config));
 
+            let mut usage = vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::SAMPLED;
+            if renderer.supports_optimal_host_copy() {
+                usage |= vk::ImageUsageFlags::HOST_TRANSFER_EXT;
+            }
             let mut target_image = VulkanImage::new(
                 renderer.device(),
                 64,
                 64,
                 vk::Format::A2B10G10R10_UNORM_PACK32,
-                vk::ImageUsageFlags::STORAGE
-                    | vk::ImageUsageFlags::TRANSFER_SRC
-                    | vk::ImageUsageFlags::SAMPLED
-                    | vk::ImageUsageFlags::HOST_TRANSFER_EXT,
+                usage,
                 false,
             )
             .expect("Failed to create target VulkanImage");
