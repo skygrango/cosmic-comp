@@ -673,6 +673,10 @@ pub fn render_workspace_to_buffer(
             let ref_white = active_hdr
                 .map(|a| a.reference_white as f32)
                 .unwrap_or(203.0);
+            let max_lum = active_hdr
+                .map(|a| a.capabilities.max_luminance as f32)
+                .unwrap_or(1000.0)
+                .max(ref_white);
 
             let is_hdr = is_hdr_buffer(&frame.buffer());
             let hdr_config = if is_hdr {
@@ -680,8 +684,8 @@ pub fn render_workspace_to_buffer(
                     reference_white: ref_white,
                     sdr_gamma: 0.0,
                     gamut_stretch: 0.0,
-                    max_luminance: ref_white,
-                    hardware_offload: true,
+                    max_luminance: max_lum,
+                    hardware_offload: false,
                     is_sdr: false,
                 })
             } else {
@@ -1134,6 +1138,10 @@ pub fn render_window_to_buffer(
             let ref_white = active_hdr
                 .map(|a| a.reference_white as f32)
                 .unwrap_or(203.0);
+            let max_lum = active_hdr
+                .map(|a| a.capabilities.max_luminance as f32)
+                .unwrap_or(1000.0)
+                .max(ref_white);
 
             let is_hdr = is_hdr_buffer(&frame.buffer());
             let hdr_config = if is_hdr {
@@ -1141,8 +1149,8 @@ pub fn render_window_to_buffer(
                     reference_white: ref_white,
                     sdr_gamma: 0.0,
                     gamut_stretch: 0.0,
-                    max_luminance: ref_white,
-                    hardware_offload: true,
+                    max_luminance: max_lum,
+                    hardware_offload: false,
                     is_sdr: false,
                 })
             } else {
