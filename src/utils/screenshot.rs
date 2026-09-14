@@ -22,7 +22,14 @@ use crate::{
 pub fn screenshot_window(state: &mut State, surface: &CosmicSurface) {
     let scale = surface
         .wl_surface()
-        .and_then(|surf| state.common.shell.read().visible_output_for_surface(&surf).cloned())
+        .and_then(|surf| {
+            state
+                .common
+                .shell
+                .read()
+                .visible_output_for_surface(&surf)
+                .cloned()
+        })
         .map(|out| out.current_scale().fractional_scale())
         .unwrap_or(1.0);
 
@@ -52,11 +59,8 @@ pub fn screenshot_window(state: &mut State, surface: &CosmicSurface) {
         let format = Fourcc::Abgr8888;
         let phys_size = bbox.size.to_f64().to_physical(scale).to_i32_round();
         let buf_size = smithay::utils::Size::from((phys_size.w, phys_size.h));
-        let mut render_buffer = Offscreen::<GlesRenderbuffer>::create_buffer(
-            renderer,
-            format,
-            buf_size,
-        )?;
+        let mut render_buffer =
+            Offscreen::<GlesRenderbuffer>::create_buffer(renderer, format, buf_size)?;
         let mut fb = renderer.bind(&mut render_buffer)?;
         let mut output_damage_tracker =
             OutputDamageTracker::new(phys_size, scale, Transform::Normal);

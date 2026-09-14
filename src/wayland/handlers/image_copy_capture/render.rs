@@ -3,7 +3,7 @@
 use calloop::LoopHandle;
 use smithay::{
     backend::{
-        allocator::{dmabuf::Dmabuf, Buffer, Fourcc, format::get_transparent},
+        allocator::{Buffer, Fourcc, dmabuf::Dmabuf, format::get_transparent},
         renderer::{
             Bind, BufferType, Color32F, ExportMem, ImportAll, ImportMem, Offscreen, Renderer,
             Texture, TextureFilter, buffer_dimensions, buffer_type,
@@ -698,21 +698,25 @@ pub fn render_window_to_buffer(
 
     let scale = toplevel
         .wl_surface()
-        .and_then(|surf| state.common.shell.read().visible_output_for_surface(&surf).cloned())
+        .and_then(|surf| {
+            state
+                .common
+                .shell
+                .read()
+                .visible_output_for_surface(&surf)
+                .cloned()
+        })
         .map(|out| out.current_scale().fractional_scale())
         .unwrap_or(1.0);
 
     let buffer = frame.buffer();
     let geometry = toplevel.geometry();
     let buffer_size = buffer_dimensions(&buffer).unwrap();
-    let phys_size = geometry
-        .size
-        .to_f64()
-        .to_physical(scale)
-        .to_i32_round();
+    let phys_size = geometry.size.to_f64().to_physical(scale).to_i32_round();
     let expected_size = Size::from((phys_size.w, phys_size.h));
     if buffer_size != expected_size {
-        let Some(constraints) = constraints_for_toplevel(toplevel, &mut state.backend, scale) else {
+        let Some(constraints) = constraints_for_toplevel(toplevel, &mut state.backend, scale)
+        else {
             toplevel.clone().remove_session(session);
             return;
         };
@@ -863,22 +867,29 @@ pub fn render_window_to_buffer(
 
         if cursor_count == 0 && surface_count == 1 {
             if let Some(mut src_dmabuf) = window_dmabuf {
-                let rect = Rectangle::from_size(geometry.size.to_f64().to_physical(scale).to_i32_round());
-                let src_size = src_dmabuf.size().to_logical(1, Transform::Normal).to_physical(1);
+                let rect =
+                    Rectangle::from_size(geometry.size.to_f64().to_physical(scale).to_i32_round());
+                let src_size = src_dmabuf
+                    .size()
+                    .to_logical(1, Transform::Normal)
+                    .to_physical(1);
                 if src_size == rect.size {
                     let sync_opt = if let Ok(dmabuf) = get_dmabuf(buffer) {
                         let mut dst_dmabuf = dmabuf.clone();
-                        match (renderer.bind(&mut src_dmabuf), renderer.bind(&mut dst_dmabuf)) {
-                            (Ok(src_fb), Ok(mut dst_fb)) => {
-                                renderer.blit(&src_fb, &mut dst_fb, rect, rect, TextureFilter::Nearest).ok()
-                            }
+                        match (
+                            renderer.bind(&mut src_dmabuf),
+                            renderer.bind(&mut dst_dmabuf),
+                        ) {
+                            (Ok(src_fb), Ok(mut dst_fb)) => renderer
+                                .blit(&src_fb, &mut dst_fb, rect, rect, TextureFilter::Nearest)
+                                .ok(),
                             _ => None,
                         }
                     } else if let Some(ref mut dst_fb) = offscreen {
                         match renderer.bind(&mut src_dmabuf) {
-                            Ok(src_fb) => {
-                                renderer.blit(&src_fb, dst_fb, rect, rect, TextureFilter::Nearest).ok()
-                            }
+                            Ok(src_fb) => renderer
+                                .blit(&src_fb, dst_fb, rect, rect, TextureFilter::Nearest)
+                                .ok(),
                             _ => None,
                         }
                     } else {
@@ -887,8 +898,9 @@ pub fn render_window_to_buffer(
 
                     if let Some(sync) = sync_opt {
                         let buffers = render_element_buffers(renderer, &elements);
-                        let (damage, states) =
-                            dt.damage_output(age, &elements).map_err(DTError::OutputNoMode)?;
+                        let (damage, states) = dt
+                            .damage_output(age, &elements)
+                            .map_err(DTError::OutputNoMode)?;
                         let res = RenderOutputResult {
                             damage,
                             sync,
@@ -897,7 +909,9 @@ pub fn render_window_to_buffer(
                         return Ok((res, buffers));
                     }
                 }
-                tracing::debug!("Direct window DMA blit not applicable or failed, using render_output fallback");
+                tracing::debug!(
+                    "Direct window DMA blit not applicable or failed, using render_output fallback"
+                );
             }
         }
 
