@@ -159,6 +159,9 @@ static DISABLE_DIRECT_SCANOUT: LazyLock<bool> =
 static DISABLE_CURSOR_PLANE: LazyLock<bool> =
     LazyLock::new(|| bool_var("COSMIC_DISABLE_CURSOR_PLANE").unwrap_or(false));
 
+static DISABLE_OVERLAY_SCANOUT: LazyLock<bool> =
+    LazyLock::new(|| bool_var("COSMIC_DISABLE_OVERLAY_SCANOUT").unwrap_or(false));
+
 const _30_HZ: Duration = Duration::from_nanos(1_000_000_000 / 30);
 
 #[cfg(feature = "debug")]
@@ -1636,8 +1639,7 @@ impl SurfaceThreadState {
         let _tearing =
             tearing_allowed_for(&self.output.name()) && has_active_fullscreen && prefers_async;
 
-        if has_active_fullscreen || animations_going {
-            // skip overlay plane assign if we have a fullscreen surface or dynamic contents to save on tests
+        if animations_going || *DISABLE_OVERLAY_SCANOUT {
             remove_frame_flags |= FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT;
         }
 
@@ -2191,7 +2193,7 @@ impl SurfaceThreadState {
                 | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY;
         }
 
-        if has_active_fullscreen || animations_going {
+        if animations_going || *DISABLE_OVERLAY_SCANOUT {
             remove_frame_flags |= FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT;
         }
 
