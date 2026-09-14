@@ -94,7 +94,13 @@ impl ImageCopyCaptureHandler for State {
                 if let Some(window) = window.upgrade() {
                     let scale = window
                         .wl_surface()
-                        .and_then(|surf| self.common.shell.read().visible_output_for_surface(&surf).cloned())
+                        .and_then(|surf| {
+                            self.common
+                                .shell
+                                .read()
+                                .visible_output_for_surface(&surf)
+                                .cloned()
+                        })
                         .map(|out| out.current_scale().fractional_scale())
                         .unwrap_or(1.0);
                     constraints_for_toplevel(&window, &mut self.backend, scale)
@@ -155,7 +161,13 @@ impl ImageCopyCaptureHandler for State {
 
                 let scale = toplevel
                     .wl_surface()
-                    .and_then(|surf| self.common.shell.read().visible_output_for_surface(&surf).cloned())
+                    .and_then(|surf| {
+                        self.common
+                            .shell
+                            .read()
+                            .visible_output_for_surface(&surf)
+                            .cloned()
+                    })
                     .map(|out| out.current_scale().fractional_scale())
                     .unwrap_or(1.0);
 
@@ -441,7 +453,9 @@ fn sort_constraints_for_hdr(
                 }
             });
             if let (Some(pref_code), Some(pref_mod)) = (preferred_format, preferred_modifier) {
-                if let Some((_, modifiers)) = dma.formats.iter_mut().find(|(code, _)| *code == pref_code) {
+                if let Some((_, modifiers)) =
+                    dma.formats.iter_mut().find(|(code, _)| *code == pref_code)
+                {
                     if let Some(pos) = modifiers.iter().position(|m| *m == pref_mod) {
                         let m = modifiers.remove(pos);
                         modifiers.insert(0, m);
@@ -485,7 +499,9 @@ fn sort_constraints_for_hdr(
                 }
             });
             if let (Some(pref_code), Some(pref_mod)) = (preferred_format, preferred_modifier) {
-                if let Some((_, modifiers)) = dma.formats.iter_mut().find(|(code, _)| *code == pref_code) {
+                if let Some((_, modifiers)) =
+                    dma.formats.iter_mut().find(|(code, _)| *code == pref_code)
+                {
                     if let Some(pos) = modifiers.iter().position(|m| *m == pref_mod) {
                         let m = modifiers.remove(pos);
                         modifiers.insert(0, m);
@@ -550,9 +566,7 @@ pub(crate) fn constraints_for_toplevel(
     .unwrap_or((None, None));
 
     let mut renderer = backend
-        .offscreen_renderer(|kms| {
-            dma_node.or(*kms.primary_node.read().unwrap())
-        })
+        .offscreen_renderer(|kms| dma_node.or(*kms.primary_node.read().unwrap()))
         .ok()?;
 
     let mut constraints = constraints_for_renderer(size, &mut renderer);

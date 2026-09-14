@@ -59,8 +59,8 @@ use smithay::{
         relative_pointer::RelativePointerManagerState,
     },
 };
-pub use surface::OutputSwapchainFormat;
 use surface::GbmDrmOutput;
+pub use surface::OutputSwapchainFormat;
 use tracing::{debug, error, info, warn};
 
 use std::{

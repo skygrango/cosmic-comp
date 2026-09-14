@@ -19,9 +19,7 @@ use crate::{
     },
     wayland::handlers::{
         compositor::{FULLSCREEN_IMMEDIATE_RENDER, recursive_frame_time_estimation},
-        image_copy_capture::{
-            FrameHolder, PendingImageCopyData, SessionData, submit_buffer,
-        },
+        image_copy_capture::{FrameHolder, PendingImageCopyData, SessionData, submit_buffer},
     },
 };
 
@@ -31,8 +29,7 @@ use cosmic_comp_config::output::comp::AdaptiveSync;
 use smithay::{
     backend::{
         allocator::{
-            Buffer,
-            Fourcc,
+            Buffer, Fourcc,
             format::FormatSet,
             gbm::{GbmAllocator, GbmBuffer},
         },
@@ -3058,10 +3055,12 @@ fn send_screencopy_result_vulkan<'a>(
         vec![],
     )
     .map_err(|err| {
-        tracing::error!("send_screencopy_result_vulkan: submit_buffer failed: {:#}", err);
+        tracing::error!(
+            "send_screencopy_result_vulkan: submit_buffer failed: {:#}",
+            err
+        );
         RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(err)
-    })?
-    {
+    })? {
         if shm_buffer || frame_result.is_empty {
             data.frame
                 .success(transform, data.damage, presentation_time);
