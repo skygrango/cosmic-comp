@@ -815,21 +815,25 @@ pub fn draw_cursor<R>(
             );
         state.current_image = Some(frame);
 
-        push(
-            CursorRenderElement::Static(
-                MemoryRenderBufferRenderElement::from_buffer(
-                    renderer,
-                    location.to_physical(scale),
-                    &pointer_image,
-                    None,
-                    None,
-                    None,
-                    Kind::Cursor,
-                )
-                .expect("Failed to import cursor bitmap"),
-            ),
-            hotspot.to_physical_precise_round(scale),
-        );
+        match MemoryRenderBufferRenderElement::from_buffer(
+            renderer,
+            location.to_physical(scale),
+            &pointer_image,
+            None,
+            None,
+            None,
+            Kind::Cursor,
+        ) {
+            Ok(element) => {
+                push(
+                    CursorRenderElement::Static(element),
+                    hotspot.to_physical_precise_round(scale),
+                );
+            }
+            Err(err) => {
+                warn!(?err, "Failed to import cursor bitmap");
+            }
+        }
     } else if let CursorImageStatus::Surface(ref wl_surface) = cursor_status {
         draw_surface_cursor(renderer, wl_surface, location, scale, blur_strength, push);
     }
