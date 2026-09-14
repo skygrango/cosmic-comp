@@ -153,3 +153,7 @@ cosmic-protocols = { git = "https://github.com/skygrango/cosmic-protocols", bran
 smithay-egui = { git = "https://github.com/Smithay/smithay-egui.git", rev = "6511552" }
 #smithay = { git = "https://github.com/skygrango/smithay.git", rev = "7f8a08f" }
 smithay = { path = "smithay" }
+drm = { path = "smithay/drm-rs" }
+drm-ffi = { path = "smithay/drm-rs/drm-ffi" }
+drm-sys = { path = "smithay/drm-rs/drm-ffi/drm-sys" }
+gbm = { path = "smithay/gbm-rs" }

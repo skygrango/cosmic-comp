@@ -1386,16 +1386,15 @@ dependencies = [
 
 [[package]]
 name = "drm"
-version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80bc8c5c6c2941f70a55c15f8d9f00f9710ebda3ffda98075f996a0e6c92756f"
+version = "0.15.0"
 dependencies = [
  "bitflags 2.13.2",
  "bytemuck",
+ "bytemuck_derive",
  "drm-ffi 0.9.1",
  "drm-fourcc",
  "libc",
- "rustix 0.38.44",
+ "rustix 1.1.4",
 ]
 
 [[package]]
@@ -1411,8 +1410,6 @@ dependencies = [
 [[package]]
 name = "drm-ffi"
 version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51a91c9b32ac4e8105dec255e849e0d66e27d7c34d184364fb93e469db08f690"
 dependencies = [
  "drm-sys 0.8.1",
  "rustix 1.1.4",
@@ -1437,8 +1434,6 @@ dependencies = [
 [[package]]
 name = "drm-sys"
 version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ecc8e1361066d91f5ffccff060a3c3be9c3ecde15be2959c1937595f7a82a9f8"
 dependencies = [
  "libc",
  "linux-raw-sys 0.9.4",
@@ -1988,11 +1983,9 @@ dependencies = [
 [[package]]
 name = "gbm"
 version = "0.18.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce852e998d3ca5e4a97014fb31c940dc5ef344ec7d364984525fd11e8a547e6a"
 dependencies = [
  "bitflags 2.13.2",
- "drm 0.14.1",
+ "drm 0.15.0",
  "drm-fourcc",
  "gbm-sys",
  "libc",
@@ -2001,8 +1994,6 @@ dependencies = [
 [[package]]
 name = "gbm-sys"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c13a5f2acc785d8fb6bf6b7ab6bfb0ef5dad4f4d97e8e70bb8e470722312f76f"
 dependencies = [
  "libc",
 ]
@@ -5100,7 +5091,7 @@ dependencies = [
  "cc",
  "cursor-icon",
  "downcast-rs",
- "drm 0.14.1",
+ "drm 0.15.0",
  "drm-ffi 0.9.1",
  "drm-fourcc",
  "drm-sys 0.8.1",

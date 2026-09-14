@@ -388,6 +388,63 @@ impl ImageCopyCaptureHandler for State {
     }
 }
 
+fn sort_constraints_for_hdr(constraints: &mut BufferConstraints, is_hdr: bool) {
+    if is_hdr {
+        constraints.shm.sort_by_key(|f| match f {
+            ShmFormat::Abgr2101010 => 0,
+            ShmFormat::Xbgr2101010 => 1,
+            ShmFormat::Argb2101010 => 2,
+            ShmFormat::Xrgb2101010 => 3,
+            ShmFormat::Abgr8888 => 4,
+            ShmFormat::Xbgr8888 => 5,
+            ShmFormat::Argb8888 => 6,
+            ShmFormat::Xrgb8888 => 7,
+            _ => 100,
+        });
+        if let Some(ref mut dma) = constraints.dma {
+            dma.formats.sort_by_key(|(f, _)| match *f {
+                Fourcc::Abgr2101010 => 0,
+                Fourcc::Xbgr2101010 => 1,
+                Fourcc::Argb2101010 => 2,
+                Fourcc::Xrgb2101010 => 3,
+                Fourcc::Abgr8888 => 4,
+                Fourcc::Xbgr8888 => 5,
+                Fourcc::Argb8888 => 6,
+                Fourcc::Xrgb8888 => 7,
+                _ => 100,
+            });
+        }
+    } else {
+        constraints.shm.retain(|f| !matches!(
+            f,
+            ShmFormat::Abgr2101010
+                | ShmFormat::Xbgr2101010
+                | ShmFormat::Argb2101010
+                | ShmFormat::Xrgb2101010
+        ));
+        constraints.shm.sort_by_key(|f| match f {
+            ShmFormat::Abgr8888 => 0,
+            ShmFormat::Xbgr8888 => 1,
+            ShmFormat::Argb8888 => 2,
+            ShmFormat::Xrgb8888 => 3,
+            _ => 100,
+        });
+        if let Some(ref mut dma) = constraints.dma {
+            dma.formats.sort_by_key(|(f, _)| match *f {
+                Fourcc::Abgr8888 => 0,
+                Fourcc::Xbgr8888 => 1,
+                Fourcc::Argb8888 => 2,
+                Fourcc::Xrgb8888 => 3,
+                Fourcc::Abgr2101010 => 10,
+                Fourcc::Xbgr2101010 => 11,
+                Fourcc::Argb2101010 => 12,
+                Fourcc::Xrgb2101010 => 13,
+                _ => 100,
+            });
+        }
+    }
+}
+
 fn constraints_for_output(output: &Output, backend: &mut BackendData) -> Option<BufferConstraints> {
     let mode = match output.current_mode() {
         Some(mode) => mode.size.to_logical(1).to_buffer(1, Transform::Normal),
@@ -396,13 +453,21 @@ fn constraints_for_output(output: &Output, backend: &mut BackendData) -> Option<
         }
     };
 
+    let is_hdr = output
+        .user_data()
+        .get::<crate::backend::kms::drm_helpers::HdrOutputState>()
+        .and_then(crate::backend::kms::drm_helpers::HdrOutputState::get)
+        .is_some();
+
     let mut renderer = backend
         .offscreen_renderer(|kms| {
             kms.target_node_for_output(output)
                 .or(*kms.primary_node.read().unwrap())
         })
         .ok()?;
-    Some(constraints_for_renderer(mode, &mut renderer))
+    let mut constraints = constraints_for_renderer(mode, &mut renderer);
+    sort_constraints_for_hdr(&mut constraints, is_hdr);
+    Some(constraints)
 }
 
 fn constraints_for_toplevel(
@@ -425,7 +490,9 @@ fn constraints_for_toplevel(
         })
         .ok()?;
 
-    Some(constraints_for_renderer(size, &mut renderer))
+    let mut constraints = constraints_for_renderer(size, &mut renderer);
+    sort_constraints_for_hdr(&mut constraints, false);
+    Some(constraints)
 }
 
 pub(crate) fn constraints_for_renderer(
