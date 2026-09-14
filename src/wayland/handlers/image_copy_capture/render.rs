@@ -61,6 +61,20 @@ use super::{
     super::data_device::get_dnd_icon, cursor_capture_constraints, user_data::SessionHolder,
 };
 
+pub fn is_hdr_buffer(buffer: &WlBuffer) -> bool {
+    let fourcc = match buffer_type(buffer) {
+        Some(BufferType::Dma) => get_dmabuf(buffer).ok().map(|d| d.format().code),
+        Some(BufferType::Shm) => {
+            with_buffer_contents(buffer, |_, _, data| shm_format_to_fourcc(data.format))
+                .ok()
+                .flatten()
+        }
+        _ => None,
+    };
+
+    fourcc.map(super::is_hdr_fourcc).unwrap_or(false)
+}
+
 pub fn render_element_buffers<R, E>(
     renderer: &mut R,
     elements: &[E],
@@ -104,14 +118,22 @@ impl PendingImageCopyData {
                 calloop::Interest::READ,
                 calloop::Mode::OneShot,
             );
-            let mut data = Some(self);
-            loop_handle
-                .insert_source(source, move |_, _, _| {
-                    let data = data.take().unwrap();
+            let data = std::sync::Arc::new(std::sync::Mutex::new(Some(self)));
+            let data_cb = data.clone();
+            if let Err(err) = loop_handle.insert_source(source, move |_, _, _| {
+                if let Some(data) = data_cb.lock().unwrap().take() {
                     data.frame.success(transform, data.damage, presented);
-                    Ok(calloop::PostAction::Remove)
-                })
-                .expect("Failed to wait on sync point");
+                }
+                Ok(calloop::PostAction::Remove)
+            }) {
+                warn!(
+                    "Failed to wait on sync point in event loop: {err:?}, falling back to sync wait"
+                );
+                if let Some(data) = data.lock().unwrap().take() {
+                    let _ = data.sync.wait();
+                    data.frame.success(transform, data.damage, presented);
+                }
+            }
         } else {
             // Should be able to export fence; but otherwise wait
             let _ = self.sync.wait();
@@ -433,6 +455,22 @@ pub fn render_workspace_to_buffer(
         return;
     }
 
+    if let Some(data) = session.user_data().get::<SessionData>() {
+        let mut user_data = data.lock().unwrap();
+        if let Some(expected_size) = mode {
+            let expected_mode = expected_size
+                .to_logical(1, Transform::Normal)
+                .to_physical(1);
+            let current_size = match user_data.dt.mode() {
+                smithay::output::OutputModeSource::Static { size, .. } => Some(*size),
+                _ => None,
+            };
+            if current_size != Some(expected_mode) {
+                *user_data = SessionUserData::new(OutputDamageTracker::from_output(&output));
+            }
+        }
+    }
+
     fn render_fn<'d, R>(
         buffer: &WlBuffer,
         renderer: &mut R,
@@ -627,14 +665,25 @@ pub fn render_workspace_to_buffer(
             }
         }
         RendererRef::VulkanMulti(mut renderer) => {
-            let is_output_hdr = output
+            let active_hdr = output
                 .user_data()
                 .get::<crate::backend::kms::drm_helpers::HdrOutputState>()
-                .and_then(crate::backend::kms::drm_helpers::HdrOutputState::get)
-                .is_some();
+                .and_then(crate::backend::kms::drm_helpers::HdrOutputState::get);
 
-            let hdr_config = if is_output_hdr {
-                Some(HdrOutputConfig::default())
+            let ref_white = active_hdr
+                .map(|a| a.reference_white as f32)
+                .unwrap_or(203.0);
+
+            let is_hdr = is_hdr_buffer(&frame.buffer());
+            let hdr_config = if is_hdr {
+                Some(HdrOutputConfig {
+                    reference_white: ref_white,
+                    sdr_gamma: 0.0,
+                    gamut_stretch: 0.0,
+                    max_luminance: ref_white,
+                    hardware_offload: true,
+                    is_sdr: false,
+                })
             } else {
                 Some(HdrOutputConfig::sdr_tonemapping())
             };
@@ -696,7 +745,7 @@ pub fn render_window_to_buffer(
         return;
     }
 
-    let scale = toplevel
+    let output = toplevel
         .wl_surface()
         .and_then(|surf| {
             state
@@ -706,8 +755,27 @@ pub fn render_window_to_buffer(
                 .visible_output_for_surface(&surf)
                 .cloned()
         })
+        .or_else(|| {
+            use crate::shell::SeatExt;
+            let shell = state.common.shell.read();
+            shell
+                .seats
+                .last_active()
+                .focused_output()
+                .or_else(|| shell.outputs().next().cloned())
+        });
+    let scale = output
+        .as_ref()
         .map(|out| out.current_scale().fractional_scale())
         .unwrap_or(1.0);
+    let is_hdr = output
+        .as_ref()
+        .and_then(|out| {
+            out.user_data()
+                .get::<crate::backend::kms::drm_helpers::HdrOutputState>()
+                .and_then(crate::backend::kms::drm_helpers::HdrOutputState::get)
+        })
+        .is_some();
 
     let buffer = frame.buffer();
     let geometry = toplevel.geometry();
@@ -715,7 +783,8 @@ pub fn render_window_to_buffer(
     let phys_size = geometry.size.to_f64().to_physical(scale).to_i32_round();
     let expected_size = Size::from((phys_size.w, phys_size.h));
     if buffer_size != expected_size {
-        let Some(constraints) = constraints_for_toplevel(toplevel, &mut state.backend, scale)
+        let Some(constraints) =
+            constraints_for_toplevel(toplevel, &mut state.backend, scale, is_hdr)
         else {
             toplevel.clone().remove_session(session);
             return;
@@ -729,6 +798,22 @@ pub fn render_window_to_buffer(
         }
         frame.fail(CaptureFailureReason::BufferConstraints);
         return;
+    }
+
+    if let Some(data) = session.user_data().get::<SessionData>() {
+        let mut user_data = data.lock().unwrap();
+        let expected_mode = buffer_size.to_logical(1, Transform::Normal).to_physical(1);
+        let current_size = match user_data.dt.mode() {
+            smithay::output::OutputModeSource::Static { size, .. } => Some(*size),
+            _ => None,
+        };
+        if current_size != Some(expected_mode) {
+            *user_data = SessionUserData::new(OutputDamageTracker::new(
+                expected_mode,
+                scale,
+                Transform::Normal,
+            ));
+        }
     }
 
     fn render_fn<'d, R>(
@@ -842,9 +927,11 @@ pub fn render_window_to_buffer(
         }
 
         let cursor_count = elements.len();
+        let loc_phys: Point<i32, Physical> =
+            geometry.loc.to_f64().to_physical(scale).to_i32_round();
         toplevel.push_render_elements(
             renderer,
-            (-geometry.loc.x, -geometry.loc.y).into(),
+            Point::from((-loc_phys.x, -loc_phys.y)),
             Scale::from(scale),
             1.0,
             None,
@@ -865,7 +952,7 @@ pub fn render_window_to_buffer(
             .flatten()
         });
 
-        if cursor_count == 0 && surface_count == 1 {
+        if cursor_count == 0 && surface_count == 1 && geometry.loc == (0, 0).into() {
             if let Some(mut src_dmabuf) = window_dmabuf {
                 let rect =
                     Rectangle::from_size(geometry.size.to_f64().to_physical(scale).to_i32_round());
@@ -875,15 +962,19 @@ pub fn render_window_to_buffer(
                     .to_physical(1);
                 if src_size == rect.size {
                     let sync_opt = if let Ok(dmabuf) = get_dmabuf(buffer) {
-                        let mut dst_dmabuf = dmabuf.clone();
-                        match (
-                            renderer.bind(&mut src_dmabuf),
-                            renderer.bind(&mut dst_dmabuf),
-                        ) {
-                            (Ok(src_fb), Ok(mut dst_fb)) => renderer
-                                .blit(&src_fb, &mut dst_fb, rect, rect, TextureFilter::Nearest)
-                                .ok(),
-                            _ => None,
+                        if src_dmabuf.format() == dmabuf.format() {
+                            let mut dst_dmabuf = dmabuf.clone();
+                            match (
+                                renderer.bind(&mut src_dmabuf),
+                                renderer.bind(&mut dst_dmabuf),
+                            ) {
+                                (Ok(src_fb), Ok(mut dst_fb)) => renderer
+                                    .blit(&src_fb, &mut dst_fb, rect, rect, TextureFilter::Nearest)
+                                    .ok(),
+                                _ => None,
+                            }
+                        } else {
+                            None
                         }
                     } else if let Some(ref mut dst_fb) = offscreen {
                         match renderer.bind(&mut src_dmabuf) {
@@ -1015,7 +1106,7 @@ pub fn render_window_to_buffer(
             }
         },
         RendererRef::VulkanMulti(mut renderer) => {
-            let is_output_hdr = toplevel
+            let active_hdr = toplevel
                 .wl_surface()
                 .and_then(|surf| {
                     common
@@ -1024,16 +1115,36 @@ pub fn render_window_to_buffer(
                         .visible_output_for_surface(&surf)
                         .cloned()
                 })
+                .or_else(|| {
+                    use crate::shell::SeatExt;
+                    let shell = common.shell.read();
+                    shell
+                        .seats
+                        .last_active()
+                        .focused_output()
+                        .or_else(|| shell.outputs().next().cloned())
+                })
                 .and_then(|output| {
                     output
                         .user_data()
                         .get::<crate::backend::kms::drm_helpers::HdrOutputState>()
                         .and_then(crate::backend::kms::drm_helpers::HdrOutputState::get)
-                })
-                .is_some();
+                });
 
-            let hdr_config = if is_output_hdr {
-                Some(HdrOutputConfig::default())
+            let ref_white = active_hdr
+                .map(|a| a.reference_white as f32)
+                .unwrap_or(203.0);
+
+            let is_hdr = is_hdr_buffer(&frame.buffer());
+            let hdr_config = if is_hdr {
+                Some(HdrOutputConfig {
+                    reference_white: ref_white,
+                    sdr_gamma: 0.0,
+                    gamut_stretch: 0.0,
+                    max_luminance: ref_white,
+                    hardware_offload: true,
+                    is_sdr: false,
+                })
             } else {
                 Some(HdrOutputConfig::sdr_tonemapping())
             };
@@ -1104,6 +1215,22 @@ pub fn render_cursor_to_buffer(
         return;
     }
 
+    if let Some(data) = session.user_data().get::<SessionData>() {
+        let mut user_data = data.lock().unwrap();
+        let expected_mode = buffer_size.to_logical(1, Transform::Normal).to_physical(1);
+        let current_size = match user_data.dt.mode() {
+            smithay::output::OutputModeSource::Static { size, .. } => Some(*size),
+            _ => None,
+        };
+        if current_size != Some(expected_mode) {
+            *user_data = SessionUserData::new(OutputDamageTracker::new(
+                expected_mode,
+                1.0,
+                Transform::Normal,
+            ));
+        }
+    }
+
     fn render_fn<'d, R>(
         buffer: &WlBuffer,
         renderer: &mut R,
@@ -1126,11 +1253,14 @@ pub fn render_cursor_to_buffer(
         CosmicElement<R>: RenderElement<R>,
         CosmicMappedRenderElement<R>: RenderElement<R>,
     {
+        let buffer_size = buffer_dimensions(buffer).unwrap_or_else(|| Size::from((64, 64)));
         let mut elements: Vec<_> = additional_damage
             .into_iter()
             .filter_map(|rect| {
-                let logical_rect = rect.to_logical(1, Transform::Normal, &Size::from((64, 64)));
-                logical_rect.intersection(Rectangle::from_size((64, 64).into()))
+                let logical_rect = rect.to_logical(1, Transform::Normal, &buffer_size);
+                logical_rect.intersection(Rectangle::from_size(
+                    buffer_size.to_logical(1, Transform::Normal),
+                ))
             })
             .map(DamageElement::new)
             .map(WindowCaptureElement::from)

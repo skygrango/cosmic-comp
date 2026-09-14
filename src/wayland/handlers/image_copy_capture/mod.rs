@@ -92,7 +92,7 @@ impl ImageCopyCaptureHandler for State {
             }
             ImageCaptureSourceKind::Toplevel(window) => {
                 if let Some(window) = window.upgrade() {
-                    let scale = window
+                    let output = window
                         .wl_surface()
                         .and_then(|surf| {
                             self.common
@@ -101,9 +101,28 @@ impl ImageCopyCaptureHandler for State {
                                 .visible_output_for_surface(&surf)
                                 .cloned()
                         })
+                        .or_else(|| {
+                            use crate::shell::SeatExt;
+                            let shell = self.common.shell.read();
+                            shell
+                                .seats
+                                .last_active()
+                                .focused_output()
+                                .or_else(|| shell.outputs().next().cloned())
+                        });
+                    let scale = output
+                        .as_ref()
                         .map(|out| out.current_scale().fractional_scale())
                         .unwrap_or(1.0);
-                    constraints_for_toplevel(&window, &mut self.backend, scale)
+                    let is_hdr = output
+                        .as_ref()
+                        .and_then(|out| {
+                            out.user_data()
+                                .get::<crate::backend::kms::drm_helpers::HdrOutputState>()
+                                .and_then(crate::backend::kms::drm_helpers::HdrOutputState::get)
+                        })
+                        .is_some();
+                    constraints_for_toplevel(&window, &mut self.backend, scale, is_hdr)
                 } else {
                     None
                 }
@@ -416,6 +435,20 @@ impl ImageCopyCaptureHandler for State {
     }
 }
 
+pub fn is_hdr_fourcc(format: Fourcc) -> bool {
+    matches!(
+        format,
+        Fourcc::Abgr2101010
+            | Fourcc::Xbgr2101010
+            | Fourcc::Argb2101010
+            | Fourcc::Xrgb2101010
+            | Fourcc::Abgr16161616f
+            | Fourcc::Xbgr16161616f
+            | Fourcc::Argb16161616f
+            | Fourcc::Xrgb16161616f
+    )
+}
+
 fn sort_constraints_for_hdr(
     constraints: &mut BufferConstraints,
     is_hdr: bool,
@@ -435,8 +468,9 @@ fn sort_constraints_for_hdr(
             _ => 100,
         });
         if let Some(ref mut dma) = constraints.dma {
+            let pref_is_hdr = preferred_format.map(is_hdr_fourcc).unwrap_or(false);
             dma.formats.sort_by_key(|(f, _)| {
-                if Some(*f) == preferred_format {
+                if pref_is_hdr && Some(*f) == preferred_format {
                     -1i32
                 } else {
                     match *f {
@@ -452,13 +486,15 @@ fn sort_constraints_for_hdr(
                     }
                 }
             });
-            if let (Some(pref_code), Some(pref_mod)) = (preferred_format, preferred_modifier) {
-                if let Some((_, modifiers)) =
-                    dma.formats.iter_mut().find(|(code, _)| *code == pref_code)
-                {
-                    if let Some(pos) = modifiers.iter().position(|m| *m == pref_mod) {
-                        let m = modifiers.remove(pos);
-                        modifiers.insert(0, m);
+            if pref_is_hdr {
+                if let (Some(pref_code), Some(pref_mod)) = (preferred_format, preferred_modifier) {
+                    if let Some((_, modifiers)) =
+                        dma.formats.iter_mut().find(|(code, _)| *code == pref_code)
+                    {
+                        if let Some(pos) = modifiers.iter().position(|m| *m == pref_mod) {
+                            let m = modifiers.remove(pos);
+                            modifiers.insert(0, m);
+                        }
                     }
                 }
             }
@@ -481,8 +517,10 @@ fn sort_constraints_for_hdr(
             _ => 100,
         });
         if let Some(ref mut dma) = constraints.dma {
+            dma.formats.retain(|(f, _)| !is_hdr_fourcc(*f));
+            let pref_is_sdr = preferred_format.map(|f| !is_hdr_fourcc(f)).unwrap_or(false);
             dma.formats.sort_by_key(|(f, _)| {
-                if Some(*f) == preferred_format {
+                if pref_is_sdr && Some(*f) == preferred_format {
                     -1i32
                 } else {
                     match *f {
@@ -490,21 +528,19 @@ fn sort_constraints_for_hdr(
                         Fourcc::Xbgr8888 => 1,
                         Fourcc::Argb8888 => 2,
                         Fourcc::Xrgb8888 => 3,
-                        Fourcc::Abgr2101010 => 10,
-                        Fourcc::Xbgr2101010 => 11,
-                        Fourcc::Argb2101010 => 12,
-                        Fourcc::Xrgb2101010 => 13,
                         _ => 100,
                     }
                 }
             });
-            if let (Some(pref_code), Some(pref_mod)) = (preferred_format, preferred_modifier) {
-                if let Some((_, modifiers)) =
-                    dma.formats.iter_mut().find(|(code, _)| *code == pref_code)
-                {
-                    if let Some(pos) = modifiers.iter().position(|m| *m == pref_mod) {
-                        let m = modifiers.remove(pos);
-                        modifiers.insert(0, m);
+            if pref_is_sdr {
+                if let (Some(pref_code), Some(pref_mod)) = (preferred_format, preferred_modifier) {
+                    if let Some((_, modifiers)) =
+                        dma.formats.iter_mut().find(|(code, _)| *code == pref_code)
+                    {
+                        if let Some(pos) = modifiers.iter().position(|m| *m == pref_mod) {
+                            let m = modifiers.remove(pos);
+                            modifiers.insert(0, m);
+                        }
                     }
                 }
             }
@@ -546,6 +582,7 @@ pub(crate) fn constraints_for_toplevel(
     surface: &CosmicSurface,
     backend: &mut BackendData,
     scale: f64,
+    is_hdr: bool,
 ) -> Option<BufferConstraints> {
     let phys_size = surface
         .geometry()
@@ -571,10 +608,24 @@ pub(crate) fn constraints_for_toplevel(
 
     let mut constraints = constraints_for_renderer(size, &mut renderer);
     let (pref_code, pref_mod) = match window_format {
-        Some(fmt) => (Some(fmt.code), Some(fmt.modifier)),
-        None => (None, None),
+        Some(fmt) if is_hdr => {
+            if is_hdr_fourcc(fmt.code) {
+                (Some(fmt.code), Some(fmt.modifier))
+            } else {
+                (Some(Fourcc::Abgr2101010), None)
+            }
+        }
+        Some(fmt) => {
+            if !is_hdr_fourcc(fmt.code) {
+                (Some(fmt.code), Some(fmt.modifier))
+            } else {
+                (Some(Fourcc::Abgr8888), None)
+            }
+        }
+        None if is_hdr => (Some(Fourcc::Abgr2101010), None),
+        None => (Some(Fourcc::Abgr8888), None),
     };
-    sort_constraints_for_hdr(&mut constraints, false, pref_code, pref_mod);
+    sort_constraints_for_hdr(&mut constraints, is_hdr, pref_code, pref_mod);
     Some(constraints)
 }
 
