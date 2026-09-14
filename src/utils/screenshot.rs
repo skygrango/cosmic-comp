@@ -20,7 +20,13 @@ use crate::{
 };
 
 pub fn screenshot_window(state: &mut State, surface: &CosmicSurface) {
-    fn render_window<R>(renderer: &mut R, window: &CosmicSurface) -> anyhow::Result<()>
+    let scale = surface
+        .wl_surface()
+        .and_then(|surf| state.common.shell.read().visible_output_for_surface(&surf).cloned())
+        .map(|out| out.current_scale().fractional_scale())
+        .unwrap_or(1.0);
+
+    fn render_window<R>(renderer: &mut R, window: &CosmicSurface, scale: f64) -> anyhow::Result<()>
     where
         R: Renderer + ImportAll + Offscreen<GlesRenderbuffer> + ExportMem + AsGlowRenderer,
         R::TextureId: Send + Clone + 'static,
@@ -31,7 +37,7 @@ pub fn screenshot_window(state: &mut State, surface: &CosmicSurface) {
         window.push_render_elements(
             renderer,
             (-bbox.loc.x, -bbox.loc.y).into(),
-            Scale::from(1.0),
+            Scale::from(scale),
             1.0,
             None,
             None,
@@ -44,14 +50,16 @@ pub fn screenshot_window(state: &mut State, surface: &CosmicSurface) {
 
         // TODO: 10-bit
         let format = Fourcc::Abgr8888;
+        let phys_size = bbox.size.to_f64().to_physical(scale).to_i32_round();
+        let buf_size = smithay::utils::Size::from((phys_size.w, phys_size.h));
         let mut render_buffer = Offscreen::<GlesRenderbuffer>::create_buffer(
             renderer,
             format,
-            bbox.size.to_buffer(1, Transform::Normal),
+            buf_size,
         )?;
         let mut fb = renderer.bind(&mut render_buffer)?;
         let mut output_damage_tracker =
-            OutputDamageTracker::new(bbox.size.to_physical(1), 1.0, Transform::Normal);
+            OutputDamageTracker::new(phys_size, scale, Transform::Normal);
         output_damage_tracker
             .render_output(renderer, &mut fb, 0, &elements, [0.0, 0.0, 0.0, 0.0])
             .map_err(|err| match err {
@@ -60,7 +68,7 @@ pub fn screenshot_window(state: &mut State, surface: &CosmicSurface) {
             })?;
         let mapping = renderer.copy_framebuffer(
             &fb,
-            bbox.to_buffer(1, Transform::Normal, &bbox.size),
+            smithay::utils::Rectangle::from_size(buf_size),
             format,
         )?;
         let gl_data = renderer.map_texture(&mapping)?;
@@ -77,7 +85,7 @@ pub fn screenshot_window(state: &mut State, surface: &CosmicSurface) {
             let file = std::fs::File::create(path.join(name))?;
 
             let writer = &mut std::io::BufWriter::new(file);
-            let mut encoder = png::Encoder::new(writer, bbox.size.w as u32, bbox.size.h as u32);
+            let mut encoder = png::Encoder::new(writer, phys_size.w as u32, phys_size.h as u32);
             encoder.set_color(png::ColorType::Rgba);
             encoder.set_depth(png::BitDepth::Eight);
             encoder.set_source_gamma(png::ScaledFloat::new(1.0 / 2.2)); // 1.0 / 2.2, unscaled, but rounded
@@ -105,8 +113,8 @@ pub fn screenshot_window(state: &mut State, surface: &CosmicSurface) {
             })
             .with_context(|| "Failed to get renderer for screenshot")
             .and_then(|renderer| match renderer {
-                RendererRef::Glow(renderer) => render_window(renderer, surface),
-                RendererRef::GlMulti(mut renderer) => render_window(&mut renderer, surface),
+                RendererRef::Glow(renderer) => render_window(renderer, surface, scale),
+                RendererRef::GlMulti(mut renderer) => render_window(&mut renderer, surface, scale),
                 RendererRef::VulkanMulti(_) => {
                     anyhow::bail!("Window context menu screenshot not implemented for Vulkan; use xdg-desktop-portal-cosmic")
                 }

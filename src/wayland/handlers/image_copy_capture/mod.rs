@@ -4,7 +4,7 @@ use std::{borrow::Borrow, collections::HashMap, sync::Mutex};
 
 use smithay::{
     backend::{
-        allocator::{Fourcc, Modifier},
+        allocator::{Buffer, Fourcc, Modifier},
         egl::EGLDevice,
         renderer::{
             damage::OutputDamageTracker,
@@ -92,7 +92,12 @@ impl ImageCopyCaptureHandler for State {
             }
             ImageCaptureSourceKind::Toplevel(window) => {
                 if let Some(window) = window.upgrade() {
-                    constraints_for_toplevel(&window, &mut self.backend)
+                    let scale = window
+                        .wl_surface()
+                        .and_then(|surf| self.common.shell.read().visible_output_for_surface(&surf).cloned())
+                        .map(|out| out.current_scale().fractional_scale())
+                        .unwrap_or(1.0);
+                    constraints_for_toplevel(&window, &mut self.backend, scale)
                 } else {
                     None
                 }
@@ -148,11 +153,22 @@ impl ImageCopyCaptureHandler for State {
                     return;
                 };
 
-                let size = toplevel.geometry().size.to_physical(1);
+                let scale = toplevel
+                    .wl_surface()
+                    .and_then(|surf| self.common.shell.read().visible_output_for_surface(&surf).cloned())
+                    .map(|out| out.current_scale().fractional_scale())
+                    .unwrap_or(1.0);
+
+                let size = toplevel
+                    .geometry()
+                    .size
+                    .to_f64()
+                    .to_physical(scale)
+                    .to_i32_round();
                 session.user_data().insert_if_missing_threadsafe(|| {
                     Mutex::new(SessionUserData::new(OutputDamageTracker::new(
                         size,
-                        1.0,
+                        scale,
                         Transform::Normal,
                     )))
                 });
@@ -388,7 +404,12 @@ impl ImageCopyCaptureHandler for State {
     }
 }
 
-fn sort_constraints_for_hdr(constraints: &mut BufferConstraints, is_hdr: bool) {
+fn sort_constraints_for_hdr(
+    constraints: &mut BufferConstraints,
+    is_hdr: bool,
+    preferred_format: Option<Fourcc>,
+    preferred_modifier: Option<Modifier>,
+) {
     if is_hdr {
         constraints.shm.sort_by_key(|f| match f {
             ShmFormat::Abgr2101010 => 0,
@@ -402,17 +423,31 @@ fn sort_constraints_for_hdr(constraints: &mut BufferConstraints, is_hdr: bool) {
             _ => 100,
         });
         if let Some(ref mut dma) = constraints.dma {
-            dma.formats.sort_by_key(|(f, _)| match *f {
-                Fourcc::Abgr2101010 => 0,
-                Fourcc::Xbgr2101010 => 1,
-                Fourcc::Argb2101010 => 2,
-                Fourcc::Xrgb2101010 => 3,
-                Fourcc::Abgr8888 => 4,
-                Fourcc::Xbgr8888 => 5,
-                Fourcc::Argb8888 => 6,
-                Fourcc::Xrgb8888 => 7,
-                _ => 100,
+            dma.formats.sort_by_key(|(f, _)| {
+                if Some(*f) == preferred_format {
+                    -1i32
+                } else {
+                    match *f {
+                        Fourcc::Abgr2101010 => 0,
+                        Fourcc::Xbgr2101010 => 1,
+                        Fourcc::Argb2101010 => 2,
+                        Fourcc::Xrgb2101010 => 3,
+                        Fourcc::Abgr8888 => 4,
+                        Fourcc::Xbgr8888 => 5,
+                        Fourcc::Argb8888 => 6,
+                        Fourcc::Xrgb8888 => 7,
+                        _ => 100,
+                    }
+                }
             });
+            if let (Some(pref_code), Some(pref_mod)) = (preferred_format, preferred_modifier) {
+                if let Some((_, modifiers)) = dma.formats.iter_mut().find(|(code, _)| *code == pref_code) {
+                    if let Some(pos) = modifiers.iter().position(|m| *m == pref_mod) {
+                        let m = modifiers.remove(pos);
+                        modifiers.insert(0, m);
+                    }
+                }
+            }
         }
     } else {
         constraints.shm.retain(|f| {
@@ -432,17 +467,31 @@ fn sort_constraints_for_hdr(constraints: &mut BufferConstraints, is_hdr: bool) {
             _ => 100,
         });
         if let Some(ref mut dma) = constraints.dma {
-            dma.formats.sort_by_key(|(f, _)| match *f {
-                Fourcc::Abgr8888 => 0,
-                Fourcc::Xbgr8888 => 1,
-                Fourcc::Argb8888 => 2,
-                Fourcc::Xrgb8888 => 3,
-                Fourcc::Abgr2101010 => 10,
-                Fourcc::Xbgr2101010 => 11,
-                Fourcc::Argb2101010 => 12,
-                Fourcc::Xrgb2101010 => 13,
-                _ => 100,
+            dma.formats.sort_by_key(|(f, _)| {
+                if Some(*f) == preferred_format {
+                    -1i32
+                } else {
+                    match *f {
+                        Fourcc::Abgr8888 => 0,
+                        Fourcc::Xbgr8888 => 1,
+                        Fourcc::Argb8888 => 2,
+                        Fourcc::Xrgb8888 => 3,
+                        Fourcc::Abgr2101010 => 10,
+                        Fourcc::Xbgr2101010 => 11,
+                        Fourcc::Argb2101010 => 12,
+                        Fourcc::Xrgb2101010 => 13,
+                        _ => 100,
+                    }
+                }
             });
+            if let (Some(pref_code), Some(pref_mod)) = (preferred_format, preferred_modifier) {
+                if let Some((_, modifiers)) = dma.formats.iter_mut().find(|(code, _)| *code == pref_code) {
+                    if let Some(pos) = modifiers.iter().position(|m| *m == pref_mod) {
+                        let m = modifiers.remove(pos);
+                        modifiers.insert(0, m);
+                    }
+                }
+            }
         }
     }
 }
@@ -461,6 +510,11 @@ fn constraints_for_output(output: &Output, backend: &mut BackendData) -> Option<
         .and_then(crate::backend::kms::drm_helpers::HdrOutputState::get)
         .is_some();
 
+    let preferred_format = output
+        .user_data()
+        .get::<crate::backend::kms::OutputSwapchainFormat>()
+        .and_then(|f| *f.0.lock().unwrap());
+
     let mut renderer = backend
         .offscreen_renderer(|kms| {
             kms.target_node_for_output(output)
@@ -468,32 +522,45 @@ fn constraints_for_output(output: &Output, backend: &mut BackendData) -> Option<
         })
         .ok()?;
     let mut constraints = constraints_for_renderer(mode, &mut renderer);
-    sort_constraints_for_hdr(&mut constraints, is_hdr);
+    sort_constraints_for_hdr(&mut constraints, is_hdr, preferred_format, None);
     Some(constraints)
 }
 
-fn constraints_for_toplevel(
+pub(crate) fn constraints_for_toplevel(
     surface: &CosmicSurface,
     backend: &mut BackendData,
+    scale: f64,
 ) -> Option<BufferConstraints> {
-    let size = surface.geometry().size.to_buffer(1, Transform::Normal);
+    let phys_size = surface
+        .geometry()
+        .size
+        .to_f64()
+        .to_physical(scale)
+        .to_i32_round();
+    let size = Size::from((phys_size.w, phys_size.h));
     let wl_surface = surface.wl_surface()?;
+
+    let (dma_node, window_format) = with_renderer_surface_state(&wl_surface, |state| {
+        let buffer = state.buffer()?;
+        let dmabuf = get_dmabuf(buffer).ok()?;
+        Some((dmabuf.node(), dmabuf.format()))
+    })
+    .flatten()
+    .map(|(node, fmt)| (node, Some(fmt)))
+    .unwrap_or((None, None));
 
     let mut renderer = backend
         .offscreen_renderer(|kms| {
-            let dma_node = with_renderer_surface_state(&wl_surface, |state| {
-                let buffer = state.buffer()?;
-                let dmabuf = get_dmabuf(buffer).ok()?;
-                dmabuf.node()
-            })
-            .flatten();
-
             dma_node.or(*kms.primary_node.read().unwrap())
         })
         .ok()?;
 
     let mut constraints = constraints_for_renderer(size, &mut renderer);
-    sort_constraints_for_hdr(&mut constraints, false);
+    let (pref_code, pref_mod) = match window_format {
+        Some(fmt) => (Some(fmt.code), Some(fmt.modifier)),
+        None => (None, None),
+    };
+    sort_constraints_for_hdr(&mut constraints, false, pref_code, pref_mod);
     Some(constraints)
 }
 

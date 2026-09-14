@@ -19,7 +19,9 @@ use crate::{
     },
     wayland::handlers::{
         compositor::{FULLSCREEN_IMMEDIATE_RENDER, recursive_frame_time_estimation},
-        image_copy_capture::{FrameHolder, PendingImageCopyData, SessionData, submit_buffer},
+        image_copy_capture::{
+            FrameHolder, PendingImageCopyData, SessionData, submit_buffer,
+        },
     },
 };
 
@@ -29,6 +31,7 @@ use cosmic_comp_config::output::comp::AdaptiveSync;
 use smithay::{
     backend::{
         allocator::{
+            Buffer,
             Fourcc,
             format::FormatSet,
             gbm::{GbmAllocator, GbmBuffer},
@@ -313,6 +316,9 @@ pub type GbmDrmOutput = DrmOutput<
     )>,
     DrmDeviceFd,
 >;
+
+#[derive(Debug, Default)]
+pub struct OutputSwapchainFormat(pub std::sync::Mutex<Option<Fourcc>>);
 
 #[derive(Debug, Default)]
 pub enum QueueState {
@@ -1069,6 +1075,12 @@ impl SurfaceThreadState {
     fn resume(&mut self, compositor: GbmDrmOutput) {
         if let Ok(caps) = compositor.scanout_capabilities() {
             self.output.set_scanout_capabilities(caps);
+        }
+        self.output
+            .user_data()
+            .insert_if_missing_threadsafe(OutputSwapchainFormat::default);
+        if let Some(format_data) = self.output.user_data().get::<OutputSwapchainFormat>() {
+            *format_data.0.lock().unwrap() = Some(compositor.format());
         }
         let (mode, min_hz) = compositor.with_compositor(|c| {
             (
@@ -2154,6 +2166,13 @@ impl SurfaceThreadState {
             unreachable!()
         };
 
+        self.output
+            .user_data()
+            .insert_if_missing_threadsafe(OutputSwapchainFormat::default);
+        if let Some(format_data) = self.output.user_data().get::<OutputSwapchainFormat>() {
+            *format_data.0.lock().unwrap() = Some(compositor.format());
+        }
+
         let mut renderer = if !is_same_gpu(&render_node, &self.target_node) {
             api.renderer(&render_node, &self.target_node, compositor.format())
                 .map_err(|err| anyhow::format_err!("Failed to create renderer: {:?}", err))?
@@ -2313,7 +2332,7 @@ impl SurfaceThreadState {
                                 (&session, frame, res),
                                 now.into(),
                             ) {
-                                tracing::warn!(?err, "Failed to screencopy in Vulkan");
+                                tracing::error!("Failed to screencopy in Vulkan: {err:#}");
                             }
                         }
 
@@ -2906,10 +2925,22 @@ fn send_screencopy_result_vulkan<'a>(
     };
     let mut fb = if let Ok(dmabuf) = get_dmabuf(&buffer) {
         dmabuf_clone = dmabuf.clone();
+        tracing::debug!(
+            output = %output.name(),
+            format = ?dmabuf.format(),
+            size = ?buffer_size,
+            "send_screencopy_result_vulkan: binding target DMA-BUF"
+        );
         Some(
             renderer
                 .bind(&mut dmabuf_clone)
-                .map_err(RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering)?,
+                .map_err(|err| {
+                    tracing::error!(
+                        "send_screencopy_result_vulkan: failed to bind target DMA-BUF (format={:?}, size={:?}): {:#}",
+                        dmabuf.format(), buffer_size, err
+                    );
+                    RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(err)
+                })?,
         )
     } else {
         shm_buffer = true;
@@ -2917,16 +2948,35 @@ fn send_screencopy_result_vulkan<'a>(
             .map_err(|_| OutputNoMode)?
             .expect("We should be able to convert all hardcoded shm screencopy formats");
 
+        tracing::debug!(
+            output = %output.name(),
+            format = ?format,
+            size = ?buffer_size,
+            "send_screencopy_result_vulkan: allocating offscreen buffer for SHM screencopy"
+        );
+
         render_buffer = Offscreen::<smithay::backend::vulkan::image::VulkanImage>::create_buffer(
             renderer,
             format,
             buffer_size,
         )
-        .map_err(RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering)?;
+        .map_err(|err| {
+            tracing::error!(
+                "send_screencopy_result_vulkan: create_buffer failed for SHM (format={:?}, size={:?}): {:#}",
+                format, buffer_size, err
+            );
+            RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(err)
+        })?;
         Some(
             renderer
                 .bind(&mut render_buffer)
-                .map_err(RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering)?,
+                .map_err(|err| {
+                    tracing::error!(
+                        "send_screencopy_result_vulkan: bind render_buffer failed for SHM (format={:?}, size={:?}): {:#}",
+                        format, buffer_size, err
+                    );
+                    RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(err)
+                })?,
         )
     };
 
@@ -2977,14 +3027,20 @@ fn send_screencopy_result_vulkan<'a>(
                 adjusted,
                 filter,
             )
-            .map_err(|err| match err {
-                BlitFrameResultError::Rendering(err) => {
-                    RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(err)
-                }
-                BlitFrameResultError::Export(_) => {
-                    RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(
-                        MultiError::DeviceMissing,
-                    )
+            .map_err(|err| {
+                tracing::error!(
+                    "send_screencopy_result_vulkan: blit_frame_result failed: {:#}",
+                    err
+                );
+                match err {
+                    BlitFrameResultError::Rendering(err) => {
+                        RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(err)
+                    }
+                    BlitFrameResultError::Export(_) => {
+                        RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(
+                            MultiError::DeviceMissing,
+                        )
+                    }
                 }
             })?;
     }
@@ -3001,7 +3057,10 @@ fn send_screencopy_result_vulkan<'a>(
         // Don't reference `Buffer`s since we blit from framebuffer/postprocess buffer
         vec![],
     )
-    .map_err(RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering)?
+    .map_err(|err| {
+        tracing::error!("send_screencopy_result_vulkan: submit_buffer failed: {:#}", err);
+        RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(err)
+    })?
     {
         if shm_buffer || frame_result.is_empty {
             data.frame

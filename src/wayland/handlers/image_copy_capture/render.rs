@@ -3,10 +3,10 @@
 use calloop::LoopHandle;
 use smithay::{
     backend::{
-        allocator::{Buffer, Fourcc, format::get_transparent},
+        allocator::{dmabuf::Dmabuf, Buffer, Fourcc, format::get_transparent},
         renderer::{
             Bind, BufferType, Color32F, ExportMem, ImportAll, ImportMem, Offscreen, Renderer,
-            Texture, buffer_dimensions, buffer_type,
+            Texture, TextureFilter, buffer_dimensions, buffer_type,
             damage::{Error as DTError, OutputDamageTracker, RenderOutputResult},
             element::{
                 RenderElement, UnderlyingStorage,
@@ -359,7 +359,10 @@ where
 
         if session_user_data.offscreen.is_none() {
             let image = Offscreen::<VulkanImage>::create_buffer(renderer, format, size)
-                .map_err(DTError::Rendering)?;
+                .map_err(|err| {
+                    tracing::error!("render_session_vulkan: Offscreen::create_buffer failed (format={:?}, size={:?}): {err:#}", format, size);
+                    DTError::Rendering(err)
+                })?;
             session_user_data.offscreen = Some(OffscreenBuffer::Vulkan(image));
             age = 0;
         }
@@ -369,7 +372,10 @@ where
 
     let SessionUserData { dt, offscreen } = &mut *session_user_data;
     let mut fb = match offscreen.as_mut() {
-        Some(OffscreenBuffer::Vulkan(img)) => Some(renderer.bind(img).map_err(DTError::Rendering)?),
+        Some(OffscreenBuffer::Vulkan(img)) => Some(renderer.bind(img).map_err(|err| {
+            tracing::error!("render_session_vulkan: renderer.bind(offscreen) failed: {err:#}");
+            DTError::Rendering(err)
+        })?),
         _ => None,
     };
     let (result, buffers) = render_fn(
@@ -587,7 +593,7 @@ pub fn render_workspace_to_buffer(
             ) {
                 Ok(frame) => frame,
                 Err(err) => {
-                    tracing::warn!(?err, "Failed to render to screencopy buffer");
+                    tracing::error!("Failed to render to screencopy buffer: {err:#}");
                     None
                 }
             }
@@ -615,35 +621,19 @@ pub fn render_workspace_to_buffer(
             ) {
                 Ok(frame) => frame,
                 Err(err) => {
-                    tracing::warn!(?err, "Failed to render to screencopy buffer");
+                    tracing::error!("Failed to render to screencopy buffer: {err:#}");
                     None
                 }
             }
         }
         RendererRef::VulkanMulti(mut renderer) => {
-            let is_hdr_buffer = match buffer_type(&buffer) {
-                Some(BufferType::Dma) => get_dmabuf(&buffer)
-                    .ok()
-                    .map(|dmabuf| match dmabuf.format().code {
-                        Fourcc::Abgr2101010
-                        | Fourcc::Xbgr2101010
-                        | Fourcc::Argb2101010
-                        | Fourcc::Xrgb2101010 => true,
-                        _ => false,
-                    })
-                    .unwrap_or(false),
-                Some(BufferType::Shm) => with_buffer_contents(&buffer, |_, _, data| match data.format {
-                    smithay::reexports::wayland_server::protocol::wl_shm::Format::Abgr2101010
-                    | smithay::reexports::wayland_server::protocol::wl_shm::Format::Xbgr2101010
-                    | smithay::reexports::wayland_server::protocol::wl_shm::Format::Argb2101010
-                    | smithay::reexports::wayland_server::protocol::wl_shm::Format::Xrgb2101010 => true,
-                    _ => false,
-                })
-                .unwrap_or(false),
-                _ => false,
-            };
+            let is_output_hdr = output
+                .user_data()
+                .get::<crate::backend::kms::drm_helpers::HdrOutputState>()
+                .and_then(crate::backend::kms::drm_helpers::HdrOutputState::get)
+                .is_some();
 
-            let hdr_config = if is_hdr_buffer {
+            let hdr_config = if is_output_hdr {
                 Some(HdrOutputConfig::default())
             } else {
                 Some(HdrOutputConfig::sdr_tonemapping())
@@ -672,7 +662,7 @@ pub fn render_workspace_to_buffer(
             ) {
                 Ok(frame) => frame,
                 Err(err) => {
-                    tracing::warn!(?err, "Failed to render to screencopy buffer");
+                    tracing::error!("Failed to render to screencopy buffer: {err:#}");
                     None
                 }
             }
@@ -706,20 +696,32 @@ pub fn render_window_to_buffer(
         return;
     }
 
+    let scale = toplevel
+        .wl_surface()
+        .and_then(|surf| state.common.shell.read().visible_output_for_surface(&surf).cloned())
+        .map(|out| out.current_scale().fractional_scale())
+        .unwrap_or(1.0);
+
     let buffer = frame.buffer();
     let geometry = toplevel.geometry();
     let buffer_size = buffer_dimensions(&buffer).unwrap();
-    if buffer_size != geometry.size.to_buffer(1, Transform::Normal) {
-        let Some(constraints) = constraints_for_toplevel(toplevel, &mut state.backend) else {
+    let phys_size = geometry
+        .size
+        .to_f64()
+        .to_physical(scale)
+        .to_i32_round();
+    let expected_size = Size::from((phys_size.w, phys_size.h));
+    if buffer_size != expected_size {
+        let Some(constraints) = constraints_for_toplevel(toplevel, &mut state.backend, scale) else {
             toplevel.clone().remove_session(session);
             return;
         };
         session.update_constraints(constraints);
 
         if let Some(data) = session.user_data().get::<SessionData>() {
-            let size = geometry.size.to_physical(1);
+            let size = geometry.size.to_f64().to_physical(scale).to_i32_round();
             *data.lock().unwrap() =
-                SessionUserData::new(OutputDamageTracker::new(size, 1.0, Transform::Normal));
+                SessionUserData::new(OutputDamageTracker::new(size, scale, Transform::Normal));
         }
         frame.fail(CaptureFailureReason::BufferConstraints);
         return;
@@ -728,7 +730,7 @@ pub fn render_window_to_buffer(
     fn render_fn<'d, R>(
         buffer: &WlBuffer,
         renderer: &mut R,
-        offscreen: Option<&mut R::Framebuffer<'_>>,
+        mut offscreen: Option<&mut R::Framebuffer<'_>>,
         dt: &'d mut OutputDamageTracker,
         age: usize,
         additional_damage: Vec<Rectangle<i32, BufferCoords>>,
@@ -736,6 +738,7 @@ pub fn render_window_to_buffer(
         common: &mut Common,
         toplevel: &CosmicSurface,
         geometry: Rectangle<i32, Logical>,
+        scale: f64,
     ) -> Result<
         (
             RenderOutputResult<'d>,
@@ -744,7 +747,7 @@ pub fn render_window_to_buffer(
         DTError<R::Error>,
     >
     where
-        R: AsGlowRenderer,
+        R: AsGlowRenderer + Bind<Dmabuf>,
         R::TextureId: Send + Clone + 'static,
         CosmicElement<R>: RenderElement<R>,
         CosmicMappedRenderElement<R>: RenderElement<R>,
@@ -834,10 +837,11 @@ pub fn render_window_to_buffer(
             }
         }
 
+        let cursor_count = elements.len();
         toplevel.push_render_elements(
             renderer,
             (-geometry.loc.x, -geometry.loc.y).into(),
-            Scale::from(1.0),
+            Scale::from(scale),
             1.0,
             None,
             None,
@@ -847,6 +851,55 @@ pub fn render_window_to_buffer(
             &mut |elem| elements.push(elem.into()),
             None,
         );
+        let surface_count = elements.len() - cursor_count;
+
+        let window_dmabuf = toplevel.wl_surface().and_then(|wl_surface| {
+            with_renderer_surface_state(&wl_surface, |state| {
+                let buffer = state.buffer()?;
+                get_dmabuf(buffer).ok().cloned()
+            })
+            .flatten()
+        });
+
+        if cursor_count == 0 && surface_count == 1 {
+            if let Some(mut src_dmabuf) = window_dmabuf {
+                let rect = Rectangle::from_size(geometry.size.to_f64().to_physical(scale).to_i32_round());
+                let src_size = src_dmabuf.size().to_logical(1, Transform::Normal).to_physical(1);
+                if src_size == rect.size {
+                    let sync_opt = if let Ok(dmabuf) = get_dmabuf(buffer) {
+                        let mut dst_dmabuf = dmabuf.clone();
+                        match (renderer.bind(&mut src_dmabuf), renderer.bind(&mut dst_dmabuf)) {
+                            (Ok(src_fb), Ok(mut dst_fb)) => {
+                                renderer.blit(&src_fb, &mut dst_fb, rect, rect, TextureFilter::Nearest).ok()
+                            }
+                            _ => None,
+                        }
+                    } else if let Some(ref mut dst_fb) = offscreen {
+                        match renderer.bind(&mut src_dmabuf) {
+                            Ok(src_fb) => {
+                                renderer.blit(&src_fb, dst_fb, rect, rect, TextureFilter::Nearest).ok()
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+
+                    if let Some(sync) = sync_opt {
+                        let buffers = render_element_buffers(renderer, &elements);
+                        let (damage, states) =
+                            dt.damage_output(age, &elements).map_err(DTError::OutputNoMode)?;
+                        let res = RenderOutputResult {
+                            damage,
+                            sync,
+                            states,
+                        };
+                        return Ok((res, buffers));
+                    }
+                }
+                tracing::debug!("Direct window DMA blit not applicable or failed, using render_output fallback");
+            }
+        }
 
         let res = if let Ok(dmabuf) = get_dmabuf(buffer) {
             let mut dmabuf_clone = dmabuf.clone();
@@ -910,12 +963,13 @@ pub fn render_window_to_buffer(
                     common,
                     toplevel,
                     geometry,
+                    scale,
                 )
             },
         ) {
             Ok(frame) => frame,
             Err(err) => {
-                tracing::warn!(?err, "Failed to render to screencopy buffer");
+                tracing::error!("Failed to render to screencopy buffer: {err:#}");
                 None
             }
         },
@@ -936,45 +990,35 @@ pub fn render_window_to_buffer(
                     common,
                     toplevel,
                     geometry,
+                    scale,
                 )
             },
         ) {
             Ok(frame) => frame,
             Err(err) => {
-                tracing::warn!(?err, "Failed to render to screencopy buffer");
+                tracing::error!("Failed to render to screencopy buffer: {err:#}");
                 None
             }
         },
         RendererRef::VulkanMulti(mut renderer) => {
-            let is_hdr_buffer = match buffer_type(&buffer) {
-                Some(BufferType::Dma) => get_dmabuf(&buffer)
-                    .map(|d| match d.format().code {
-                        Fourcc::Abgr2101010
-                        | Fourcc::Xbgr2101010
-                        | Fourcc::Argb2101010
-                        | Fourcc::Xrgb2101010
-                        | Fourcc::Abgr16161616f => true,
-                        _ => false,
-                    })
-                    .unwrap_or(false),
-                Some(BufferType::Shm) => with_buffer_contents(&buffer, |_, _, data| {
-                    match data
-                    .format
-                {
-                    smithay::reexports::wayland_server::protocol::wl_shm::Format::Abgr2101010
-                    | smithay::reexports::wayland_server::protocol::wl_shm::Format::Xbgr2101010
-                    | smithay::reexports::wayland_server::protocol::wl_shm::Format::Argb2101010
-                    | smithay::reexports::wayland_server::protocol::wl_shm::Format::Xrgb2101010 => {
-                        true
-                    }
-                    _ => false,
-                }
+            let is_output_hdr = toplevel
+                .wl_surface()
+                .and_then(|surf| {
+                    common
+                        .shell
+                        .read()
+                        .visible_output_for_surface(&surf)
+                        .cloned()
                 })
-                .unwrap_or(false),
-                _ => false,
-            };
+                .and_then(|output| {
+                    output
+                        .user_data()
+                        .get::<crate::backend::kms::drm_helpers::HdrOutputState>()
+                        .and_then(crate::backend::kms::drm_helpers::HdrOutputState::get)
+                })
+                .is_some();
 
-            let hdr_config = if is_hdr_buffer {
+            let hdr_config = if is_output_hdr {
                 Some(HdrOutputConfig::default())
             } else {
                 Some(HdrOutputConfig::sdr_tonemapping())
@@ -998,12 +1042,13 @@ pub fn render_window_to_buffer(
                         common,
                         toplevel,
                         geometry,
+                        scale,
                     )
                 },
             ) {
                 Ok(frame) => frame,
                 Err(err) => {
-                    tracing::warn!(?err, "Failed to render to screencopy buffer");
+                    tracing::error!("Failed to render to screencopy buffer: {err:#}");
                     None
                 }
             }
@@ -1143,7 +1188,7 @@ pub fn render_cursor_to_buffer(
             ) {
                 Ok(frame) => frame,
                 Err(err) => {
-                    tracing::warn!(?err, "Failed to render to screencopy buffer");
+                    tracing::error!("Failed to render to screencopy buffer: {err:#}");
                     None
                 }
             }
@@ -1169,7 +1214,7 @@ pub fn render_cursor_to_buffer(
             ) {
                 Ok(frame) => frame,
                 Err(err) => {
-                    tracing::warn!(?err, "Failed to render to screencopy buffer");
+                    tracing::error!("Failed to render to screencopy buffer: {err:#}");
                     None
                 }
             }
@@ -1196,7 +1241,7 @@ pub fn render_cursor_to_buffer(
             ) {
                 Ok(frame) => frame,
                 Err(err) => {
-                    tracing::warn!(?err, "Failed to render to screencopy buffer");
+                    tracing::error!("Failed to render to screencopy buffer: {err:#}");
                     None
                 }
             }
