@@ -153,6 +153,12 @@ static FULLSCREEN_SKIP_OTHER_SURFACE: LazyLock<bool> =
 static FULLSCREEN_SKIP_OTHER_SURFACE_ALWAYS: LazyLock<bool> =
     LazyLock::new(|| bool_var("COSMIC_FULLSCREEN_SKIP_OTHER_SURFACE_ALWAYS").unwrap_or(false));
 
+static DISABLE_DIRECT_SCANOUT: LazyLock<bool> =
+    LazyLock::new(|| bool_var("COSMIC_DISABLE_DIRECT_SCANOUT").unwrap_or(false));
+
+static DISABLE_CURSOR_PLANE: LazyLock<bool> =
+    LazyLock::new(|| bool_var("COSMIC_DISABLE_CURSOR_PLANE").unwrap_or(false));
+
 const _30_HZ: Duration = Duration::from_nanos(1_000_000_000 / 30);
 
 #[cfg(feature = "debug")]
@@ -941,11 +947,20 @@ fn surface_thread(
                 } else {
                     state.frame_flags.insert(FrameFlags::DEFAULT);
                     if bool_var("COSMIC_DISABLE_DIRECT_SCANOUT").unwrap_or(false) {
-                        state.frame_flags.remove(FrameFlags::ALLOW_SCANOUT);
+                        state.frame_flags.remove(
+                            FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
+                                | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY
+                                | FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT,
+                        );
                     } else if bool_var("COSMIC_DISABLE_OVERLAY_SCANOUT").unwrap_or(false) {
                         state
                             .frame_flags
                             .remove(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
+                    }
+                    if bool_var("COSMIC_DISABLE_CURSOR_PLANE").unwrap_or(false) {
+                        state
+                            .frame_flags
+                            .remove(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT);
                     }
                 }
                 state.queue_redraw(true, false);
@@ -1017,10 +1032,17 @@ fn surface_thread(
                             | FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT,
                     );
                 } else if bool_var("COSMIC_DISABLE_DIRECT_SCANOUT").unwrap_or(false) {
-                    flags.remove(FrameFlags::ALLOW_SCANOUT);
+                    flags.remove(
+                        FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
+                            | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY
+                            | FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT,
+                    );
                 }
                 if bool_var("COSMIC_DISABLE_OVERLAY_SCANOUT").unwrap_or(false) {
                     flags.remove(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
+                }
+                if bool_var("COSMIC_DISABLE_CURSOR_PLANE").unwrap_or(false) {
+                    flags.remove(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT);
                 }
 
                 if flag {
@@ -1107,10 +1129,18 @@ impl SurfaceThreadState {
             .set_min_refresh_interval(self.min_vrr_frame_time);
 
         if bool_var("COSMIC_DISABLE_DIRECT_SCANOUT").unwrap_or(false) {
-            self.frame_flags.remove(FrameFlags::ALLOW_SCANOUT);
+            self.frame_flags.remove(
+                FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
+                    | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY
+                    | FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT,
+            );
         } else if bool_var("COSMIC_DISABLE_OVERLAY_SCANOUT").unwrap_or(false) {
             self.frame_flags
                 .remove(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
+        }
+        if bool_var("COSMIC_DISABLE_CURSOR_PLANE").unwrap_or(false) {
+            self.frame_flags
+                .remove(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT);
         }
         self.compositor = Some(compositor);
     }
@@ -1585,10 +1615,16 @@ impl SurfaceThreadState {
             self.is_scanout = allow_primary_scanout;
         }
 
+        let disable_cursor_plane = bool_var("COSMIC_DISABLE_CURSOR_PLANE").unwrap_or(false);
+        if !disable_cursor_plane {
+            additional_frame_flags |= FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT;
+        } else {
+            remove_frame_flags |= FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT;
+        }
+
         if allow_primary_scanout {
             additional_frame_flags |= FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
-                | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY
-                | FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT;
+                | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY;
         } else {
             remove_frame_flags |= FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
                 | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY;
@@ -2074,7 +2110,7 @@ impl SurfaceThreadState {
             && scanout_plan.allows_primary_scanout()
             && self.screen_filter.is_noop()
             && self.mirroring.is_none()
-            && !bool_var("COSMIC_DISABLE_DIRECT_SCANOUT").unwrap_or(false);
+            && !*DISABLE_DIRECT_SCANOUT;
 
         if allow_primary_scanout {
             if self.failed_scanout_plan.as_ref() == Some(&scanout_plan) {
@@ -2140,10 +2176,16 @@ impl SurfaceThreadState {
             self.is_scanout = allow_primary_scanout;
         }
 
+        let disable_cursor_plane = *DISABLE_CURSOR_PLANE;
+        if !disable_cursor_plane {
+            additional_frame_flags |= FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT;
+        } else {
+            remove_frame_flags |= FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT;
+        }
+
         if allow_primary_scanout {
             additional_frame_flags |= FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
-                | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY
-                | FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT;
+                | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY;
         } else {
             remove_frame_flags |= FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
                 | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY;
@@ -2261,13 +2303,12 @@ impl SurfaceThreadState {
                     }
                     self.swapchin_is_scanout = actual_scanout;
                 }
+                let has_cursor_plane = frame_result.cursor_element.is_some();
                 debug!(
                     is_empty = frame_result.is_empty,
                     needs_sync = frame_result.needs_sync(),
-                    is_swapchain = matches!(
-                        frame_result.primary_element,
-                        PrimaryPlaneElement::Swapchain(_)
-                    ),
+                    is_swapchain,
+                    has_cursor_plane,
                     states_len = frame_result.states.states.len(),
                     "redraw_vulkan render_frame Ok"
                 );
@@ -3799,6 +3840,70 @@ mod tests {
         }
         println!(
             "\n================================================================================\n"
+        );
+    }
+
+    #[test]
+    fn test_cursor_plane_scanout_flag_logic() {
+        // 1. In compositing mode (allow_primary_scanout = false),
+        // ALLOW_CURSOR_PLANE_SCANOUT must be preserved in effective_flags!
+        let base_flags = FrameFlags::DEFAULT;
+        assert!(base_flags.contains(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT));
+
+        let mut additional_flags = FrameFlags::empty();
+        let mut remove_flags = FrameFlags::empty();
+
+        let disable_cursor_plane = false;
+        if !disable_cursor_plane {
+            additional_flags |= FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT;
+        } else {
+            remove_flags |= FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT;
+        }
+
+        let allow_primary_scanout = false;
+        if allow_primary_scanout {
+            additional_flags |= FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
+                | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY;
+        } else {
+            remove_frame_flags_helper(&mut remove_flags);
+        }
+
+        fn remove_frame_flags_helper(remove_flags: &mut FrameFlags) {
+            *remove_flags |= FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
+                | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY;
+        }
+
+        let effective_flags = base_flags.union(additional_flags).difference(remove_flags);
+
+        assert!(
+            effective_flags.contains(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT),
+            "Cursor plane scanout must be allowed in normal compositing mode!"
+        );
+        assert!(
+            !effective_flags.contains(FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT),
+            "Primary plane scanout must be disabled when allow_primary_scanout is false"
+        );
+
+        // 2. Disabling cursor plane via COSMIC_DISABLE_CURSOR_PLANE strips it
+        let mut remove_flags_disabled = remove_flags;
+        remove_flags_disabled |= FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT;
+        let flags_without_cursor = effective_flags.difference(remove_flags_disabled);
+        assert!(
+            !flags_without_cursor.contains(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT),
+            "COSMIC_DISABLE_CURSOR_PLANE must remove cursor scanout"
+        );
+
+        // 3. Disabling direct scanout (COSMIC_DISABLE_DIRECT_SCANOUT) removes primary and overlay,
+        // but must NOT remove cursor plane scanout!
+        let mut flags_after_direct_disable = FrameFlags::DEFAULT;
+        flags_after_direct_disable.remove(
+            FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
+                | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY
+                | FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT,
+        );
+        assert!(
+            flags_after_direct_disable.contains(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT),
+            "COSMIC_DISABLE_DIRECT_SCANOUT must preserve hardware cursor plane scanout!"
         );
     }
 }
