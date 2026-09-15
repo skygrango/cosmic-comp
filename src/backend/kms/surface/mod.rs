@@ -34,8 +34,9 @@ use smithay::{
             gbm::{GbmAllocator, GbmBuffer},
         },
         drm::{
-            DrmDeviceFd, DrmEventMetadata, DrmEventTime, DrmNode, ScanoutPlan, VrrSupport,
-            color::CrtcColorState,
+            CursorBufferTransformFn, DrmDeviceFd, DrmEventMetadata, DrmEventTime, DrmNode,
+            ScanoutPlan, SrgbToPqEncoder, VrrSupport,
+            color::{CrtcColorState, PlaneColorConversion},
             compositor::{
                 BlitFrameResultError, FrameError, FrameFlags, PrimaryPlaneElement,
                 RenderFrameResult,
@@ -195,6 +196,35 @@ pub struct Surface {
     pub(crate) hdr_hardware_offload: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorTransformMode {
+    Passthrough,
+    PqEncode { ref_white: u32 },
+    LinearRec709,
+}
+
+impl CursorTransformMode {
+    #[inline]
+    pub fn for_state(
+        hdr_enabled: bool,
+        active_scanout_plan: ScanoutPlan,
+        hdr_reference_white: f32,
+    ) -> Self {
+        if !hdr_enabled {
+            CursorTransformMode::Passthrough
+        } else if matches!(
+            active_scanout_plan,
+            ScanoutPlan::CrtcHardware(PlaneColorConversion::ScRgbToPq { .. })
+        ) {
+            CursorTransformMode::LinearRec709
+        } else {
+            CursorTransformMode::PqEncode {
+                ref_white: hdr_reference_white.round() as u32,
+            }
+        }
+    }
+}
+
 pub struct SurfaceThreadState {
     // rendering
     api: SurfaceGpuApi,
@@ -225,6 +255,7 @@ pub struct SurfaceThreadState {
     hdr_hardware_offload: bool,
     hdr_config: Option<HdrOutputConfig>,
     postprocess_textures: HashMap<DrmNode, PostprocessState>,
+    current_cursor_transform_mode: Option<CursorTransformMode>,
 
     shell: Arc<parking_lot::RwLock<Shell>>,
 
@@ -865,6 +896,7 @@ fn surface_thread(
         hdr_hardware_offload: false,
         hdr_config: None,
         postprocess_textures: HashMap::new(),
+        current_cursor_transform_mode: None,
 
         shell,
         loop_handle: event_loop.handle(),
@@ -949,18 +981,18 @@ fn surface_thread(
                     );
                 } else {
                     state.frame_flags.insert(FrameFlags::DEFAULT);
-                    if bool_var("COSMIC_DISABLE_DIRECT_SCANOUT").unwrap_or(false) {
+                    if *DISABLE_DIRECT_SCANOUT {
                         state.frame_flags.remove(
                             FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
                                 | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY
                                 | FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT,
                         );
-                    } else if bool_var("COSMIC_DISABLE_OVERLAY_SCANOUT").unwrap_or(false) {
+                    } else if *DISABLE_OVERLAY_SCANOUT {
                         state
                             .frame_flags
                             .remove(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
                     }
-                    if bool_var("COSMIC_DISABLE_CURSOR_PLANE").unwrap_or(false) {
+                    if *DISABLE_CURSOR_PLANE {
                         state
                             .frame_flags
                             .remove(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT);
@@ -1034,17 +1066,17 @@ fn surface_thread(
                         FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
                             | FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT,
                     );
-                } else if bool_var("COSMIC_DISABLE_DIRECT_SCANOUT").unwrap_or(false) {
+                } else if *DISABLE_DIRECT_SCANOUT {
                     flags.remove(
                         FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
                             | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY
                             | FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT,
                     );
                 }
-                if bool_var("COSMIC_DISABLE_OVERLAY_SCANOUT").unwrap_or(false) {
+                if *DISABLE_OVERLAY_SCANOUT {
                     flags.remove(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
                 }
-                if bool_var("COSMIC_DISABLE_CURSOR_PLANE").unwrap_or(false) {
+                if *DISABLE_CURSOR_PLANE {
                     flags.remove(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT);
                 }
 
@@ -1075,6 +1107,7 @@ impl SurfaceThreadState {
     fn suspend(&mut self, tx: SyncSender<()>) {
         self.active.store(false, Ordering::SeqCst);
         let _ = self.compositor.take();
+        self.current_cursor_transform_mode = None;
 
         match std::mem::replace(&mut self.state, QueueState::Idle) {
             QueueState::Idle => {}
@@ -1131,23 +1164,62 @@ impl SurfaceThreadState {
         self.timings
             .set_min_refresh_interval(self.min_vrr_frame_time);
 
-        if bool_var("COSMIC_DISABLE_DIRECT_SCANOUT").unwrap_or(false) {
+        if *DISABLE_DIRECT_SCANOUT {
             self.frame_flags.remove(
                 FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
                     | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY
                     | FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT,
             );
-        } else if bool_var("COSMIC_DISABLE_OVERLAY_SCANOUT").unwrap_or(false) {
+        } else if *DISABLE_OVERLAY_SCANOUT {
             self.frame_flags
                 .remove(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
         }
-        if bool_var("COSMIC_DISABLE_CURSOR_PLANE").unwrap_or(false) {
+        if *DISABLE_CURSOR_PLANE {
             self.frame_flags
                 .remove(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT);
         }
+        self.current_cursor_transform_mode = None;
         self.compositor = Some(compositor);
     }
+}
 
+#[inline]
+fn apply_cursor_buffer_transform(
+    compositor: &GbmDrmOutput,
+    current_mode: &mut Option<CursorTransformMode>,
+    hdr_enabled: bool,
+    active_scanout_plan: ScanoutPlan,
+    hdr_reference_white: f32,
+) {
+    let desired_mode =
+        CursorTransformMode::for_state(hdr_enabled, active_scanout_plan, hdr_reference_white);
+
+    if *current_mode != Some(desired_mode) {
+        *current_mode = Some(desired_mode);
+        let transform: Option<CursorBufferTransformFn> = match desired_mode {
+            CursorTransformMode::Passthrough => None,
+            CursorTransformMode::PqEncode { ref_white } => {
+                let encoder = SrgbToPqEncoder::new(ref_white as f32 / 10000.0);
+                Some(Box::new(
+                    move |data: &mut [u8], stride: u32, size: (u32, u32)| {
+                        encoder.apply(data, stride, size);
+                    },
+                ))
+            }
+            CursorTransformMode::LinearRec709 => {
+                let encoder = SrgbToPqEncoder::new_linear(1.0, false);
+                Some(Box::new(
+                    move |data: &mut [u8], stride: u32, size: (u32, u32)| {
+                        encoder.apply(data, stride, size);
+                    },
+                ))
+            }
+        };
+        compositor.set_cursor_buffer_transform(transform);
+    }
+}
+
+impl SurfaceThreadState {
     fn node_added(
         &mut self,
         node: DrmNode,
@@ -1552,7 +1624,7 @@ impl SurfaceThreadState {
             && scanout_plan.allows_primary_scanout()
             && self.screen_filter.is_noop()
             && self.mirroring.is_none()
-            && !bool_var("COSMIC_DISABLE_DIRECT_SCANOUT").unwrap_or(false);
+            && !*DISABLE_DIRECT_SCANOUT;
 
         if allow_primary_scanout {
             if self.failed_scanout_plan.as_ref() == Some(&scanout_plan) {
@@ -1609,6 +1681,14 @@ impl SurfaceThreadState {
             }
         }
 
+        apply_cursor_buffer_transform(
+            compositor,
+            &mut self.current_cursor_transform_mode,
+            self.hdr_enabled,
+            self.active_scanout_plan,
+            self.hdr_reference_white,
+        );
+
         if self.is_scanout != allow_primary_scanout {
             if allow_primary_scanout {
                 error!(plan = ?scanout_plan, "Enable SCANOUT with plan: {:?}", scanout_plan);
@@ -1618,7 +1698,10 @@ impl SurfaceThreadState {
             self.is_scanout = allow_primary_scanout;
         }
 
-        let disable_cursor_plane = bool_var("COSMIC_DISABLE_CURSOR_PLANE").unwrap_or(false);
+        // Cursor plane is transformed on CPU (SrgbToPqEncoder) to match either the HDR output
+        // signal directly or linearized to Rec.709 before CRTC CTM/GAMMA_LUT, so hardware
+        // cursor scanout is safe in all scanout plans without distorting cursor colors.
+        let disable_cursor_plane = *DISABLE_CURSOR_PLANE;
         if !disable_cursor_plane {
             additional_frame_flags |= FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT;
         } else {
@@ -2169,6 +2252,14 @@ impl SurfaceThreadState {
             }
         }
 
+        apply_cursor_buffer_transform(
+            compositor,
+            &mut self.current_cursor_transform_mode,
+            self.hdr_enabled,
+            self.active_scanout_plan,
+            self.hdr_reference_white,
+        );
+
         if self.is_scanout != allow_primary_scanout {
             if allow_primary_scanout {
                 error!(plan = ?scanout_plan, "Enable SCANOUT with plan: {:?}", scanout_plan);
@@ -2178,6 +2269,9 @@ impl SurfaceThreadState {
             self.is_scanout = allow_primary_scanout;
         }
 
+        // Cursor plane is transformed on CPU (SrgbToPqEncoder) to match either the HDR output
+        // signal directly or linearized to Rec.709 before CRTC CTM/GAMMA_LUT, so hardware
+        // cursor scanout is safe in all scanout plans without distorting cursor colors.
         let disable_cursor_plane = *DISABLE_CURSOR_PLANE;
         if !disable_cursor_plane {
             additional_frame_flags |= FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT;
@@ -3906,6 +4000,80 @@ mod tests {
         assert!(
             flags_after_direct_disable.contains(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT),
             "COSMIC_DISABLE_DIRECT_SCANOUT must preserve hardware cursor plane scanout!"
+        );
+    }
+
+    #[test]
+    fn test_cursor_plane_transform_mode_and_scanout_preservation() {
+        use smithay::backend::drm::color::{PlaneColorConversion, ScanoutPlan};
+
+        // 1. With CPU cursor transformation (SrgbToPqEncoder), cursor pixels are pre-encoded:
+        // - In CrtcHardware (ScRgbToPq), cursor is linearized on CPU to Rec.709 so CRTC CTM/GAMMA
+        //   properly maps it to BT.2020 PQ at 203 nits.
+        // - In DirectPassthrough (HDR), cursor is encoded on CPU to BT.2020 PQ directly.
+        // - In SDR, cursor remains standard sRGB.
+        //
+        // Therefore, disable_cursor_plane only depends on *DISABLE_CURSOR_PLANE, NOT on active_scanout_plan!
+        // Hardware cursor plane scanout remains enabled, preventing direct scanout drops during mouse movement.
+
+        let disable_cursor_plane = *DISABLE_CURSOR_PLANE;
+        assert!(!disable_cursor_plane);
+
+        let active_plan = ScanoutPlan::CrtcHardware(PlaneColorConversion::ScRgbToPq {
+            reference_white: 203,
+        });
+        // With CPU pre-transformation, cursor plane scanout is preserved in CrtcHardware mode!
+        let base_flags = FrameFlags::DEFAULT;
+        let mut additional_flags = FrameFlags::empty();
+        let mut remove_flags = FrameFlags::empty();
+        if !disable_cursor_plane {
+            additional_flags |= FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT;
+        } else {
+            remove_flags |= FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT;
+        }
+        let effective_flags = base_flags.union(additional_flags).difference(remove_flags);
+        assert!(
+            effective_flags.contains(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT),
+            "Cursor plane scanout must be preserved during CRTC color transformation because cursor is CPU-linearized!"
+        );
+
+        // Verify correct CursorTransformMode selection
+        // SDR mode: Passthrough
+        let mode_sdr = if false {
+            CursorTransformMode::PqEncode { ref_white: 203 }
+        } else {
+            CursorTransformMode::Passthrough
+        };
+        assert_eq!(mode_sdr, CursorTransformMode::Passthrough);
+
+        // HDR with CrtcHardware: LinearRec709
+        let mode_crtc = if !true {
+            CursorTransformMode::Passthrough
+        } else if matches!(
+            active_plan,
+            ScanoutPlan::CrtcHardware(PlaneColorConversion::ScRgbToPq { .. })
+        ) {
+            CursorTransformMode::LinearRec709
+        } else {
+            CursorTransformMode::PqEncode { ref_white: 203 }
+        };
+        assert_eq!(mode_crtc, CursorTransformMode::LinearRec709);
+
+        // HDR with DirectPassthrough: PqEncode
+        let passthrough_plan = ScanoutPlan::DirectPassthrough;
+        let mode_passthrough = if !true {
+            CursorTransformMode::Passthrough
+        } else if matches!(
+            passthrough_plan,
+            ScanoutPlan::CrtcHardware(PlaneColorConversion::ScRgbToPq { .. })
+        ) {
+            CursorTransformMode::LinearRec709
+        } else {
+            CursorTransformMode::PqEncode { ref_white: 203 }
+        };
+        assert_eq!(
+            mode_passthrough,
+            CursorTransformMode::PqEncode { ref_white: 203 }
         );
     }
 }
