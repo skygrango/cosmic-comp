@@ -75,7 +75,7 @@ pub(crate) mod drm_helpers;
 pub mod render;
 mod surface;
 use device::*;
-pub use surface::Timings;
+pub use surface::{OutputVulkanTimeline, Timings, output_vulkan_timeline};
 pub(crate) use surface::{Surface, emergency_shutdown_hdr_surfaces};
 
 use super::render::{CLEAR_COLOR, CursorMode, output_elements};

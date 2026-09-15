@@ -204,26 +204,26 @@ impl CompositorHandler for State {
                     })
             });
             if let Some(dmabuf) = maybe_dmabuf {
-                if let Some(acquire_point) = acquire_point
-                    && let Ok((blocker, source)) = acquire_point.generate_blocker()
-                {
-                    let client = surface.client().unwrap();
-                    let surface_clone = surface.clone();
-                    let res =
-                        state
-                            .common
-                            .event_loop_handle
-                            .insert_source(source, move |_, _, state| {
+                if let Some(acquire_point) = acquire_point {
+                    if let Ok((blocker, source)) = acquire_point.generate_blocker() {
+                        let client = surface.client().unwrap();
+                        let surface_clone = surface.clone();
+                        let res = state.common.event_loop_handle.insert_source(
+                            source,
+                            move |_, _, state| {
                                 let dh = state.common.display_handle.clone();
                                 state
                                     .client_compositor_state(&client)
                                     .surface_blocker_cleared(&surface_clone, state, &dh);
                                 Ok(())
-                            });
-                    if res.is_ok() {
-                        add_blocker(surface, blocker);
-                        return;
+                            },
+                        );
+                        if res.is_ok() {
+                            add_blocker(surface, blocker);
+                        }
                     }
+                    // Explicit sync protocol forbids falling back to implicit sync on the dmabuf
+                    return;
                 }
                 if let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ) {
                     let client = surface.client().unwrap();
@@ -283,25 +283,25 @@ impl CompositorHandler for State {
                     })
             });
             if let Some(dmabuf) = maybe_dmabuf {
-                if let Some(acquire_point) = acquire_point
-                    && let Ok((blocker, source)) = acquire_point.generate_blocker()
-                {
-                    let client = surface.client().unwrap();
-                    let res =
-                        state
-                            .common
-                            .event_loop_handle
-                            .insert_source(source, move |_, _, state| {
+                if let Some(acquire_point) = acquire_point {
+                    if let Ok((blocker, source)) = acquire_point.generate_blocker() {
+                        let client = surface.client().unwrap();
+                        let res = state.common.event_loop_handle.insert_source(
+                            source,
+                            move |_, _, state| {
                                 let dh = state.common.display_handle.clone();
                                 state
                                     .client_compositor_state(&client)
                                     .blocker_cleared(state, &dh);
                                 Ok(())
-                            });
-                    if res.is_ok() {
-                        add_blocker(surface, blocker);
-                        return;
+                            },
+                        );
+                        if res.is_ok() {
+                            add_blocker(surface, blocker);
+                        }
                     }
+                    // Explicit sync protocol forbids falling back to implicit sync on the dmabuf
+                    return;
                 }
                 if let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ) {
                     let client = surface.client().unwrap();
