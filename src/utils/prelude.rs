@@ -357,8 +357,8 @@ impl OutputExt for Output {
         }
 
         if let Some(ref mut occ) = occupied {
-            // Check output HDR status and reference white
-            let (output_hdr_enabled, output_ref_white) = user_data
+            // Check output HDR status, reference white, and peak luminance
+            let (output_hdr_enabled, output_ref_white, output_peak) = user_data
                 .get::<crate::backend::kms::drm_helpers::HdrOutputState>()
                 .and_then(|s| s.get().or_else(|| s.staged()))
                 .map(|hdr| {
@@ -369,9 +369,14 @@ impl OutputExt for Output {
                         } else {
                             203
                         },
+                        if hdr.capabilities.max_luminance > 0 {
+                            Some(hdr.capabilities.max_luminance)
+                        } else {
+                            None
+                        },
                     )
                 })
-                .unwrap_or((false, 203));
+                .unwrap_or((false, 203, None));
 
             // Query hardware scanout capabilities from output
             let caps = self.scanout_capabilities().unwrap_or_default();
@@ -383,17 +388,19 @@ impl OutputExt for Output {
                 }
             }
 
-            // Determine scanout plan using smithay's evaluate_scanout_plan
-            let plan = caps.evaluate_scanout_plan(
+            // Determine scanout plan using smithay's evaluate_scanout_plan_with_peak
+            let plan = caps.evaluate_scanout_plan_with_peak(
                 output_hdr_enabled,
                 occ.color_description.as_ref(),
                 output_ref_white,
+                output_peak,
             );
 
             tracing::info!(
                 output = %self.name(),
                 output_hdr = output_hdr_enabled,
                 output_ref_white,
+                output_peak = ?output_peak,
                 color_desc = ?occ.color_description,
                 ?plan,
                 "Fullscreen occupied: evaluated hardware scanout plan"
@@ -454,7 +461,7 @@ impl OutputExt for Output {
         if current_async == prefers_async && current_desc == color_desc {
             return;
         }
-        let (output_hdr_enabled, output_ref_white) = self
+        let (output_hdr_enabled, output_ref_white, output_peak) = self
             .user_data()
             .get::<crate::backend::kms::drm_helpers::HdrOutputState>()
             .and_then(|s| s.get().or_else(|| s.staged()))
@@ -466,12 +473,21 @@ impl OutputExt for Output {
                     } else {
                         203
                     },
+                    if hdr.capabilities.max_luminance > 0 {
+                        Some(hdr.capabilities.max_luminance)
+                    } else {
+                        None
+                    },
                 )
             })
-            .unwrap_or((false, 203));
+            .unwrap_or((false, 203, None));
         let caps = self.scanout_capabilities().unwrap_or_default();
-        let plan =
-            caps.evaluate_scanout_plan(output_hdr_enabled, color_desc.as_ref(), output_ref_white);
+        let plan = caps.evaluate_scanout_plan_with_peak(
+            output_hdr_enabled,
+            color_desc.as_ref(),
+            output_ref_white,
+            output_peak,
+        );
         let mut guard = state.0.write();
         let Some(weak_occ) = guard.as_mut() else {
             return;
