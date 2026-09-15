@@ -435,6 +435,46 @@ pub enum SurfaceCommand {
     SendFrames(usize),
     RenderStates(RenderElementStates),
     FatalRenderError(String),
+    ProcessShmScreencopy,
+}
+
+pub struct PendingShmCapture {
+    pub task: smithay::backend::renderer::vulkan::PendingVulkanShmCopy,
+    pub frame: ScreencopyFrame,
+    pub transform: Transform,
+    pub damage: Vec<Rectangle<i32, smithay::utils::Buffer>>,
+    pub presentation_time: Duration,
+}
+
+#[derive(Default, Clone)]
+pub struct OutputPendingShmCaptures(pub Arc<std::sync::Mutex<Vec<PendingShmCapture>>>);
+
+impl PendingShmCapture {
+    pub fn process(self) {
+        let buffer = self.frame.buffer();
+        let transform = self.transform;
+        let damage = self.damage;
+        let presentation_time = self.presentation_time;
+        let res = smithay::wayland::shm::with_buffer_contents_mut(&buffer, |ptr, len, data| {
+            self.task.wait_and_copy(ptr, len, data.offset, data.stride)
+        });
+        match res {
+            Ok(Ok(())) => {
+                self.frame.success(transform, damage, presentation_time);
+            }
+            Ok(Err(err)) => {
+                tracing::error!("PendingShmCapture wait_and_copy failed: {:?}", err);
+                self.frame.fail(CaptureFailureReason::Unknown);
+            }
+            Err(err) => {
+                tracing::error!(
+                    "PendingShmCapture with_buffer_contents_mut failed: {:?}",
+                    err
+                );
+                self.frame.fail(CaptureFailureReason::Unknown);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -500,11 +540,35 @@ impl Surface {
             })
             .context("Failed to spawn surface thread")?;
 
+        output
+            .user_data()
+            .insert_if_missing_threadsafe(OutputPendingShmCaptures::default);
         let output_clone = output.clone();
         let thread_token = evlh
             .insert_source(rx2, move |command, _, state| match command {
                 Event::Msg(SurfaceCommand::SignalFIFO) => {
                     output_clone.signal_fifo(state);
+                }
+                Event::Msg(SurfaceCommand::ProcessShmScreencopy) => {
+                    if let Some(pending_captures) = output_clone.user_data().get::<OutputPendingShmCaptures>() {
+                        let captures: Vec<PendingShmCapture> = {
+                            let mut guard = pending_captures.0.lock().unwrap();
+                            std::mem::take(&mut *guard)
+                        };
+                        if !captures.is_empty() {
+                            let thread_name = format!("shm-screencopy-{}", output_clone.name());
+                            if let Err(err) = std::thread::Builder::new()
+                                .name(thread_name)
+                                .spawn(move || {
+                                    for capture in captures {
+                                        capture.process();
+                                    }
+                                })
+                            {
+                                tracing::error!("Failed to spawn shm screencopy thread: {err:?}");
+                            }
+                        }
+                    }
                 }
                 Event::Msg(SurfaceCommand::SendFrames(sequence)) => {
                     if output_clone.mirroring().is_some() {
@@ -2415,6 +2479,10 @@ impl SurfaceThreadState {
         } else {
             CLEAR_COLOR
         };
+        renderer.as_mut().begin_batch();
+        if let Some(target) = renderer.target_as_mut() {
+            target.begin_batch();
+        }
         let res = compositor.render_frame(&mut renderer, &elements, clear_color, effective_flags);
         self.timings.draw_done(&self.clock);
 
@@ -2456,6 +2524,78 @@ impl SurfaceThreadState {
                     None
                 };
 
+                let now = self.clock.now();
+                for (session, frame, res) in frames {
+                    if let Err(err) = send_screencopy_result_vulkan(
+                        &mut renderer,
+                        &self.output,
+                        &tx,
+                        &frame_result,
+                        &elements,
+                        (&session, frame, res),
+                        now.into(),
+                    ) {
+                        tracing::error!("Failed to screencopy in Vulkan: {err:#}");
+                    }
+                }
+
+                let toplevel_frames: Vec<(
+                    CosmicSurface,
+                    Vec<(ScreencopySessionRef, ScreencopyFrame)>,
+                )> = if self.mirroring.is_none() {
+                    let shell = self.shell.read();
+                    shell
+                        .workspaces
+                        .spaces()
+                        .filter(|ws| ws.output() == &self.output)
+                        .flat_map(|ws| {
+                            ws.mapped()
+                                .flat_map(|m| m.windows())
+                                .map(|(s, _)| s)
+                                .chain(ws.get_fullscreen_surfaces().map(|f| f.surface.clone()))
+                        })
+                        .filter_map(|window| {
+                            let pending = window.take_pending_frames();
+                            if pending.is_empty() {
+                                None
+                            } else {
+                                Some((window, pending))
+                            }
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
+                for (toplevel, pending) in toplevel_frames {
+                    for (session, frame) in pending {
+                        if let Err(err) = send_toplevel_screencopy_result_vulkan(
+                            &mut renderer,
+                            &self.output,
+                            &tx,
+                            &toplevel,
+                            &session,
+                            frame,
+                            now.into(),
+                        ) {
+                            tracing::error!("Failed to toplevel screencopy in Vulkan: {err:#}");
+                        }
+                    }
+                }
+
+                if let Err(err) = renderer.as_mut().flush_batch() {
+                    tracing::error!("Failed to flush Vulkan renderer batch: {err:#}");
+                }
+                if let Some(target) = renderer.target_as_mut() {
+                    if let Err(err) = target.flush_batch() {
+                        tracing::error!("Failed to flush Vulkan target renderer batch: {err:#}");
+                    }
+                }
+
+                let _ = self
+                    .thread_sender
+                    .send(SurfaceCommand::ProcessShmScreencopy);
+
                 // With Vulkan timeline semaphore exported to DRM syncobj, needs_sync() is false
                 // because the fence is exportable as IN_FENCE_FD. The CPU does not block waiting for the GPU.
                 if frame_result.needs_sync()
@@ -2487,66 +2627,6 @@ impl SurfaceThreadState {
                                     self.loop_handle.remove(estimated_vblank);
                                 }
                             };
-                        }
-
-                        let now = self.clock.now();
-                        for (session, frame, res) in frames {
-                            if let Err(err) = send_screencopy_result_vulkan(
-                                &mut renderer,
-                                &self.output,
-                                &tx,
-                                &frame_result,
-                                &elements,
-                                (&session, frame, res),
-                                now.into(),
-                            ) {
-                                tracing::error!("Failed to screencopy in Vulkan: {err:#}");
-                            }
-                        }
-
-                        let toplevel_frames: Vec<(
-                            CosmicSurface,
-                            Vec<(ScreencopySessionRef, ScreencopyFrame)>,
-                        )> = if self.mirroring.is_none() {
-                            let shell = self.shell.read();
-                            shell
-                                .workspaces
-                                .spaces()
-                                .filter(|ws| ws.output() == &self.output)
-                                .flat_map(|ws| {
-                                    ws.mapped().flat_map(|m| m.windows()).map(|(s, _)| s).chain(
-                                        ws.get_fullscreen_surfaces().map(|f| f.surface.clone()),
-                                    )
-                                })
-                                .filter_map(|window| {
-                                    let pending = window.take_pending_frames();
-                                    if pending.is_empty() {
-                                        None
-                                    } else {
-                                        Some((window, pending))
-                                    }
-                                })
-                                .collect()
-                        } else {
-                            Vec::new()
-                        };
-
-                        for (toplevel, pending) in toplevel_frames {
-                            for (session, frame) in pending {
-                                if let Err(err) = send_toplevel_screencopy_result_vulkan(
-                                    &mut renderer,
-                                    &self.output,
-                                    &tx,
-                                    &toplevel,
-                                    &session,
-                                    frame,
-                                    now.into(),
-                                ) {
-                                    tracing::error!(
-                                        "Failed to toplevel screencopy in Vulkan: {err:#}"
-                                    );
-                                }
-                            }
                         }
 
                         if self.mirroring.is_none() {
@@ -2582,14 +2662,15 @@ impl SurfaceThreadState {
                         }
                     }
                     Err(err) => {
-                        for (_session, frame, _) in frames {
-                            frame.fail(CaptureFailureReason::Unknown);
-                        }
                         return Err(err).with_context(|| "Failed to submit result for display");
                     }
                 };
             }
             Err(err) => {
+                renderer.as_mut().cancel_batch();
+                if let Some(target) = renderer.target_as_mut() {
+                    target.cancel_batch();
+                }
                 compositor.reset_buffers();
                 anyhow::bail!("Rendering failed: {}", err);
             }
@@ -3121,7 +3202,7 @@ fn send_screencopy_result_vulkan<'a>(
 
     let mut sync = SyncPoint::default();
     let mut dmabuf_clone;
-    let mut render_buffer;
+    let mut render_buffer = None;
     let buffer = frame.buffer();
     let mut shm_buffer = false;
     let buffer_size = match buffer_dimensions(&buffer) {
@@ -3168,7 +3249,7 @@ fn send_screencopy_result_vulkan<'a>(
             "send_screencopy_result_vulkan: allocating offscreen buffer for SHM screencopy"
         );
 
-        render_buffer = Offscreen::<smithay::backend::vulkan::image::VulkanImage>::create_buffer(
+        let img = Offscreen::<smithay::backend::vulkan::image::VulkanImage>::create_buffer(
             renderer,
             format,
             buffer_size,
@@ -3180,9 +3261,10 @@ fn send_screencopy_result_vulkan<'a>(
             );
             RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(err)
         })?;
+        render_buffer = Some(img);
         Some(
             renderer
-                .bind(&mut render_buffer)
+                .bind(render_buffer.as_mut().unwrap())
                 .map_err(|err| {
                     tracing::error!(
                         "send_screencopy_result_vulkan: bind render_buffer failed for SHM (format={:?}, size={:?}): {:#}",
@@ -3260,10 +3342,57 @@ fn send_screencopy_result_vulkan<'a>(
 
     let transform = output.current_transform();
 
+    if shm_buffer {
+        drop(fb);
+        let format = with_buffer_contents(&buffer, |_, _, data| shm_format_to_fourcc(data.format))
+            .map_err(|_| OutputNoMode)?
+            .expect("We should be able to convert all hardcoded shm screencopy formats");
+        let vulkan_renderer = if renderer.target_as_ref().is_some() {
+            renderer.target_as_mut().unwrap()
+        } else {
+            renderer.as_mut()
+        };
+        let task = vulkan_renderer
+            .record_copy_image_to_shm(
+                render_buffer.as_ref().unwrap(),
+                Rectangle::from_size(buffer_size),
+                format,
+            )
+            .map_err(|err| {
+                tracing::error!(
+                    "send_screencopy_result_vulkan: record_copy_image_to_shm failed: {:#}",
+                    err
+                );
+                RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(
+                    MultiError::Render(err),
+                )
+            })?;
+        let damage_rects = damage
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|rect| {
+                let logical = rect.to_logical(1);
+                logical.to_buffer(1, transform.invert(), &buffer_size.to_logical(1, transform))
+            })
+            .collect();
+        let capture = PendingShmCapture {
+            task,
+            frame,
+            transform,
+            damage: damage_rects,
+            presentation_time,
+        };
+        if let Some(queue) = output.user_data().get::<OutputPendingShmCaptures>() {
+            queue.0.lock().unwrap().push(capture);
+        }
+        return Ok(());
+    }
+
     if let Some(data) = submit_buffer(
         frame,
         renderer,
-        shm_buffer.then_some(fb.as_mut().unwrap()),
+        None,
         transform,
         damage.as_deref(),
         sync,
@@ -3277,7 +3406,7 @@ fn send_screencopy_result_vulkan<'a>(
         );
         RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(err)
     })? {
-        if shm_buffer || frame_result.is_empty {
+        if frame_result.is_empty {
             data.frame
                 .success(transform, data.damage, presentation_time);
         } else {
@@ -3323,7 +3452,7 @@ fn send_toplevel_screencopy_result_vulkan<'a>(
 
     let mut sync = SyncPoint::default();
     let mut dmabuf_clone;
-    let mut render_buffer;
+    let mut render_buffer = None;
     let mut shm_buffer = false;
 
     let mut dst_fb = if let Ok(dmabuf) = get_dmabuf(&buffer) {
@@ -3340,7 +3469,7 @@ fn send_toplevel_screencopy_result_vulkan<'a>(
         let format = with_buffer_contents(&buffer, |_, _, data| shm_format_to_fourcc(data.format))
             .map_err(|_| OutputNoMode)?
             .expect("We should be able to convert all hardcoded shm screencopy formats");
-        render_buffer = Offscreen::<smithay::backend::vulkan::image::VulkanImage>::create_buffer(
+        let img = Offscreen::<smithay::backend::vulkan::image::VulkanImage>::create_buffer(
             renderer,
             format,
             buffer_size,
@@ -3352,7 +3481,8 @@ fn send_toplevel_screencopy_result_vulkan<'a>(
             );
             RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(err)
         })?;
-        Some(renderer.bind(&mut render_buffer).map_err(|err| {
+        render_buffer = Some(img);
+        Some(renderer.bind(render_buffer.as_mut().unwrap()).map_err(|err| {
             tracing::error!(
                 "send_toplevel_screencopy_result_vulkan: bind render_buffer failed for SHM: {:#}",
                 err
@@ -3401,10 +3531,48 @@ fn send_toplevel_screencopy_result_vulkan<'a>(
         }
     }
 
+    if shm_buffer {
+        drop(dst_fb);
+        let format = with_buffer_contents(&buffer, |_, _, data| shm_format_to_fourcc(data.format))
+            .map_err(|_| OutputNoMode)?
+            .expect("We should be able to convert all hardcoded shm screencopy formats");
+        let vulkan_renderer = if renderer.target_as_ref().is_some() {
+            renderer.target_as_mut().unwrap()
+        } else {
+            renderer.as_mut()
+        };
+        let task = vulkan_renderer
+            .record_copy_image_to_shm(
+                render_buffer.as_ref().unwrap(),
+                Rectangle::from_size(buffer_size),
+                format,
+            )
+            .map_err(|err| {
+                tracing::error!(
+                    "send_toplevel_screencopy_result_vulkan: record_copy_image_to_shm failed: {:#}",
+                    err
+                );
+                RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(
+                    MultiError::Render(err),
+                )
+            })?;
+        let capture = PendingShmCapture {
+            task,
+            frame,
+            transform: Transform::Normal,
+            damage: vec![Rectangle::from_size(buffer_size)],
+            presentation_time,
+        };
+        if let Some(queue) = output.user_data().get::<OutputPendingShmCaptures>() {
+            queue.0.lock().unwrap().push(capture);
+        }
+        return Ok(());
+    }
+
     if let Some(data) = submit_buffer(
         frame,
         renderer,
-        shm_buffer.then_some(dst_fb.as_mut().unwrap()),
+        None,
         Transform::Normal,
         Some(&[Rectangle::from_size(
             buffer_size.to_logical(1, Transform::Normal).to_physical(1),
@@ -3419,12 +3587,7 @@ fn send_toplevel_screencopy_result_vulkan<'a>(
         );
         RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(err)
     })? {
-        if shm_buffer {
-            data.frame
-                .success(Transform::Normal, data.damage, presentation_time);
-        } else {
-            let _ = tx.send(data);
-        }
+        let _ = tx.send(data);
     }
 
     Ok(())
