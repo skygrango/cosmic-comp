@@ -348,11 +348,30 @@ impl ImageCopyCaptureHandler for State {
                 render_workspace_to_buffer(self, session, frame, handle)
             }
             ImageCaptureSourceKind::Toplevel(toplevel) => {
-                let Some(toplevel) = toplevel.upgrade() else {
+                let Some(mut toplevel) = toplevel.upgrade() else {
                     return;
                 };
 
-                render_window_to_buffer(self, session, frame, &toplevel)
+                let output = toplevel
+                    .wl_surface()
+                    .and_then(|surf| {
+                        self.common
+                            .shell
+                            .read()
+                            .visible_output_for_surface(&surf)
+                            .cloned()
+                    })
+                    .or_else(|| {
+                        let shell = self.common.shell.read();
+                        shell.outputs().next().cloned()
+                    });
+
+                if let Some(output) = output {
+                    toplevel.add_frame(session.clone(), frame);
+                    self.backend.schedule_render(&output);
+                } else {
+                    render_window_to_buffer(self, session, frame, &toplevel);
+                }
             }
             ImageCaptureSourceKind::Destroyed => {
                 frame.fail(CaptureFailureReason::Stopped);
@@ -377,6 +396,17 @@ impl ImageCopyCaptureHandler for State {
         let shell = self.common.shell.read();
         for mut output in shell.outputs().cloned() {
             output.remove_frame(&frame);
+        }
+        for space in shell.workspaces.spaces() {
+            for mapped in space.mapped() {
+                for (mut window, _) in mapped.windows() {
+                    window.remove_frame(&frame);
+                }
+            }
+            for fullscreen in space.get_fullscreen_surfaces() {
+                let mut surface = fullscreen.surface.clone();
+                surface.remove_frame(&frame);
+            }
         }
     }
 
