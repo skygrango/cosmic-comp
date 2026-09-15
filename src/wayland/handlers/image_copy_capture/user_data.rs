@@ -187,6 +187,32 @@ impl SessionHolder for Workspace {
     }
 }
 
+impl FrameHolder for CosmicSurface {
+    fn add_frame(&mut self, session: SessionRef, frame: Frame) {
+        self.user_data()
+            .insert_if_missing_threadsafe(PendingImageCopyBuffers::default);
+        self.user_data()
+            .get::<PendingImageCopyBuffers>()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .push((session, frame));
+    }
+
+    fn remove_frame(&mut self, frame: &FrameRef) {
+        if let Some(pending) = self.user_data().get::<PendingImageCopyBuffers>() {
+            pending.lock().unwrap().retain(|(_, f)| f != frame);
+        }
+    }
+
+    fn take_pending_frames(&self) -> Vec<(SessionRef, Frame)> {
+        self.user_data()
+            .get::<PendingImageCopyBuffers>()
+            .map(|pending| std::mem::take(&mut *pending.lock().unwrap()))
+            .unwrap_or_default()
+    }
+}
+
 impl SessionHolder for CosmicSurface {
     fn add_session(&mut self, session: Session) {
         self.user_data()

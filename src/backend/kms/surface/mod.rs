@@ -11,7 +11,7 @@ use crate::{
         },
     },
     config::ScreenFilter,
-    shell::Shell,
+    shell::{CosmicSurface, Shell},
     state::SurfaceDmabufFeedback,
     utils::{
         env::{bool_var, hdr_policy, tearing_allowed_for},
@@ -19,7 +19,9 @@ use crate::{
     },
     wayland::handlers::{
         compositor::{FULLSCREEN_IMMEDIATE_RENDER, recursive_frame_time_estimation},
-        image_copy_capture::{FrameHolder, PendingImageCopyData, SessionData, submit_buffer},
+        image_copy_capture::{
+            FrameHolder, PendingImageCopyData, SessionData, SessionHolder, submit_buffer,
+        },
     },
 };
 
@@ -68,6 +70,7 @@ use smithay::{
             utils::with_renderer_surface_state,
         },
     },
+    desktop::space::SpaceElement,
     desktop::utils::OutputPresentationFeedback,
     output::{Output, OutputNoMode},
     reexports::{
@@ -83,7 +86,7 @@ use smithay::{
         },
         wayland_server::protocol::wl_surface::WlSurface,
     },
-    utils::{Clock, IsAlive, Monotonic, Physical, Point, Rectangle, Transform},
+    utils::{Clock, IsAlive, Monotonic, Physical, Point, Rectangle, Size, Transform},
     wayland::{
         color::management::{Chromaticities, ImageDescription},
         dmabuf::{DmabufFeedbackBuilder, get_dmabuf},
@@ -2501,6 +2504,51 @@ impl SurfaceThreadState {
                             }
                         }
 
+                        let toplevel_frames: Vec<(
+                            CosmicSurface,
+                            Vec<(ScreencopySessionRef, ScreencopyFrame)>,
+                        )> = if self.mirroring.is_none() {
+                            let shell = self.shell.read();
+                            shell
+                                .workspaces
+                                .spaces()
+                                .filter(|ws| ws.output() == &self.output)
+                                .flat_map(|ws| {
+                                    ws.mapped().flat_map(|m| m.windows()).map(|(s, _)| s).chain(
+                                        ws.get_fullscreen_surfaces().map(|f| f.surface.clone()),
+                                    )
+                                })
+                                .filter_map(|window| {
+                                    let pending = window.take_pending_frames();
+                                    if pending.is_empty() {
+                                        None
+                                    } else {
+                                        Some((window, pending))
+                                    }
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+
+                        for (toplevel, pending) in toplevel_frames {
+                            for (session, frame) in pending {
+                                if let Err(err) = send_toplevel_screencopy_result_vulkan(
+                                    &mut renderer,
+                                    &self.output,
+                                    &tx,
+                                    &toplevel,
+                                    &session,
+                                    frame,
+                                    now.into(),
+                                ) {
+                                    tracing::error!(
+                                        "Failed to toplevel screencopy in Vulkan: {err:#}"
+                                    );
+                                }
+                            }
+                        }
+
                         if self.mirroring.is_none() {
                             let _ = self
                                 .thread_sender
@@ -3232,6 +3280,148 @@ fn send_screencopy_result_vulkan<'a>(
         if shm_buffer || frame_result.is_empty {
             data.frame
                 .success(transform, data.damage, presentation_time);
+        } else {
+            let _ = tx.send(data);
+        }
+    }
+
+    Ok(())
+}
+
+fn send_toplevel_screencopy_result_vulkan<'a>(
+    renderer: &mut VulkanMultiRenderer<'a>,
+    output: &Output,
+    tx: &std::sync::mpsc::Sender<PendingImageCopyData>,
+    toplevel: &CosmicSurface,
+    session: &ScreencopySessionRef,
+    frame: ScreencopyFrame,
+    presentation_time: Duration,
+) -> Result<()> {
+    if !toplevel.alive() {
+        let mut toplevel_clone = toplevel.clone();
+        toplevel_clone.remove_session(session);
+        frame.fail(CaptureFailureReason::Stopped);
+        return Ok(());
+    }
+
+    let scale = output.current_scale().fractional_scale();
+    let geometry = toplevel.geometry();
+    let buffer = frame.buffer();
+    let buffer_size = match buffer_dimensions(&buffer) {
+        Some(s) => s,
+        None => {
+            frame.fail(CaptureFailureReason::Unknown);
+            return Ok(());
+        }
+    };
+    let phys_size = geometry.size.to_f64().to_physical(scale).to_i32_round();
+    let expected_size = Size::from((phys_size.w, phys_size.h));
+    if buffer_size != expected_size {
+        frame.fail(CaptureFailureReason::BufferConstraints);
+        return Ok(());
+    }
+
+    let mut sync = SyncPoint::default();
+    let mut dmabuf_clone;
+    let mut render_buffer;
+    let mut shm_buffer = false;
+
+    let mut dst_fb = if let Ok(dmabuf) = get_dmabuf(&buffer) {
+        dmabuf_clone = dmabuf.clone();
+        Some(renderer.bind(&mut dmabuf_clone).map_err(|err| {
+            tracing::error!(
+                "send_toplevel_screencopy_result_vulkan: failed to bind dst dmabuf: {:#}",
+                err
+            );
+            RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(err)
+        })?)
+    } else {
+        shm_buffer = true;
+        let format = with_buffer_contents(&buffer, |_, _, data| shm_format_to_fourcc(data.format))
+            .map_err(|_| OutputNoMode)?
+            .expect("We should be able to convert all hardcoded shm screencopy formats");
+        render_buffer = Offscreen::<smithay::backend::vulkan::image::VulkanImage>::create_buffer(
+            renderer,
+            format,
+            buffer_size,
+        )
+        .map_err(|err| {
+            tracing::error!(
+                "send_toplevel_screencopy_result_vulkan: create_buffer failed for SHM: {:#}",
+                err
+            );
+            RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(err)
+        })?;
+        Some(renderer.bind(&mut render_buffer).map_err(|err| {
+            tracing::error!(
+                "send_toplevel_screencopy_result_vulkan: bind render_buffer failed for SHM: {:#}",
+                err
+            );
+            RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(err)
+        })?)
+    };
+
+    let window_dmabuf = toplevel.wl_surface().and_then(|wl_surface| {
+        smithay::backend::renderer::utils::with_renderer_surface_state(&wl_surface, |state| {
+            let buffer = state.buffer()?;
+            get_dmabuf(buffer).ok().cloned()
+        })
+        .flatten()
+    });
+
+    if let Some(mut src_dmabuf) = window_dmabuf {
+        let rect = Rectangle::from_size(phys_size);
+        let src_size = src_dmabuf
+            .size()
+            .to_logical(1, Transform::Normal)
+            .to_physical(1);
+        if src_size == rect.size {
+            let src_fb = renderer.bind(&mut src_dmabuf).map_err(|err| {
+                tracing::error!(
+                    "send_toplevel_screencopy_result_vulkan: failed to bind src dmabuf: {:#}",
+                    err
+                );
+                RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(err)
+            })?;
+            sync = renderer
+                .blit(
+                    &src_fb,
+                    dst_fb.as_mut().unwrap(),
+                    rect,
+                    rect,
+                    TextureFilter::Nearest,
+                )
+                .map_err(|err| {
+                    tracing::error!(
+                        "send_toplevel_screencopy_result_vulkan: blit failed: {:#}",
+                        err
+                    );
+                    RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(err)
+                })?;
+        }
+    }
+
+    if let Some(data) = submit_buffer(
+        frame,
+        renderer,
+        shm_buffer.then_some(dst_fb.as_mut().unwrap()),
+        Transform::Normal,
+        Some(&[Rectangle::from_size(
+            buffer_size.to_logical(1, Transform::Normal).to_physical(1),
+        )]),
+        sync,
+        vec![],
+    )
+    .map_err(|err| {
+        tracing::error!(
+            "send_toplevel_screencopy_result_vulkan: submit_buffer failed: {:#}",
+            err
+        );
+        RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(err)
+    })? {
+        if shm_buffer {
+            data.frame
+                .success(Transform::Normal, data.damage, presentation_time);
         } else {
             let _ = tx.send(data);
         }
