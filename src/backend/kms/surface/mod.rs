@@ -357,6 +357,20 @@ pub type GbmDrmOutput = DrmOutput<
 #[derive(Debug, Default)]
 pub struct OutputSwapchainFormat(pub std::sync::Mutex<Option<Fourcc>>);
 
+#[derive(Debug, Clone, Default)]
+pub struct OutputVulkanTimeline(
+    pub std::sync::Arc<parking_lot::RwLock<Option<smithay::backend::drm::sync::DrmTimeline>>>,
+);
+
+pub fn output_vulkan_timeline(
+    output: &smithay::output::Output,
+) -> Option<smithay::backend::drm::sync::DrmTimeline> {
+    output
+        .user_data()
+        .get::<OutputVulkanTimeline>()
+        .and_then(|t| t.0.read().clone())
+}
+
 #[derive(Debug, Default)]
 pub enum QueueState {
     #[default]
@@ -2319,6 +2333,23 @@ impl SurfaceThreadState {
         renderer.as_mut().set_hdr_output(self.hdr_config);
         if let Some(target) = renderer.target_as_mut() {
             target.set_hdr_output(self.hdr_config);
+        }
+
+        self.output
+            .user_data()
+            .insert_if_missing_threadsafe(OutputVulkanTimeline::default);
+        if let Some(timeline_data) = self.output.user_data().get::<OutputVulkanTimeline>() {
+            let timeline = renderer
+                .target_as_ref()
+                .and_then(|r| r.drm_timeline())
+                .or_else(|| renderer.as_ref().drm_timeline())
+                .cloned();
+            if let Some(timeline) = timeline {
+                let mut current = timeline_data.0.write();
+                if current.as_ref() != Some(&timeline) {
+                    *current = Some(timeline);
+                }
+            }
         }
 
         let elements = output_elements(
