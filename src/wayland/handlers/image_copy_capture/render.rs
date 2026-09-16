@@ -689,7 +689,7 @@ pub fn render_workspace_to_buffer(
                     is_sdr: false,
                 })
             } else {
-                Some(HdrOutputConfig::sdr_tonemapping())
+                Some(HdrOutputConfig::sdr_tonemapping_with_reference(ref_white))
             };
 
             match render_session_vulkan(
@@ -1154,7 +1154,7 @@ pub fn render_window_to_buffer(
                     is_sdr: false,
                 })
             } else {
-                Some(HdrOutputConfig::sdr_tonemapping())
+                Some(HdrOutputConfig::sdr_tonemapping_with_reference(ref_white))
             };
 
             match render_session_vulkan(
