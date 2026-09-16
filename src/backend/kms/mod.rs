@@ -246,7 +246,9 @@ pub fn init_backend(
         .map_err(|err| err.error)
         .context("Failed to initialize session event source")?;
 
-    let use_vulkan = std::env::var("COSMIC_RENDERER").as_deref() == Ok("vulkan");
+    let use_vulkan = std::env::var("COSMIC_RENDERER")
+        .map(|v| !v.eq_ignore_ascii_case("gles"))
+        .unwrap_or(true);
     let api = if use_vulkan {
         info!("Initializing Vulkan KMS backend");
         let instance = Instance::new(Version::VERSION_1_3, None)
