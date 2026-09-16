@@ -86,7 +86,7 @@ use smithay::{
         },
         wayland_server::protocol::wl_surface::WlSurface,
     },
-    utils::{Clock, IsAlive, Monotonic, Physical, Point, Rectangle, Size, Transform},
+    utils::{Clock, IsAlive, Monotonic, Physical, Point, Rectangle, Scale, Size, Transform},
     wayland::{
         color::management::{Chromaticities, ImageDescription},
         dmabuf::{DmabufFeedbackBuilder, get_dmabuf},
@@ -3491,44 +3491,102 @@ fn send_toplevel_screencopy_result_vulkan<'a>(
         })?)
     };
 
-    let window_dmabuf = toplevel.wl_surface().and_then(|wl_surface| {
-        smithay::backend::renderer::utils::with_renderer_surface_state(&wl_surface, |state| {
-            let buffer = state.buffer()?;
-            get_dmabuf(buffer).ok().cloned()
-        })
-        .flatten()
-    });
+    let loc_phys: Point<i32, Physical> = geometry.loc.to_f64().to_physical(scale).to_i32_round();
+    let mut elements: Vec<
+        crate::backend::render::wayland::SurfaceRenderElement<VulkanMultiRenderer>,
+    > = Vec::new();
+    toplevel.push_render_elements(
+        renderer,
+        Point::from((-loc_phys.x, -loc_phys.y)),
+        Scale::from(scale),
+        1.0,
+        None,
+        None,
+        false,
+        [0; 4],
+        0,
+        &mut |elem| elements.push(elem),
+        None,
+    );
 
-    if let Some(mut src_dmabuf) = window_dmabuf {
-        let rect = Rectangle::from_size(phys_size);
-        let src_size = src_dmabuf
-            .size()
-            .to_logical(1, Transform::Normal)
-            .to_physical(1);
-        if src_size == rect.size {
-            let src_fb = renderer.bind(&mut src_dmabuf).map_err(|err| {
+    let mut direct_blit_done = false;
+    if elements.len() == 1 && geometry.loc == (0, 0).into() {
+        if let Some(wl_surface) = toplevel.wl_surface() {
+            let window_dmabuf = smithay::backend::renderer::utils::with_renderer_surface_state(
+                &wl_surface,
+                |state| {
+                    let buffer = state.buffer()?;
+                    get_dmabuf(buffer).ok().cloned()
+                },
+            )
+            .flatten();
+
+            if let Some(mut src_dmabuf) = window_dmabuf {
+                let rect = Rectangle::from_size(phys_size);
+                let src_size = src_dmabuf
+                    .size()
+                    .to_logical(1, Transform::Normal)
+                    .to_physical(1);
+                if src_size == rect.size {
+                    if let Ok(src_fb) = renderer.bind(&mut src_dmabuf) {
+                        if let Ok(blit_sync) = renderer.blit(
+                            &src_fb,
+                            dst_fb.as_mut().unwrap(),
+                            rect,
+                            rect,
+                            TextureFilter::Nearest,
+                        ) {
+                            sync = blit_sync;
+                            direct_blit_done = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !direct_blit_done {
+        let mut frame = renderer
+            .render(dst_fb.as_mut().unwrap(), phys_size, Transform::Normal)
+            .map_err(|err| {
                 tracing::error!(
-                    "send_toplevel_screencopy_result_vulkan: failed to bind src dmabuf: {:#}",
+                    "send_toplevel_screencopy_result_vulkan: render failed: {:#}",
                     err
                 );
                 RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(err)
             })?;
-            sync = renderer
-                .blit(
-                    &src_fb,
-                    dst_fb.as_mut().unwrap(),
-                    rect,
-                    rect,
-                    TextureFilter::Nearest,
-                )
-                .map_err(|err| {
-                    tracing::error!(
-                        "send_toplevel_screencopy_result_vulkan: blit failed: {:#}",
-                        err
-                    );
-                    RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(err)
-                })?;
-        }
+
+        frame
+            .clear(Color32F::TRANSPARENT, &[Rectangle::from_size(phys_size)])
+            .map_err(|err| {
+                tracing::error!(
+                    "send_toplevel_screencopy_result_vulkan: clear failed: {:#}",
+                    err
+                );
+                RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(err)
+            })?;
+
+        let _ = smithay::backend::renderer::utils::draw_render_elements(
+            &mut frame,
+            Scale::from(scale),
+            &elements,
+            &[Rectangle::from_size(phys_size)],
+        )
+        .map_err(|err| {
+            tracing::error!(
+                "send_toplevel_screencopy_result_vulkan: draw_render_elements failed: {:#}",
+                err
+            );
+            RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(err)
+        })?;
+
+        sync = frame.finish().map_err(|err| {
+            tracing::error!(
+                "send_toplevel_screencopy_result_vulkan: frame.finish failed: {:#}",
+                err
+            );
+            RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(err)
+        })?;
     }
 
     if shm_buffer {
