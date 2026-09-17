@@ -253,6 +253,7 @@ pub struct SurfaceThreadState {
     is_scanout: bool,
     swapchin_is_scanout: bool,
     active_scanout_plan: ScanoutPlan,
+    active_scanout_surface: Option<Id>,
     failed_scanout_plan: Option<ScanoutPlan>,
     hdr_reference_white: f32,
     hdr_max_luminance: f32,
@@ -977,6 +978,7 @@ fn surface_thread(
         is_scanout: false,
         swapchin_is_scanout: false,
         active_scanout_plan: ScanoutPlan::DirectPassthrough,
+        active_scanout_surface: None,
         failed_scanout_plan: None,
         hdr_reference_white: 203.0,
         hdr_max_luminance: 1000.0,
@@ -1320,6 +1322,34 @@ fn apply_cursor_buffer_transform(
     }
 }
 
+/// Finds the actual primary scanout surface from a window's surface tree.
+/// In Wayland, an application (like mpv, a browser, or a Wine game) may have an empty toplevel
+/// container while the actual fullscreen content is presented on a subsurface.
+/// This helper finds the surface in the tree that has an attached buffer and the largest area.
+fn find_primary_scanout_surface(root: &WlSurface) -> Option<WlSurface> {
+    let mut candidate: Option<(WlSurface, i64)> = None;
+    smithay::desktop::utils::with_surfaces_surface_tree(root, |s, _| {
+        with_renderer_surface_state(s, |rstate| {
+            if rstate.buffer().is_some() {
+                let area = if let Some(size) = rstate.buffer_size() {
+                    size.w as i64 * size.h as i64
+                } else if let Some(size) = rstate.surface_size() {
+                    size.w as i64 * size.h as i64
+                } else {
+                    0
+                };
+                if candidate
+                    .as_ref()
+                    .map_or(true, |(_, max_area)| area > *max_area)
+                {
+                    candidate = Some((s.clone(), area));
+                }
+            }
+        });
+    });
+    candidate.map(|(s, _)| s).or_else(|| Some(root.clone()))
+}
+
 impl SurfaceThreadState {
     fn update_scanout_color_management(
         &mut self,
@@ -1328,127 +1358,141 @@ impl SurfaceThreadState {
         allow_primary_scanout: &mut bool,
     ) {
         let compositor = self.compositor.as_ref().unwrap();
-        if *allow_primary_scanout {
+
+        let target_plan = if *allow_primary_scanout {
             if self.failed_scanout_plan.as_ref() == Some(&scanout_plan) {
                 *allow_primary_scanout = false;
+                ScanoutPlan::DirectPassthrough
             } else {
-                match scanout_plan {
-                    ScanoutPlan::PlaneColorop(conv) => {
-                        let wl_surf = fullscreen_surface.and_then(|f| f.surface.wl_surface());
-                        if let Some(wl_surf) = wl_surf {
-                            let transform = conv.to_scanout_color_transform();
-                            let mut transforms = std::collections::HashMap::new();
-                            smithay::desktop::utils::with_surfaces_surface_tree(
-                                &wl_surf,
-                                |s, _| {
-                                    transforms.insert(Id::from_wayland_resource(s), transform);
-                                },
-                            );
-
-                            let is_direct = self
-                                .output
-                                .scanout_capabilities()
-                                .map(|caps| caps.can_plane_colorop_direct(conv))
-                                .unwrap_or(false);
-
-                            let post_blend = if self.hdr_enabled && !is_direct {
-                                let peak = self
-                                    .output
-                                    .user_data()
-                                    .get::<crate::backend::kms::drm_helpers::HdrOutputState>()
-                                    .and_then(|s| s.get().or_else(|| s.staged()))
-                                    .map(|hdr| hdr.capabilities.max_luminance as f64)
-                                    .unwrap_or(1000.0);
-                                Some(PostBlendEncode::for_hdr(peak))
-                            } else {
-                                None
-                            };
-
-                            let linear_transforms = match post_blend {
-                                Some(pb) => transforms
-                                    .iter()
-                                    .filter_map(|(id, tr)| {
-                                        let linear = pb.linear_transform((*tr)?)?;
-                                        Some((id.clone(), linear))
-                                    })
-                                    .collect(),
-                                None => std::collections::HashMap::new(),
-                            };
-
-                            compositor.use_color_transforms(transforms, self.hdr_enabled);
-                            compositor.use_post_blend_encode(post_blend, linear_transforms);
-
-                            if self.active_scanout_plan != scanout_plan {
-                                let _ = compositor.use_crtc_color_state(CrtcColorState::default());
-                                debug!(
-                                    ?conv,
-                                    ?scanout_plan,
-                                    "Staged Plane COLOR_PIPELINE (colorop) for scanout"
-                                );
-                                self.active_scanout_plan = scanout_plan;
-                                self.failed_scanout_plan = None;
-                            }
-                        } else {
-                            *allow_primary_scanout = false;
-                        }
-                    }
-                    ScanoutPlan::CrtcHardware(conv) => {
-                        compositor.use_color_transforms(std::collections::HashMap::new(), false);
-                        compositor.use_post_blend_encode(None, std::collections::HashMap::new());
-
-                        if self.active_scanout_plan != scanout_plan {
-                            let caps = self.output.scanout_capabilities().unwrap_or_default();
-                            let color_state = conv.to_crtc_color_state(
-                                caps.crtc_color.gamma_lut_size as usize,
-                                caps.crtc_color.degamma_lut_size as usize,
-                            );
-                            match compositor.use_crtc_color_state(color_state) {
-                                Ok(()) => {
-                                    debug!(
-                                        ?conv,
-                                        ?scanout_plan,
-                                        "Staged CRTC hardware color management for scanout"
-                                    );
-                                    self.active_scanout_plan = scanout_plan;
-                                    self.failed_scanout_plan = None;
-                                }
-                                Err(err) => {
-                                    warn!(
-                                        ?err,
-                                        ?scanout_plan,
-                                        "CRTC color state rejected; falling back to shader"
-                                    );
-                                    let _ =
-                                        compositor.use_crtc_color_state(CrtcColorState::default());
-                                    self.active_scanout_plan = ScanoutPlan::DirectPassthrough;
-                                    self.failed_scanout_plan = Some(scanout_plan);
-                                    *allow_primary_scanout = false;
-                                }
-                            }
-                        }
-                    }
-                    ScanoutPlan::DirectPassthrough => {
-                        compositor.use_color_transforms(std::collections::HashMap::new(), false);
-                        compositor.use_post_blend_encode(None, std::collections::HashMap::new());
-
-                        if self.active_scanout_plan != ScanoutPlan::DirectPassthrough {
-                            let _ = compositor.use_crtc_color_state(CrtcColorState::default());
-                            self.active_scanout_plan = ScanoutPlan::DirectPassthrough;
-                        }
-                        self.failed_scanout_plan = None;
-                    }
-                    ScanoutPlan::VulkanFastDirectFlip => unreachable!(),
-                }
+                scanout_plan
             }
         } else {
-            self.failed_scanout_plan = None;
-            compositor.use_color_transforms(std::collections::HashMap::new(), false);
-            compositor.use_post_blend_encode(None, std::collections::HashMap::new());
+            ScanoutPlan::DirectPassthrough
+        };
 
-            if self.active_scanout_plan != ScanoutPlan::DirectPassthrough {
+        let wl_surf = fullscreen_surface.and_then(|f| f.surface.wl_surface());
+        let actual_surf = wl_surf.as_deref().and_then(find_primary_scanout_surface);
+        let current_surf_id = actual_surf.as_ref().map(Id::from_wayland_resource);
+
+        // Fast path: if the target plan has not changed (and for PlaneColorop, the surface has not changed),
+        // we can return early to avoid redundant allocations and state reapplication on every frame.
+        if self.active_scanout_plan == target_plan {
+            match target_plan {
+                ScanoutPlan::PlaneColorop(_) => {
+                    if self.active_scanout_surface == current_surf_id && current_surf_id.is_some() {
+                        return;
+                    }
+                }
+                _ => {
+                    return;
+                }
+            }
+        }
+
+        match target_plan {
+            ScanoutPlan::PlaneColorop(conv) => {
+                if let Some(wl_surf) = wl_surf {
+                    let transform = conv.to_scanout_color_transform();
+                    let mut transforms = std::collections::HashMap::new();
+                    smithay::desktop::utils::with_surfaces_surface_tree(&wl_surf, |s, _| {
+                        transforms.insert(Id::from_wayland_resource(s), transform);
+                    });
+
+                    let is_direct = self
+                        .output
+                        .scanout_capabilities()
+                        .map(|caps| caps.can_plane_colorop_direct(conv))
+                        .unwrap_or(false);
+
+                    let post_blend = if self.hdr_enabled && !is_direct {
+                        let peak = self
+                            .output
+                            .user_data()
+                            .get::<crate::backend::kms::drm_helpers::HdrOutputState>()
+                            .and_then(|s| s.get().or_else(|| s.staged()))
+                            .map(|hdr| hdr.capabilities.max_luminance as f64)
+                            .unwrap_or(1000.0);
+                        Some(PostBlendEncode::for_hdr(peak))
+                    } else {
+                        None
+                    };
+
+                    let linear_transforms = match post_blend {
+                        Some(pb) => transforms
+                            .iter()
+                            .filter_map(|(id, tr)| {
+                                let linear = pb.linear_transform((*tr)?)?;
+                                Some((id.clone(), linear))
+                            })
+                            .collect(),
+                        None => std::collections::HashMap::new(),
+                    };
+
+                    compositor.use_color_transforms(transforms, self.hdr_enabled);
+                    compositor.use_post_blend_encode(post_blend, linear_transforms);
+
+                    let _ = compositor.use_crtc_color_state(CrtcColorState::default());
+                    debug!(
+                        ?conv,
+                        ?scanout_plan,
+                        "Staged Plane COLOR_PIPELINE (colorop) for scanout"
+                    );
+                    self.active_scanout_plan = target_plan;
+                    self.active_scanout_surface = current_surf_id;
+                    self.failed_scanout_plan = None;
+                } else {
+                    *allow_primary_scanout = false;
+                    compositor.use_color_transforms(std::collections::HashMap::new(), false);
+                    compositor.use_post_blend_encode(None, std::collections::HashMap::new());
+                    let _ = compositor.use_crtc_color_state(CrtcColorState::default());
+                    self.active_scanout_plan = ScanoutPlan::DirectPassthrough;
+                    self.active_scanout_surface = None;
+                }
+            }
+            ScanoutPlan::CrtcHardware(conv) => {
+                compositor.use_color_transforms(std::collections::HashMap::new(), false);
+                compositor.use_post_blend_encode(None, std::collections::HashMap::new());
+
+                let caps = self.output.scanout_capabilities().unwrap_or_default();
+                let color_state = conv.to_crtc_color_state(
+                    caps.crtc_color.gamma_lut_size as usize,
+                    caps.crtc_color.degamma_lut_size as usize,
+                );
+                match compositor.use_crtc_color_state(color_state) {
+                    Ok(()) => {
+                        debug!(
+                            ?conv,
+                            ?scanout_plan,
+                            "Staged CRTC hardware color management for scanout"
+                        );
+                        self.active_scanout_plan = target_plan;
+                        self.active_scanout_surface = None;
+                        self.failed_scanout_plan = None;
+                    }
+                    Err(err) => {
+                        warn!(
+                            ?err,
+                            ?scanout_plan,
+                            "CRTC color state rejected; falling back to shader"
+                        );
+                        let _ = compositor.use_crtc_color_state(CrtcColorState::default());
+                        self.active_scanout_plan = ScanoutPlan::DirectPassthrough;
+                        self.active_scanout_surface = None;
+                        self.failed_scanout_plan = Some(scanout_plan);
+                        *allow_primary_scanout = false;
+                    }
+                }
+            }
+            ScanoutPlan::DirectPassthrough => {
+                self.failed_scanout_plan = None;
+                compositor.use_color_transforms(std::collections::HashMap::new(), false);
+                compositor.use_post_blend_encode(None, std::collections::HashMap::new());
+
                 let _ = compositor.use_crtc_color_state(CrtcColorState::default());
                 self.active_scanout_plan = ScanoutPlan::DirectPassthrough;
+                self.active_scanout_surface = None;
             }
+            ScanoutPlan::VulkanFastDirectFlip => unreachable!(),
         }
     }
 
