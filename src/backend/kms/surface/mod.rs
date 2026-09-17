@@ -1331,12 +1331,22 @@ impl SurfaceThreadState {
                     ScanoutPlan::PlaneColorop(conv) => {
                         let wl_surf = fullscreen_surface.and_then(|f| f.surface.wl_surface());
                         if let Some(wl_surf) = wl_surf {
-                            let element_id = Id::from_wayland_resource(&*wl_surf);
                             let transform = conv.to_scanout_color_transform();
-                            let transforms =
-                                std::collections::HashMap::from([(element_id, transform)]);
+                            let mut transforms = std::collections::HashMap::new();
+                            smithay::desktop::utils::with_surfaces_surface_tree(
+                                &wl_surf,
+                                |s, _| {
+                                    transforms.insert(Id::from_wayland_resource(s), transform);
+                                },
+                            );
 
-                            let post_blend = if self.hdr_enabled {
+                            let is_direct = self
+                                .output
+                                .scanout_capabilities()
+                                .map(|caps| caps.can_plane_colorop_direct(conv))
+                                .unwrap_or(false);
+
+                            let post_blend = if self.hdr_enabled && !is_direct {
                                 let peak = self
                                     .output
                                     .user_data()
