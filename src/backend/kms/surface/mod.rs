@@ -211,14 +211,16 @@ impl CursorTransformMode {
     #[inline]
     pub fn for_state(
         hdr_enabled: bool,
-        active_scanout_plan: ScanoutPlan,
+        active_scanout_plan: Option<ScanoutPlan>,
         hdr_reference_white: f32,
     ) -> Self {
         if !hdr_enabled {
             CursorTransformMode::Passthrough
         } else if matches!(
             active_scanout_plan,
-            ScanoutPlan::CrtcHardware(PlaneColorConversion::ScRgbToPq { .. })
+            Some(ScanoutPlan::CrtcHardware(
+                PlaneColorConversion::ScRgbToPq { .. }
+            ))
         ) {
             CursorTransformMode::LinearRec709
         } else {
@@ -247,13 +249,13 @@ pub struct SurfaceThreadState {
     thread_sender: Sender<SurfaceCommand>,
 
     output: Output,
+    fullscreen: Option<FullscreenOccupied>,
     mirroring: Option<Output>,
     screen_filter: ScreenFilter,
     hdr_enabled: bool,
     is_scanout: bool,
     swapchin_is_scanout: bool,
-    active_scanout_plan: ScanoutPlan,
-    failed_scanout_plan: Option<ScanoutPlan>,
+    active_scanout_plan: Option<ScanoutPlan>,
     hdr_reference_white: f32,
     hdr_max_luminance: f32,
     hdr_hardware_offload: bool,
@@ -971,13 +973,13 @@ fn surface_thread(
         thread_sender,
 
         output,
+        fullscreen: None,
         mirroring: None,
         screen_filter,
         hdr_enabled: false,
         is_scanout: false,
         swapchin_is_scanout: false,
-        active_scanout_plan: ScanoutPlan::DirectPassthrough,
-        failed_scanout_plan: None,
+        active_scanout_plan: None,
         hdr_reference_white: 203.0,
         hdr_max_luminance: 1000.0,
         hdr_hardware_offload: false,
@@ -1275,7 +1277,7 @@ fn apply_cursor_buffer_transform(
     compositor: &GbmDrmOutput,
     current_mode: &mut Option<CursorTransformMode>,
     hdr_enabled: bool,
-    active_scanout_plan: ScanoutPlan,
+    active_scanout_plan: Option<ScanoutPlan>,
     hdr_reference_white: f32,
 ) {
     let desired_mode =
@@ -1329,126 +1331,100 @@ impl SurfaceThreadState {
     ) {
         let compositor = self.compositor.as_ref().unwrap();
         if *allow_primary_scanout {
-            if self.failed_scanout_plan.as_ref() == Some(&scanout_plan) {
-                *allow_primary_scanout = false;
-            } else {
-                match scanout_plan {
-                    ScanoutPlan::PlaneColorop(conv) => {
-                        let wl_surf = fullscreen_surface.and_then(|f| f.surface.wl_surface());
-                        if let Some(wl_surf) = wl_surf {
-                            let transform = conv.to_scanout_color_transform();
-                            let mut transforms = std::collections::HashMap::new();
-                            smithay::desktop::utils::with_surfaces_surface_tree(
-                                &wl_surf,
-                                |s, _| {
-                                    transforms.insert(Id::from_wayland_resource(s), transform);
-                                },
-                            );
+            match scanout_plan {
+                ScanoutPlan::PlaneColorop(conv) => {
+                    let wl_surf = fullscreen_surface.and_then(|f| f.surface.wl_surface());
+                    if let Some(wl_surf) = wl_surf {
+                        let transform = conv.to_scanout_color_transform();
+                        let mut transforms = std::collections::HashMap::new();
+                        smithay::desktop::utils::with_surfaces_surface_tree(&wl_surf, |s, _| {
+                            transforms.insert(Id::from_wayland_resource(s), transform);
+                        });
 
-                            let is_direct = self
+                        let is_direct = self
+                            .output
+                            .scanout_capabilities()
+                            .map(|caps| caps.can_plane_colorop_direct(conv))
+                            .unwrap_or(false);
+
+                        let post_blend = if self.hdr_enabled && !is_direct {
+                            let peak = self
                                 .output
-                                .scanout_capabilities()
-                                .map(|caps| caps.can_plane_colorop_direct(conv))
-                                .unwrap_or(false);
-
-                            let post_blend = if self.hdr_enabled && !is_direct {
-                                let peak = self
-                                    .output
-                                    .user_data()
-                                    .get::<crate::backend::kms::drm_helpers::HdrOutputState>()
-                                    .and_then(|s| s.get().or_else(|| s.staged()))
-                                    .map(|hdr| hdr.capabilities.max_luminance as f64)
-                                    .unwrap_or(1000.0);
-                                Some(PostBlendEncode::for_hdr(peak))
-                            } else {
-                                None
-                            };
-
-                            let linear_transforms = match post_blend {
-                                Some(pb) => transforms
-                                    .iter()
-                                    .filter_map(|(id, tr)| {
-                                        let linear = pb.linear_transform((*tr)?)?;
-                                        Some((id.clone(), linear))
-                                    })
-                                    .collect(),
-                                None => std::collections::HashMap::new(),
-                            };
-
-                            compositor.use_color_transforms(transforms, self.hdr_enabled);
-                            compositor.use_post_blend_encode(post_blend, linear_transforms);
-
-                            if self.active_scanout_plan != scanout_plan {
-                                let _ = compositor.use_crtc_color_state(CrtcColorState::default());
-                                debug!(
-                                    ?conv,
-                                    ?scanout_plan,
-                                    "Staged Plane COLOR_PIPELINE (colorop) for scanout"
-                                );
-                                self.active_scanout_plan = scanout_plan;
-                                self.failed_scanout_plan = None;
-                            }
+                                .user_data()
+                                .get::<crate::backend::kms::drm_helpers::HdrOutputState>()
+                                .and_then(|s| s.get().or_else(|| s.staged()))
+                                .map(|hdr| hdr.capabilities.max_luminance as f64)
+                                .unwrap_or(1000.0);
+                            Some(PostBlendEncode::for_hdr(peak))
                         } else {
+                            None
+                        };
+
+                        let linear_transforms = match post_blend {
+                            Some(pb) => transforms
+                                .iter()
+                                .filter_map(|(id, tr)| {
+                                    let linear = pb.linear_transform((*tr)?)?;
+                                    Some((id.clone(), linear))
+                                })
+                                .collect(),
+                            None => std::collections::HashMap::new(),
+                        };
+
+                        let _ = compositor.use_crtc_color_state(CrtcColorState::default());
+                        compositor.use_color_transforms(transforms, self.hdr_enabled);
+                        compositor.use_post_blend_encode(post_blend, linear_transforms);
+
+                        self.active_scanout_plan = Some(scanout_plan);
+                    } else {
+                        *allow_primary_scanout = false;
+                        self.active_scanout_plan = None;
+                        compositor.use_color_transforms(std::collections::HashMap::new(), false);
+                        compositor.use_post_blend_encode(None, std::collections::HashMap::new());
+                    }
+                }
+                ScanoutPlan::CrtcHardware(conv) => {
+                    compositor.use_color_transforms(std::collections::HashMap::new(), false);
+                    compositor.use_post_blend_encode(None, std::collections::HashMap::new());
+                    let caps = self.output.scanout_capabilities().unwrap_or_default();
+                    let color_state = conv.to_crtc_color_state(
+                        caps.crtc_color.gamma_lut_size as usize,
+                        caps.crtc_color.degamma_lut_size as usize,
+                    );
+                    match compositor.use_crtc_color_state(color_state) {
+                        Ok(()) => {
+                            debug!(
+                                ?conv,
+                                ?scanout_plan,
+                                "Staged CRTC hardware color management for scanout"
+                            );
+                            self.active_scanout_plan = Some(scanout_plan);
+                        }
+                        Err(err) => {
+                            warn!(
+                                ?err,
+                                ?scanout_plan,
+                                "CRTC color state rejected; falling back to fallback plan"
+                            );
+                            let _ = compositor.use_crtc_color_state(CrtcColorState::default());
+                            self.active_scanout_plan = Some(ScanoutPlan::VulkanFastDirectFlip);
+                            self.output.set_fullscreen_failed_scanout_plan(scanout_plan);
                             *allow_primary_scanout = false;
                         }
                     }
-                    ScanoutPlan::CrtcHardware(conv) => {
-                        compositor.use_color_transforms(std::collections::HashMap::new(), false);
-                        compositor.use_post_blend_encode(None, std::collections::HashMap::new());
-
-                        if self.active_scanout_plan != scanout_plan {
-                            let caps = self.output.scanout_capabilities().unwrap_or_default();
-                            let color_state = conv.to_crtc_color_state(
-                                caps.crtc_color.gamma_lut_size as usize,
-                                caps.crtc_color.degamma_lut_size as usize,
-                            );
-                            match compositor.use_crtc_color_state(color_state) {
-                                Ok(()) => {
-                                    debug!(
-                                        ?conv,
-                                        ?scanout_plan,
-                                        "Staged CRTC hardware color management for scanout"
-                                    );
-                                    self.active_scanout_plan = scanout_plan;
-                                    self.failed_scanout_plan = None;
-                                }
-                                Err(err) => {
-                                    warn!(
-                                        ?err,
-                                        ?scanout_plan,
-                                        "CRTC color state rejected; falling back to shader"
-                                    );
-                                    let _ =
-                                        compositor.use_crtc_color_state(CrtcColorState::default());
-                                    self.active_scanout_plan = ScanoutPlan::DirectPassthrough;
-                                    self.failed_scanout_plan = Some(scanout_plan);
-                                    *allow_primary_scanout = false;
-                                }
-                            }
-                        }
-                    }
-                    ScanoutPlan::DirectPassthrough => {
-                        compositor.use_color_transforms(std::collections::HashMap::new(), false);
-                        compositor.use_post_blend_encode(None, std::collections::HashMap::new());
-
-                        if self.active_scanout_plan != ScanoutPlan::DirectPassthrough {
-                            let _ = compositor.use_crtc_color_state(CrtcColorState::default());
-                            self.active_scanout_plan = ScanoutPlan::DirectPassthrough;
-                        }
-                        self.failed_scanout_plan = None;
-                    }
-                    ScanoutPlan::VulkanFastDirectFlip => unreachable!(),
+                }
+                ScanoutPlan::DirectPassthrough | ScanoutPlan::VulkanFastDirectFlip => {
+                    self.active_scanout_plan = Some(scanout_plan);
+                    compositor.use_color_transforms(std::collections::HashMap::new(), false);
+                    compositor.use_post_blend_encode(None, std::collections::HashMap::new());
+                    let _ = compositor.use_crtc_color_state(CrtcColorState::default());
                 }
             }
         } else {
-            self.failed_scanout_plan = None;
             compositor.use_color_transforms(std::collections::HashMap::new(), false);
             compositor.use_post_blend_encode(None, std::collections::HashMap::new());
-
-            if self.active_scanout_plan != ScanoutPlan::DirectPassthrough {
-                let _ = compositor.use_crtc_color_state(CrtcColorState::default());
-                self.active_scanout_plan = ScanoutPlan::DirectPassthrough;
-            }
+            self.active_scanout_plan = None;
+            let _ = compositor.use_crtc_color_state(CrtcColorState::default());
         }
     }
 
@@ -1846,7 +1822,7 @@ impl SurfaceThreadState {
                         .is_some_and(|dur| dur <= min_vrr_frame_time)
                 });
                 let prefers_async = fullscreen_surface.prefers_async;
-                let scanout_plan = fullscreen_surface.scanout_plan;
+                let scanout_plan = fullscreen_surface.effective_scanout_plan();
                 (
                     true,
                     drives_refresh_rate,
@@ -1873,14 +1849,16 @@ impl SurfaceThreadState {
             && self.mirroring.is_none()
             && !*DISABLE_DIRECT_SCANOUT;
 
-        self.update_scanout_color_management(
-            scanout_plan,
-            fullscreen_surface.as_ref(),
-            &mut allow_primary_scanout,
-        );
+        if self.fullscreen != fullscreen_surface || self.is_scanout != allow_primary_scanout {
+            self.update_scanout_color_management(
+                scanout_plan,
+                fullscreen_surface.as_ref(),
+                &mut allow_primary_scanout,
+            );
+            self.fullscreen = fullscreen_surface;
+        }
 
         let compositor = self.compositor.as_mut().unwrap();
-
         apply_cursor_buffer_transform(
             compositor,
             &mut self.current_cursor_transform_mode,
@@ -2371,7 +2349,7 @@ impl SurfaceThreadState {
                         .is_some_and(|dur| dur <= min_vrr_frame_time)
                 });
                 let prefers_async = fullscreen_surface.prefers_async;
-                let scanout_plan = fullscreen_surface.scanout_plan;
+                let scanout_plan = fullscreen_surface.effective_scanout_plan();
                 (
                     true,
                     drives_refresh_rate,
@@ -2398,14 +2376,16 @@ impl SurfaceThreadState {
             && self.mirroring.is_none()
             && !*DISABLE_DIRECT_SCANOUT;
 
-        self.update_scanout_color_management(
-            scanout_plan,
-            fullscreen_surface.as_ref(),
-            &mut allow_primary_scanout,
-        );
+        if self.fullscreen != fullscreen_surface || self.is_scanout != allow_primary_scanout {
+            self.update_scanout_color_management(
+                scanout_plan,
+                fullscreen_surface.as_ref(),
+                &mut allow_primary_scanout,
+            );
+            self.fullscreen = fullscreen_surface;
+        }
 
         let compositor = self.compositor.as_mut().unwrap();
-
         apply_cursor_buffer_transform(
             compositor,
             &mut self.current_cursor_transform_mode,
