@@ -398,12 +398,9 @@ impl CompositorHandler for State {
 
         // schedule a new render
         if let Some(output) = shell.visible_output_for_surface(surface) {
-            let is_fullscreen =
-                output
-                    .is_foreground_fullscreen_occupied()
-                    .is_some_and(|cosmic_surface| {
-                        cosmic_surface.has_surface(surface, WindowSurfaceType::ALL)
-                    });
+            let is_fullscreen = output
+                .primary_fullscreen_surface()
+                .is_some_and(|primary| primary == *surface);
             if is_fullscreen {
                 output.refresh_fullscreen_occupied_flags();
                 self.backend.schedule_render_fullscreen(output);

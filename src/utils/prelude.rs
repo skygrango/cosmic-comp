@@ -1,11 +1,14 @@
 use cosmic_comp_config::output::comp::{AdaptiveSync, OutputConfig, OutputState};
 use parking_lot::RwLock;
 use smithay::{
-    backend::drm::{DrmScanoutCapabilities, ScanoutPlan, VrrSupport as Support},
+    backend::{
+        drm::{DrmScanoutCapabilities, ScanoutPlan, VrrSupport as Support},
+        renderer::utils::RendererSurfaceStateUserData,
+    },
     desktop::utils::with_surfaces_surface_tree,
     output::{Output, WeakOutput},
     reexports::wayland_server::{Client, protocol::wl_surface::WlSurface},
-    utils::Rectangle,
+    utils::{Physical, Rectangle, Size},
     wayland::{
         color::management::ImageDescription,
         compositor::{Barrier, CompositorHandler},
@@ -64,6 +67,7 @@ pub trait OutputExt {
     fn set_fullscreen_occupied(&self, occupied: Option<FullscreenOccupied>);
     fn is_foreground_fullscreen_occupied(&self) -> Option<FullscreenOccupied>;
     fn refresh_fullscreen_occupied_flags(&self);
+    fn primary_fullscreen_surface(&self) -> Option<WlSurface>;
 }
 
 struct Vrr(AtomicU8);
@@ -498,6 +502,12 @@ impl OutputExt for Output {
             weak_occ.scanout_plan = plan;
         }
     }
+
+    fn primary_fullscreen_surface(&self) -> Option<WlSurface> {
+        let occupied = self.is_foreground_fullscreen_occupied()?;
+        let root = occupied.surface.wl_surface()?;
+        find_primary_fullscreen_surface(&root, self)
+    }
 }
 
 /// Whether any surface in the tree asked for tearing presentation via
@@ -538,4 +548,98 @@ pub fn surface_tree_is_hdr(surface: &WlSurface) -> bool {
         }
     });
     found
+}
+
+/// Finds the primary fullscreen surface from a window's surface tree for the given output.
+///
+/// To qualify as the primary fullscreen surface:
+/// 1. The surface must have an attached buffer.
+/// 2. The surface/buffer size must closely match the screen/output size (within a 2-pixel
+///    tolerance to account for integer rounding under scaling and avoid floating-point errors).
+/// 3. If multiple surfaces match the screen size, the one that is largest and topmost in the
+///    z-order (nearest to the screen) is selected.
+///
+/// If no surface covers the screen (e.g. undersized window or loading state), returns `None`.
+pub fn find_primary_fullscreen_surface(root: &WlSurface, output: &Output) -> Option<WlSurface> {
+    let output_logical = output.geometry().size;
+    let output_mode = output
+        .current_mode()
+        .map(|m| output.current_transform().transform_size(m.size));
+    let scale = output.current_scale().fractional_scale();
+
+    // Candidates in top-to-bottom order (downward traversal visits topmost first)
+    let mut candidates: Vec<(WlSurface, i64, usize)> = Vec::new();
+    let mut depth: usize = 0;
+
+    with_surfaces_surface_tree(root, |s, states| {
+        depth += 1;
+        let Some(data) = states.data_map.get::<RendererSurfaceStateUserData>() else {
+            return;
+        };
+        let rstate = data.lock().unwrap();
+        if rstate.buffer().is_none() {
+            return;
+        }
+
+        let surf_logical = rstate.surface_size().or_else(|| rstate.buffer_size());
+        let buf_scale = rstate.buffer_scale();
+        let buf_dims: Option<Size<i32, Physical>> = rstate
+            .buffer_size()
+            .map(|sz| (sz.w * buf_scale, sz.h * buf_scale).into());
+
+        // 1. Check logical size match within 2 pixels tolerance
+        let logical_match = surf_logical.is_some_and(|sz| {
+            (sz.w - output_logical.w).abs() <= 2 && (sz.h - output_logical.h).abs() <= 2
+        });
+
+        // 2. Check physical buffer match against output mode within 2 pixels
+        let physical_match = if let (Some(buf), Some(mode)) = (buf_dims, output_mode) {
+            (buf.w - mode.w).abs() <= 2 && (buf.h - mode.h).abs() <= 2
+        } else {
+            false
+        };
+
+        // 3. Check scaled logical match against physical mode within 2 pixels
+        let scaled_match = if let (Some(sz), Some(mode)) = (surf_logical, output_mode) {
+            let scaled_w = (sz.w as f64 * scale).round() as i32;
+            let scaled_h = (sz.h as f64 * scale).round() as i32;
+            (scaled_w - mode.w).abs() <= 2 && (scaled_h - mode.h).abs() <= 2
+        } else {
+            false
+        };
+
+        // 4. Check buffer size logical match
+        let buf_logical_match = rstate.buffer_size().is_some_and(|bsz| {
+            (bsz.w - output_logical.w).abs() <= 2 && (bsz.h - output_logical.h).abs() <= 2
+        });
+
+        if logical_match || physical_match || scaled_match || buf_logical_match {
+            let area = if let Some(buf) = buf_dims {
+                buf.w as i64 * buf.h as i64
+            } else if let Some(sz) = surf_logical {
+                sz.w as i64 * sz.h as i64
+            } else {
+                0
+            };
+            candidates.push((s.clone(), area, depth));
+        }
+    });
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Pick the largest candidate. If areas are roughly equal (both cover the screen),
+    // pick the topmost one (smallest depth index in top-to-bottom traversal).
+    candidates.sort_by(|a, b| {
+        let area_diff = (a.1 - b.1).abs();
+        let max_area = a.1.max(b.1);
+        if max_area > 0 && (area_diff as f64 / max_area as f64) < 0.05 {
+            a.2.cmp(&b.2)
+        } else {
+            b.1.cmp(&a.1)
+        }
+    });
+
+    candidates.first().map(|(s, _, _)| s.clone())
 }

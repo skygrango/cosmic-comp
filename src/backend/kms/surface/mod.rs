@@ -1322,34 +1322,6 @@ fn apply_cursor_buffer_transform(
     }
 }
 
-/// Finds the actual primary scanout surface from a window's surface tree.
-/// In Wayland, an application (like mpv, a browser, or a Wine game) may have an empty toplevel
-/// container while the actual fullscreen content is presented on a subsurface.
-/// This helper finds the surface in the tree that has an attached buffer and the largest area.
-fn find_primary_scanout_surface(root: &WlSurface) -> Option<WlSurface> {
-    let mut candidate: Option<(WlSurface, i64)> = None;
-    smithay::desktop::utils::with_surfaces_surface_tree(root, |s, _| {
-        with_renderer_surface_state(s, |rstate| {
-            if rstate.buffer().is_some() {
-                let area = if let Some(size) = rstate.buffer_size() {
-                    size.w as i64 * size.h as i64
-                } else if let Some(size) = rstate.surface_size() {
-                    size.w as i64 * size.h as i64
-                } else {
-                    0
-                };
-                if candidate
-                    .as_ref()
-                    .map_or(true, |(_, max_area)| area > *max_area)
-                {
-                    candidate = Some((s.clone(), area));
-                }
-            }
-        });
-    });
-    candidate.map(|(s, _)| s).or_else(|| Some(root.clone()))
-}
-
 impl SurfaceThreadState {
     fn update_scanout_color_management(
         &mut self,
@@ -1371,7 +1343,7 @@ impl SurfaceThreadState {
         };
 
         let wl_surf = fullscreen_surface.and_then(|f| f.surface.wl_surface());
-        let actual_surf = wl_surf.as_deref().and_then(find_primary_scanout_surface);
+        let actual_surf = self.output.primary_fullscreen_surface();
         let current_surf_id = actual_surf.as_ref().map(Id::from_wayland_resource);
 
         // Fast path: if the target plan has not changed (and for PlaneColorop, the surface has not changed),
@@ -1882,17 +1854,19 @@ impl SurfaceThreadState {
             if let Some(fullscreen_surface) = output.is_foreground_fullscreen_occupied()
                 && fullscreen_surface.alive()
             {
+                let primary_surf = output.primary_fullscreen_surface();
+                let has_primary_fullscreen = primary_surf.is_some();
                 let min_vrr_frame_time = self
                     .min_vrr_frame_time
                     .unwrap_or(Duration::from_nanos(1_000_000_000 / 30));
-                let drives_refresh_rate = fullscreen_surface.wl_surface().is_some_and(|surface| {
-                    recursive_frame_time_estimation(&self.clock, &surface)
+                let drives_refresh_rate = primary_surf.as_ref().is_some_and(|surface| {
+                    recursive_frame_time_estimation(&self.clock, surface)
                         .is_some_and(|dur| dur <= min_vrr_frame_time)
                 });
                 let prefers_async = fullscreen_surface.prefers_async;
                 let scanout_plan = fullscreen_surface.scanout_plan;
                 (
-                    true,
+                    has_primary_fullscreen,
                     drives_refresh_rate,
                     animations_going,
                     prefers_async,
@@ -2407,17 +2381,19 @@ impl SurfaceThreadState {
             if let Some(fullscreen_surface) = output.is_foreground_fullscreen_occupied()
                 && fullscreen_surface.alive()
             {
+                let primary_surf = output.primary_fullscreen_surface();
+                let has_primary_fullscreen = primary_surf.is_some();
                 let min_vrr_frame_time = self
                     .min_vrr_frame_time
                     .unwrap_or(Duration::from_nanos(1_000_000_000 / 30));
-                let drives_refresh_rate = fullscreen_surface.wl_surface().is_some_and(|surface| {
-                    recursive_frame_time_estimation(&self.clock, &surface)
+                let drives_refresh_rate = primary_surf.as_ref().is_some_and(|surface| {
+                    recursive_frame_time_estimation(&self.clock, surface)
                         .is_some_and(|dur| dur <= min_vrr_frame_time)
                 });
                 let prefers_async = fullscreen_surface.prefers_async;
                 let scanout_plan = fullscreen_surface.scanout_plan;
                 (
-                    true,
+                    has_primary_fullscreen,
                     drives_refresh_rate,
                     animations_going,
                     prefers_async,
