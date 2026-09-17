@@ -58,7 +58,7 @@ use smithay::{
         xwm::{Reorder, XwmId},
     },
 };
-use tracing::{error, trace, warn};
+use tracing::{debug, error, trace, warn};
 use xcursor::parser::Image;
 use xkbcommon::xkb::Keysym;
 
@@ -762,8 +762,17 @@ impl Common {
             && let Some(xwm) = xstate.xwm.as_mut()
             && let Err(err) = xwm.set_randr_primary_output(xwayland_primary_output.as_ref())
         {
-            warn!("Failed to set xwayland primary output: {}", err);
-            return;
+            match err {
+                smithay::xwayland::xwm::PrimaryOutputError::OutputUnknown => {
+                    debug!(
+                        "Xwayland has not yet registered primary output: {:?}",
+                        xwayland_primary_output.map(|o| o.name())
+                    );
+                }
+                _ => {
+                    warn!("Failed to set xwayland primary output: {}", err);
+                }
+            }
         };
 
         self.output_configuration_state.update();
