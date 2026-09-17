@@ -39,6 +39,7 @@ use smithay::{
             CursorBufferTransformFn, DrmDeviceFd, DrmEventMetadata, DrmEventTime, DrmNode,
             ScanoutPlan, SrgbToPqEncoder, VrrSupport,
             color::{CrtcColorState, PlaneColorConversion},
+            colorop::PostBlendEncode,
             compositor::{
                 BlitFrameResultError, FrameError, FrameFlags, PrimaryPlaneElement,
                 RenderFrameResult,
@@ -53,7 +54,7 @@ use smithay::{
             TextureFilter, buffer_dimensions, buffer_type,
             damage::Error as RenderError,
             element::{
-                Element, Kind, RenderElementStates,
+                Element, Id, Kind, RenderElementStates,
                 texture::TextureRenderElement,
                 utils::{
                     ConstrainAlign, ConstrainScaleBehavior, Relocate, RelocateRenderElement,
@@ -1297,10 +1298,145 @@ fn apply_cursor_buffer_transform(
             }
         };
         compositor.set_cursor_buffer_transform(transform);
+
+        let post_blend_transform: Option<CursorBufferTransformFn> = if hdr_enabled {
+            let peak = (hdr_reference_white * 5.0).max(1000.0);
+            let scale = (hdr_reference_white / peak).min(1.0);
+            let encoder = SrgbToPqEncoder::new_linear(scale, false);
+            Some(Box::new(
+                move |data: &mut [u8], stride: u32, size: (u32, u32)| {
+                    encoder.apply(data, stride, size);
+                },
+            ))
+        } else {
+            None
+        };
+        compositor.set_cursor_buffer_transform_post_blend(post_blend_transform);
     }
 }
 
 impl SurfaceThreadState {
+    fn update_scanout_color_management(
+        &mut self,
+        scanout_plan: ScanoutPlan,
+        fullscreen_surface: Option<&FullscreenOccupied>,
+        allow_primary_scanout: &mut bool,
+    ) {
+        let compositor = self.compositor.as_ref().unwrap();
+        if *allow_primary_scanout {
+            if self.failed_scanout_plan.as_ref() == Some(&scanout_plan) {
+                *allow_primary_scanout = false;
+            } else {
+                match scanout_plan {
+                    ScanoutPlan::PlaneColorop(conv) => {
+                        let wl_surf = fullscreen_surface.and_then(|f| f.surface.wl_surface());
+                        if let Some(wl_surf) = wl_surf {
+                            let element_id = Id::from_wayland_resource(&*wl_surf);
+                            let transform = conv.to_scanout_color_transform();
+                            let transforms =
+                                std::collections::HashMap::from([(element_id, transform)]);
+
+                            let post_blend = if self.hdr_enabled {
+                                let peak = self
+                                    .output
+                                    .user_data()
+                                    .get::<crate::backend::kms::drm_helpers::HdrOutputState>()
+                                    .and_then(|s| s.get().or_else(|| s.staged()))
+                                    .map(|hdr| hdr.capabilities.max_luminance as f64)
+                                    .unwrap_or(1000.0);
+                                Some(PostBlendEncode::for_hdr(peak))
+                            } else {
+                                None
+                            };
+
+                            let linear_transforms = match post_blend {
+                                Some(pb) => transforms
+                                    .iter()
+                                    .filter_map(|(id, tr)| {
+                                        let linear = pb.linear_transform((*tr)?)?;
+                                        Some((id.clone(), linear))
+                                    })
+                                    .collect(),
+                                None => std::collections::HashMap::new(),
+                            };
+
+                            compositor.use_color_transforms(transforms, self.hdr_enabled);
+                            compositor.use_post_blend_encode(post_blend, linear_transforms);
+
+                            if self.active_scanout_plan != scanout_plan {
+                                let _ = compositor.use_crtc_color_state(CrtcColorState::default());
+                                debug!(
+                                    ?conv,
+                                    ?scanout_plan,
+                                    "Staged Plane COLOR_PIPELINE (colorop) for scanout"
+                                );
+                                self.active_scanout_plan = scanout_plan;
+                                self.failed_scanout_plan = None;
+                            }
+                        } else {
+                            *allow_primary_scanout = false;
+                        }
+                    }
+                    ScanoutPlan::CrtcHardware(conv) => {
+                        compositor.use_color_transforms(std::collections::HashMap::new(), false);
+                        compositor.use_post_blend_encode(None, std::collections::HashMap::new());
+
+                        if self.active_scanout_plan != scanout_plan {
+                            let caps = self.output.scanout_capabilities().unwrap_or_default();
+                            let color_state = conv.to_crtc_color_state(
+                                caps.crtc_color.gamma_lut_size as usize,
+                                caps.crtc_color.degamma_lut_size as usize,
+                            );
+                            match compositor.use_crtc_color_state(color_state) {
+                                Ok(()) => {
+                                    debug!(
+                                        ?conv,
+                                        ?scanout_plan,
+                                        "Staged CRTC hardware color management for scanout"
+                                    );
+                                    self.active_scanout_plan = scanout_plan;
+                                    self.failed_scanout_plan = None;
+                                }
+                                Err(err) => {
+                                    warn!(
+                                        ?err,
+                                        ?scanout_plan,
+                                        "CRTC color state rejected; falling back to shader"
+                                    );
+                                    let _ =
+                                        compositor.use_crtc_color_state(CrtcColorState::default());
+                                    self.active_scanout_plan = ScanoutPlan::DirectPassthrough;
+                                    self.failed_scanout_plan = Some(scanout_plan);
+                                    *allow_primary_scanout = false;
+                                }
+                            }
+                        }
+                    }
+                    ScanoutPlan::DirectPassthrough => {
+                        compositor.use_color_transforms(std::collections::HashMap::new(), false);
+                        compositor.use_post_blend_encode(None, std::collections::HashMap::new());
+
+                        if self.active_scanout_plan != ScanoutPlan::DirectPassthrough {
+                            let _ = compositor.use_crtc_color_state(CrtcColorState::default());
+                            self.active_scanout_plan = ScanoutPlan::DirectPassthrough;
+                        }
+                        self.failed_scanout_plan = None;
+                    }
+                    ScanoutPlan::VulkanFastDirectFlip => unreachable!(),
+                }
+            }
+        } else {
+            self.failed_scanout_plan = None;
+            compositor.use_color_transforms(std::collections::HashMap::new(), false);
+            compositor.use_post_blend_encode(None, std::collections::HashMap::new());
+
+            if self.active_scanout_plan != ScanoutPlan::DirectPassthrough {
+                let _ = compositor.use_crtc_color_state(CrtcColorState::default());
+                self.active_scanout_plan = ScanoutPlan::DirectPassthrough;
+            }
+        }
+    }
+
     fn node_added(
         &mut self,
         node: DrmNode,
@@ -1654,8 +1790,6 @@ impl SurfaceThreadState {
         render_node: DrmNode,
         estimated_presentation: Duration,
     ) -> Result<()> {
-        let compositor = self.compositor.as_mut().unwrap();
-
         self.timings.start_render(&self.clock);
 
         let mut additional_frame_flags = FrameFlags::empty();
@@ -1667,6 +1801,7 @@ impl SurfaceThreadState {
             animations_going,
             prefers_async,
             scanout_plan,
+            fullscreen_surface,
         ) = {
             let shell = self.shell.read();
             let animations_going = shell.animations_going();
@@ -1689,6 +1824,7 @@ impl SurfaceThreadState {
                     animations_going,
                     prefers_async,
                     scanout_plan,
+                    Some(fullscreen_surface),
                 )
             } else {
                 (
@@ -1697,6 +1833,7 @@ impl SurfaceThreadState {
                     animations_going,
                     false,
                     ScanoutPlan::DirectPassthrough,
+                    None,
                 )
             }
         };
@@ -1707,60 +1844,13 @@ impl SurfaceThreadState {
             && self.mirroring.is_none()
             && !*DISABLE_DIRECT_SCANOUT;
 
-        if allow_primary_scanout {
-            if self.failed_scanout_plan.as_ref() == Some(&scanout_plan) {
-                allow_primary_scanout = false;
-            } else {
-                match scanout_plan {
-                    ScanoutPlan::CrtcHardware(conv) | ScanoutPlan::PlaneColorop(conv) => {
-                        if self.active_scanout_plan != scanout_plan {
-                            let caps = self.output.scanout_capabilities().unwrap_or_default();
-                            let color_state = conv.to_crtc_color_state(
-                                caps.crtc_color.gamma_lut_size as usize,
-                                caps.crtc_color.degamma_lut_size as usize,
-                            );
-                            match compositor.use_crtc_color_state(color_state) {
-                                Ok(()) => {
-                                    debug!(
-                                        ?conv,
-                                        ?scanout_plan,
-                                        "Staged hardware color management for scanout"
-                                    );
-                                    self.active_scanout_plan = scanout_plan;
-                                    self.failed_scanout_plan = None;
-                                }
-                                Err(err) => {
-                                    warn!(
-                                        ?err,
-                                        ?scanout_plan,
-                                        "Hardware color state rejected; falling back to shader"
-                                    );
-                                    let _ =
-                                        compositor.use_crtc_color_state(CrtcColorState::default());
-                                    self.active_scanout_plan = ScanoutPlan::DirectPassthrough;
-                                    self.failed_scanout_plan = Some(scanout_plan);
-                                    allow_primary_scanout = false;
-                                }
-                            }
-                        }
-                    }
-                    ScanoutPlan::DirectPassthrough => {
-                        if self.active_scanout_plan != ScanoutPlan::DirectPassthrough {
-                            let _ = compositor.use_crtc_color_state(CrtcColorState::default());
-                            self.active_scanout_plan = ScanoutPlan::DirectPassthrough;
-                        }
-                        self.failed_scanout_plan = None;
-                    }
-                    ScanoutPlan::VulkanFastDirectFlip => unreachable!(),
-                }
-            }
-        } else {
-            self.failed_scanout_plan = None;
-            if self.active_scanout_plan != ScanoutPlan::DirectPassthrough {
-                let _ = compositor.use_crtc_color_state(CrtcColorState::default());
-                self.active_scanout_plan = ScanoutPlan::DirectPassthrough;
-            }
-        }
+        self.update_scanout_color_management(
+            scanout_plan,
+            fullscreen_surface.as_ref(),
+            &mut allow_primary_scanout,
+        );
+
+        let compositor = self.compositor.as_mut().unwrap();
 
         apply_cursor_buffer_transform(
             compositor,
@@ -2225,8 +2315,6 @@ impl SurfaceThreadState {
         render_node: DrmNode,
         estimated_presentation: Duration,
     ) -> Result<()> {
-        let compositor = self.compositor.as_mut().unwrap();
-
         self.timings.start_render(&self.clock);
 
         let mut additional_frame_flags = FrameFlags::empty();
@@ -2238,6 +2326,7 @@ impl SurfaceThreadState {
             animations_going,
             _prefers_async,
             scanout_plan,
+            fullscreen_surface,
         ) = {
             let shell = self.shell.read();
             let animations_going = shell.animations_going();
@@ -2260,6 +2349,7 @@ impl SurfaceThreadState {
                     animations_going,
                     prefers_async,
                     scanout_plan,
+                    Some(fullscreen_surface),
                 )
             } else {
                 (
@@ -2268,6 +2358,7 @@ impl SurfaceThreadState {
                     animations_going,
                     false,
                     ScanoutPlan::DirectPassthrough,
+                    None,
                 )
             }
         };
@@ -2278,60 +2369,13 @@ impl SurfaceThreadState {
             && self.mirroring.is_none()
             && !*DISABLE_DIRECT_SCANOUT;
 
-        if allow_primary_scanout {
-            if self.failed_scanout_plan.as_ref() == Some(&scanout_plan) {
-                allow_primary_scanout = false;
-            } else {
-                match scanout_plan {
-                    ScanoutPlan::CrtcHardware(conv) | ScanoutPlan::PlaneColorop(conv) => {
-                        if self.active_scanout_plan != scanout_plan {
-                            let caps = self.output.scanout_capabilities().unwrap_or_default();
-                            let color_state = conv.to_crtc_color_state(
-                                caps.crtc_color.gamma_lut_size as usize,
-                                caps.crtc_color.degamma_lut_size as usize,
-                            );
-                            match compositor.use_crtc_color_state(color_state) {
-                                Ok(()) => {
-                                    debug!(
-                                        ?conv,
-                                        ?scanout_plan,
-                                        "Staged hardware color management for Vulkan scanout"
-                                    );
-                                    self.active_scanout_plan = scanout_plan;
-                                    self.failed_scanout_plan = None;
-                                }
-                                Err(err) => {
-                                    warn!(
-                                        ?err,
-                                        ?scanout_plan,
-                                        "Hardware color state rejected; falling back to Vulkan shader"
-                                    );
-                                    let _ =
-                                        compositor.use_crtc_color_state(CrtcColorState::default());
-                                    self.active_scanout_plan = ScanoutPlan::DirectPassthrough;
-                                    self.failed_scanout_plan = Some(scanout_plan);
-                                    allow_primary_scanout = false;
-                                }
-                            }
-                        }
-                    }
-                    ScanoutPlan::DirectPassthrough => {
-                        if self.active_scanout_plan != ScanoutPlan::DirectPassthrough {
-                            let _ = compositor.use_crtc_color_state(CrtcColorState::default());
-                            self.active_scanout_plan = ScanoutPlan::DirectPassthrough;
-                        }
-                        self.failed_scanout_plan = None;
-                    }
-                    ScanoutPlan::VulkanFastDirectFlip => unreachable!(),
-                }
-            }
-        } else {
-            self.failed_scanout_plan = None;
-            if self.active_scanout_plan != ScanoutPlan::DirectPassthrough {
-                let _ = compositor.use_crtc_color_state(CrtcColorState::default());
-                self.active_scanout_plan = ScanoutPlan::DirectPassthrough;
-            }
-        }
+        self.update_scanout_color_management(
+            scanout_plan,
+            fullscreen_surface.as_ref(),
+            &mut allow_primary_scanout,
+        );
+
+        let compositor = self.compositor.as_mut().unwrap();
 
         apply_cursor_buffer_transform(
             compositor,
@@ -3849,6 +3893,7 @@ mod tests {
                 has_ctm: true,
             },
             supports_plane_colorop: false,
+            primary_plane_color_pipelines: Vec::new(),
             primary_plane_formats: FormatSet::default(),
             supports_fp16: true,
             supports_10bit: true,
@@ -4006,14 +4051,56 @@ mod tests {
     }
 
     #[test]
+    fn test_plane_colorop_scanout_color_transform() {
+        use smithay::backend::drm::color::PlaneColorConversion;
+        use smithay::backend::drm::colorop::{Curve1DType, PostBlendEncode};
+
+        // 1. scRGB to PQ (HDR)
+        let scrgb = PlaneColorConversion::ScRgbToPq {
+            reference_white: 203,
+        };
+        let tr = scrgb
+            .to_scanout_color_transform()
+            .expect("scRGB to PQ transform");
+        assert_eq!(tr.decode, None); // scRGB is linear
+        assert_eq!(tr.encode, Some(Curve1DType::Pq125InvEotf));
+        assert!((tr.multiplier - (203.0 / 80.0)).abs() < 1e-6);
+        assert!(tr.ctm.is_some());
+        let ctm = tr.ctm.unwrap();
+        assert!((ctm[0] - 0.6274040).abs() < 1e-4);
+
+        // 2. sRGB to PQ (HDR)
+        let srgb = PlaneColorConversion::SrgbToPq {
+            reference_white: 203,
+        };
+        let tr = srgb
+            .to_scanout_color_transform()
+            .expect("sRGB to PQ transform");
+        assert_eq!(tr.decode, Some(Curve1DType::SrgbEotf));
+        assert_eq!(tr.encode, Some(Curve1DType::Pq125InvEotf));
+        assert!((tr.multiplier - (203.0 / 80.0)).abs() < 1e-6);
+
+        // 3. Post-blend encode offload
+        let pb = PostBlendEncode::for_hdr(1000.0);
+        assert_eq!(pb.encode, Curve1DType::Pq125InvEotf);
+        assert!((pb.linear_max - (1000.0 / 80.0)).abs() < 1e-6);
+
+        let linear_tr = pb.linear_transform(tr).expect("linear transform");
+        assert_eq!(linear_tr.encode, None);
+        assert!((linear_tr.multiplier - (203.0 / 1000.0)).abs() < 1e-4);
+    }
+
+    #[test]
     fn test_hardware_scanout_color_schemes_report() {
         use smithay::backend::allocator::Fourcc;
         use smithay::backend::drm::DrmDeviceFd;
         use smithay::backend::drm::color::{CrtcColorCapabilities, DrmScanoutCapabilities};
+        use smithay::backend::drm::colorop::{ColorOpKind, plane_color_pipelines};
         use smithay::reexports::drm::ClientCapability;
         use smithay::reexports::drm::Device as BasicDevice;
         use smithay::reexports::drm::control::Device as ControlDevice;
         use smithay::utils::DeviceFd;
+        use smithay::wayland::color::management::TransferFunction;
 
         println!(
             "\n================================================================================"
@@ -4205,6 +4292,119 @@ mod tests {
                         if supports_fp16 { "YES" } else { "NO" }
                     );
 
+                    let pipelines = if has_color_pipeline {
+                        plane_color_pipelines(&drm_fd, *plane_handle).unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+
+                    println!("      - Discovered Color Pipelines: {}", pipelines.len());
+                    for (i, p) in pipelines.iter().enumerate() {
+                        println!(
+                            "        * Pipeline #{} (ID: {}) [{} colorops]:",
+                            i,
+                            p.id,
+                            p.ops.len()
+                        );
+                        for (op_idx, op) in p.ops.iter().enumerate() {
+                            let bypass_tag = if op.bypassable {
+                                "Bypassable"
+                            } else {
+                                "Mandatory"
+                            };
+                            match &op.kind {
+                                ColorOpKind::Curve1D { supported } => {
+                                    let names: Vec<_> =
+                                        supported.iter().map(|(c, _)| format!("{:?}", c)).collect();
+                                    println!(
+                                        "          [Op {}] ID: {} | 1D Curve [{}] ({})",
+                                        op_idx,
+                                        op.id,
+                                        names.join(", "),
+                                        bypass_tag
+                                    );
+                                }
+                                ColorOpKind::Multiplier => {
+                                    println!(
+                                        "          [Op {}] ID: {} | Multiplier (S31.32 fixed-point) ({})",
+                                        op_idx, op.id, bypass_tag
+                                    );
+                                }
+                                ColorOpKind::Ctm3x4 => {
+                                    println!(
+                                        "          [Op {}] ID: {} | 3x4 Matrix (DRM CTM) ({})",
+                                        op_idx, op.id, bypass_tag
+                                    );
+                                }
+                                ColorOpKind::Lut1D {
+                                    size,
+                                    interpolation,
+                                } => {
+                                    println!(
+                                        "          [Op {}] ID: {} | 1D LUT (size: {}, {:?}) ({})",
+                                        op_idx, op.id, size, interpolation, bypass_tag
+                                    );
+                                }
+                                ColorOpKind::Lut3D {
+                                    size,
+                                    interpolation,
+                                } => {
+                                    println!(
+                                        "          [Op {}] ID: {} | 3D LUT (size: {}, {:?}) ({})",
+                                        op_idx, op.id, size, interpolation, bypass_tag
+                                    );
+                                }
+                                ColorOpKind::Unknown { type_name } => {
+                                    println!(
+                                        "          [Op {}] ID: {} | Unknown Type: {} ({})",
+                                        op_idx, op.id, type_name, bypass_tag
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // Also check Overlay and Cursor planes for Colorop capabilities
+                    let mut overlay_colorop_count = 0;
+                    let mut cursor_colorop_count = 0;
+                    for other_plane in plane_handles.iter() {
+                        if other_plane == plane_handle {
+                            continue;
+                        }
+                        let Ok(other_props) = drm_fd.get_properties(*other_plane) else {
+                            continue;
+                        };
+                        let mut is_overlay = false;
+                        let mut is_cursor = false;
+                        let mut has_colorop = false;
+                        for (&p_h, &p_v) in &other_props {
+                            if let Ok(p_info) = drm_fd.get_property(p_h) {
+                                let name = p_info.name().to_string_lossy();
+                                if name == "type" {
+                                    if p_v == 0 {
+                                        is_overlay = true;
+                                    } else if p_v == 2 {
+                                        is_cursor = true;
+                                    }
+                                } else if name == "COLOR_PIPELINE" {
+                                    has_colorop = true;
+                                }
+                            }
+                        }
+                        if has_colorop {
+                            if is_overlay {
+                                overlay_colorop_count += 1;
+                            }
+                            if is_cursor {
+                                cursor_colorop_count += 1;
+                            }
+                        }
+                    }
+                    println!(
+                        "      - Other Planes Colorop: {} overlay plane(s), {} cursor plane(s) advertise COLOR_PIPELINE",
+                        overlay_colorop_count, cursor_colorop_count
+                    );
+
                     let caps = DrmScanoutCapabilities {
                         crtc_color: CrtcColorCapabilities {
                             has_gamma_lut,
@@ -4214,6 +4414,7 @@ mod tests {
                             has_ctm,
                         },
                         supports_plane_colorop: has_color_pipeline,
+                        primary_plane_color_pipelines: pipelines.clone(),
                         primary_plane_formats: Default::default(),
                         supports_fp16,
                         supports_10bit,
@@ -4237,6 +4438,9 @@ mod tests {
                         desc: Option<ImageDescription>,
                     }
 
+                    let mut hlg_desc = ImageDescription::WINDOWS_BT2100;
+                    hlg_desc.transfer = TransferFunction::Hlg;
+
                     let test_cases = vec![
                         TestCase {
                             output_hdr: false,
@@ -4257,6 +4461,12 @@ mod tests {
                             desc: Some(ImageDescription::WINDOWS_BT2100),
                         },
                         TestCase {
+                            output_hdr: false,
+                            output_name: "SDR Display (sRGB Rec.709)",
+                            content_name: "HLG Content (BT.2100 HLG)",
+                            desc: Some(hlg_desc),
+                        },
+                        TestCase {
                             output_hdr: true,
                             output_name: "HDR Display (PQ BT.2020)",
                             content_name: "HDR10 Content (PQ BT.2020 10-bit)",
@@ -4277,98 +4487,179 @@ mod tests {
                         TestCase {
                             output_hdr: true,
                             output_name: "HDR Display (PQ BT.2020)",
+                            content_name: "HLG Content (BT.2100 HLG)",
+                            desc: Some(hlg_desc),
+                        },
+                        TestCase {
+                            output_hdr: true,
+                            output_name: "HDR Display (PQ BT.2020)",
                             content_name: "Untagged Legacy Client",
                             desc: None,
                         },
                     ];
 
-                    for tc in test_cases {
+                    for tc in &test_cases {
                         println!(
                             "\n    [*] Mode: {}  |  Content: {}",
                             tc.output_name, tc.content_name
                         );
+                        // True scanout plan evaluation under test (calling caps.evaluate_scanout_plan)
                         let plan = caps.evaluate_scanout_plan(tc.output_hdr, tc.desc.as_ref(), 203);
 
-                        let passthrough_possible = match (tc.output_hdr, &tc.desc) {
+                        // Report step 1: Tier 1 DirectPassthrough evaluation test
+                        let t1_matched = match (tc.output_hdr, &tc.desc) {
                             (false, Some(d)) if !d.is_hdr() && !d.windows_scrgb => true,
                             (false, None) => true,
                             (true, Some(d)) if d.is_pq_bt2020() => true,
                             _ => false,
                         };
-                        if passthrough_possible {
+                        if t1_matched {
                             println!(
-                                "      [Tier 1: DirectPassthrough]  SUPPORTED (Zero GPU/Display transformation)"
+                                "      [Tier 1: DirectPassthrough]  TEST PASSED: Native format matches display signal with zero transformation"
                             );
                         } else {
                             println!(
-                                "      [Tier 1: DirectPassthrough]  UNSUPPORTED (Reason: Color space or EOTF mismatch between content and display)"
+                                "      [Tier 1: DirectPassthrough]  TEST REJECTED: Color space or EOTF mismatch requires conversion"
                             );
                         }
 
-                        if caps.supports_plane_colorop {
-                            println!(
-                                "      [Tier 2A: PlaneColorop]      SUPPORTED (Plane COLOR_PIPELINE hardware)"
-                            );
-                        } else {
-                            println!(
-                                "      [Tier 2A: PlaneColorop]      UNSUPPORTED (Reason: Kernel driver does not expose COLOR_PIPELINE property)"
-                            );
-                        }
-
-                        let crtc_hardware_possible = match (tc.output_hdr, &tc.desc) {
-                            (false, Some(d)) if d.windows_scrgb => {
-                                caps.supports_scrgb_hardware_scanout()
+                        // Report step 2: Tier 2A PlaneColorop evaluation test
+                        match plan {
+                            ScanoutPlan::PlaneColorop(conv) => {
+                                println!(
+                                    "      [Tier 2A: PlaneColorop]      TEST PASSED: Verified hardware plane color pipeline can execute {:?}",
+                                    conv
+                                );
+                                if let Some(tr) = conv.to_scanout_color_transform() {
+                                    for p in &pipelines {
+                                        if let Some(plan_ops) = tr.plan(p) {
+                                            println!(
+                                                "        Colorop Hardware Op Allocation Strategy (Pipeline ID {}):",
+                                                p.id
+                                            );
+                                            for (op_idx, (op, plan_item)) in
+                                                p.ops.iter().zip(plan_ops.iter()).enumerate()
+                                            {
+                                                println!(
+                                                    "          - Op {} (ID {}, {}): {}",
+                                                    op_idx,
+                                                    op.id,
+                                                    op.kind.name(),
+                                                    plan_item.description(op)
+                                                );
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
                             }
-                            (false, Some(d)) if d.is_pq_bt2020() => {
-                                caps.crtc_color.has_degamma_lut
-                                    && caps.crtc_color.has_ctm
-                                    && caps.crtc_color.has_gamma_lut
-                            }
-                            (true, Some(d)) if d.windows_scrgb => {
-                                caps.supports_scrgb_hardware_scanout()
-                            }
-                            (true, Some(d)) if !d.is_hdr() => {
-                                caps.supports_sdr_to_hdr_hardware_scanout()
-                            }
-                            (true, None) => caps.supports_sdr_to_hdr_hardware_scanout(),
-                            _ => false,
-                        };
-                        if crtc_hardware_possible {
-                            println!(
-                                "      [Tier 2B: CrtcHardware]      SUPPORTED (CRTC DEGAMMA+CTM+GAMMA available, blob format verified)"
-                            );
-                        } else {
-                            let mut reasons = Vec::new();
-                            if !caps.crtc_color.has_gamma_lut {
-                                reasons.push("CRTC lacks GAMMA_LUT");
-                            }
-                            if !caps.crtc_color.has_ctm {
-                                reasons.push("CRTC lacks CTM");
-                            }
-                            if !caps.crtc_color.has_degamma_lut {
-                                reasons.push("CRTC lacks DEGAMMA_LUT");
-                            }
-                            if tc.desc.as_ref().is_some_and(|d| d.windows_scrgb)
-                                && !caps.supports_fp16
-                            {
-                                reasons.push("Primary plane lacks FP16 format");
-                            }
-                            if reasons.is_empty() {
-                                reasons.push(
-                                    "Conversion scheme not applicable or direct scanout preferred",
+                            ScanoutPlan::DirectPassthrough => {
+                                println!(
+                                    "      [Tier 2A: PlaneColorop]      SKIPPED: Tier 1 DirectPassthrough already satisfied output without conversion"
                                 );
                             }
-                            println!(
-                                "      [Tier 2B: CrtcHardware]      UNSUPPORTED (Reason: {})",
-                                reasons.join(", ")
-                            );
+                            _ => {
+                                if !caps.supports_plane_colorop {
+                                    println!(
+                                        "      [Tier 2A: PlaneColorop]      TEST REJECTED: Plane lacks COLOR_PIPELINE property"
+                                    );
+                                } else if pipelines.is_empty() {
+                                    println!(
+                                        "      [Tier 2A: PlaneColorop]      TEST REJECTED: Plane has COLOR_PIPELINE property but no usable pipelines"
+                                    );
+                                } else {
+                                    println!(
+                                        "      [Tier 2A: PlaneColorop]      TEST REJECTED: Plane pipelines cannot fulfill required transform stages or lacks FP16 format"
+                                    );
+                                }
+                            }
                         }
 
-                        println!(
-                            "      [Tier 3: VulkanShaderFlip]   SUPPORTED (Vulkan compute/raster shader converts in VRAM before scanout)"
-                        );
+                        // Report step 3: Tier 2B CrtcHardware evaluation test
+                        match plan {
+                            ScanoutPlan::CrtcHardware(conv) => {
+                                println!(
+                                    "      [Tier 2B: CrtcHardware]      TEST PASSED: CRTC DEGAMMA+CTM+GAMMA verified for {:?}",
+                                    conv
+                                );
+                            }
+                            ScanoutPlan::DirectPassthrough | ScanoutPlan::PlaneColorop(_) => {
+                                println!(
+                                    "      [Tier 2B: CrtcHardware]      SKIPPED: Higher-priority tier (Tier 1 or Tier 2A) successfully selected"
+                                );
+                            }
+                            _ => {
+                                println!(
+                                    "      [Tier 2B: CrtcHardware]      TEST REJECTED: CRTC lacks required DEGAMMA/CTM/GAMMA LUT hardware or format"
+                                );
+                            }
+                        }
+
+                        // Report step 4: Tier 3 VulkanFastDirectFlip evaluation test
+                        match plan {
+                            ScanoutPlan::VulkanFastDirectFlip => {
+                                println!(
+                                    "      [Tier 3: VulkanShaderFlip]   TEST SELECTED: Hardware tiers unavailable or tonemapping needed, falling back to Vulkan VRAM fast flip"
+                                );
+                            }
+                            _ => {
+                                println!(
+                                    "      [Tier 3: VulkanShaderFlip]   STANDBY: Available as fallback, not needed for this format"
+                                );
+                            }
+                        }
+
                         println!("      => Final Selected Plan: {:?}", plan);
                     }
+
+                    println!(
+                        "\n    ------------------------------------------------------------------------------------------------"
+                    );
+                    println!(
+                        "    SCANOUT COLOR SCHEMES DECISION MATRIX SUMMARY (CRTC {:?})",
+                        crtc_handle
+                    );
+                    println!(
+                        "    ------------------------------------------------------------------------------------------------"
+                    );
+                    println!(
+                        "    | Display Output   | Content Format       | Tier 1 Direct | Tier 2A Colorop | Final Selected Plan          |"
+                    );
+                    println!(
+                        "    |------------------|----------------------|---------------|-----------------|------------------------------|"
+                    );
+                    for tc in &test_cases {
+                        let plan = caps.evaluate_scanout_plan(tc.output_hdr, tc.desc.as_ref(), 203);
+                        let t1_status = if matches!(plan, ScanoutPlan::DirectPassthrough) {
+                            "YES (Direct)"
+                        } else {
+                            "Mismatch"
+                        };
+                        let t2a_status = match plan {
+                            ScanoutPlan::PlaneColorop(_) => "YES (Colorop)",
+                            ScanoutPlan::DirectPassthrough => "Not Needed",
+                            _ => "Fallback",
+                        };
+                        println!(
+                            "    | {:<16} | {:<20} | {:<13} | {:<15} | {:<28} |",
+                            if tc.output_hdr {
+                                "HDR (PQ BT.2020)"
+                            } else {
+                                "SDR (sRGB)"
+                            },
+                            tc.content_name
+                                .split('(')
+                                .next()
+                                .unwrap_or(tc.content_name)
+                                .trim(),
+                            t1_status,
+                            t2a_status,
+                            format!("{:?}", plan)
+                        );
+                    }
+                    println!(
+                        "    ------------------------------------------------------------------------------------------------"
+                    );
                 }
             }
         }
