@@ -1270,11 +1270,10 @@ impl InnerDevice {
             }
             Ok(true)
         } else {
-            if self.vulkan.is_some() {
-                let _ = self.vulkan.take();
-                api.remove_node(&self.render_node);
-            }
-            Ok(false)
+            // For Vulkan, do not destroy the renderer simply because outputs are temporarily sleeping or inactive.
+            // Keeping the renderer alive preserves allocated surface textures across DPMS off/on cycles.
+            // The renderer will only be cleaned up when cosmic-comp shuts down or on device removal.
+            Ok(self.vulkan.is_some())
         }
     }
 

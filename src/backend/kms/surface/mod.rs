@@ -436,6 +436,7 @@ pub enum SurfaceCommand {
     SendFrames(usize),
     RenderStates(RenderElementStates),
     FatalRenderError(String),
+    DeviceLost(DrmNode),
     ProcessShmScreencopy,
 }
 
@@ -622,6 +623,10 @@ impl Surface {
                     state.common.should_stop = true;
                     state.common.event_loop_signal.stop();
                     state.common.event_loop_signal.wakeup();
+                }
+                Event::Msg(SurfaceCommand::DeviceLost(target_node)) => {
+                    error!(output = %output_clone.name(), ?target_node, "Vulkan device lost received on main thread; initiating recovery");
+                    state.handle_vulkan_device_lost(target_node);
                 }
                 Event::Closed => {}
             })
@@ -1731,6 +1736,20 @@ impl SurfaceThreadState {
                 if let Err(err) = state.redraw(estimated_presentation) {
                     let name = state.output.name();
                     warn!(?name, "Failed to submit rendering: {:?}", err);
+                    let err_str = format!("{err:?}");
+                    if err_str.contains("DeadDevice")
+                        || err_str.contains("ERROR_DEVICE_LOST")
+                        || err_str.contains("DeviceLost")
+                    {
+                        error!(
+                            ?name,
+                            "Vulkan device lost in surface thread! Requesting GPU recovery."
+                        );
+                        let _ = state
+                            .thread_sender
+                            .send(SurfaceCommand::DeviceLost(state.target_node));
+                        return TimeoutAction::Drop;
+                    }
                     if hdr_policy().require_active {
                         let _ = state
                             .thread_sender

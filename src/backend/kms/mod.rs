@@ -638,6 +638,92 @@ impl State {
         loop_signal.wakeup();
     }
 
+    pub fn handle_vulkan_device_lost(&mut self, target_node: DrmNode) {
+        error!(?target_node, "Initiating Vulkan device lost recovery");
+
+        // 1. Evict all cached textures for all Wayland surfaces known to the compositor
+        self.common.compositor_state.for_each_surface(|surface| {
+            smithay::backend::renderer::utils::with_renderer_surface_state(surface, |state| {
+                state.clear_textures();
+            });
+        });
+
+        // 2. Identify the target render node
+        let kms = self.backend.kms();
+        let primary_node = kms.primary_node.read().unwrap().clone();
+        let render_node = if let Some(device) = kms
+            .drm_devices
+            .values()
+            .find(|d| d.inner.render_node == target_node || d.inner.dev_node == target_node)
+        {
+            device.inner.render_node
+        } else {
+            error!(
+                ?target_node,
+                "Could not find DRM device for lost target node"
+            );
+            return;
+        };
+
+        // 3. Remove the dead node from all active surfaces so they tear down the lost surface renderer
+        for surface in kms
+            .drm_devices
+            .values_mut()
+            .flat_map(|d| d.inner.surfaces.values_mut())
+        {
+            surface.remove_node(render_node);
+        }
+
+        // 4. Tear down and re-create the backend's Vulkan renderer
+        let KmsGpuApi::Vulkan { api, .. } = &mut kms.api else {
+            return;
+        };
+        if let Some(device) = kms
+            .drm_devices
+            .values_mut()
+            .find(|d| d.inner.render_node == render_node)
+        {
+            let _ = device.inner.vulkan.take();
+            api.as_mut().remove_node(&render_node);
+
+            match device
+                .inner
+                .update_vulkan(primary_node.as_ref(), api.as_mut())
+            {
+                Ok(_) => {
+                    info!(
+                        ?render_node,
+                        "Vulkan backend renderer re-created successfully after device lost"
+                    );
+                }
+                Err(err) => {
+                    error!(
+                        ?err,
+                        ?render_node,
+                        "Failed to re-create Vulkan backend renderer during recovery"
+                    );
+                    return;
+                }
+            }
+        }
+
+        // 5. Update surface nodes: this adds the newly created renderer back to all surfaces
+        if let Err(err) = kms.refresh_used_devices() {
+            error!(
+                ?err,
+                "Failed to refresh used devices during Vulkan recovery"
+            );
+        }
+
+        // 6. Re-schedule rendering on all active surfaces to restore the display
+        for device in kms.drm_devices.values_mut() {
+            for surface in device.inner.surfaces.values() {
+                surface.schedule_render();
+            }
+        }
+        info!("Vulkan device lost recovery completed successfully");
+    }
+
     fn pause_session(&mut self) {
         let backend = self.backend.kms();
         backend.libinput.suspend();
@@ -932,10 +1018,11 @@ impl KmsState {
 
         for device in self.drm_devices.values_mut() {
             if device.inner.is_vulkan {
-                if device.inner.vulkan.take().is_some() {
-                    self.api.remove_node(&device.inner.render_node);
-                    device.inner.update_surface_nodes(&empty_devices, &[])?;
-                }
+                // Keep Vulkan renderers and devices alive across session resume.
+                // Vulkan devices and textures persist cleanly across DPMS off/on and suspend.
+                // Recreating the context during resume causes VkDevice to be destroyed
+                // while active client surface textures remain alive in memory.
+                continue;
             } else if device.inner.egl.take().is_some() {
                 self.api.remove_node(&device.inner.render_node);
                 device.inner.update_surface_nodes(&empty_devices, &[])?;

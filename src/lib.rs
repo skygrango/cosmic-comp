@@ -390,9 +390,14 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    // drop eventloop & state before logger
+    // drop eventloop & state before logger. Drop common (Wayland client surfaces and textures)
+    // before backend so that all Vulkan child resources are cleaned up prior to device destruction.
     std::mem::drop(event_loop);
-    std::mem::drop(state);
+    std::mem::drop(state.common);
+    std::mem::drop(state.backend);
+    std::mem::drop(state.ready);
+    std::mem::drop(state.last_refresh);
+    std::mem::drop(state.kiosk_command);
 
     if let Some(code) = kiosk_exit_code {
         process::exit(code);
