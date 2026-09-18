@@ -811,6 +811,7 @@ name = "cosmic-comp"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "bitflags 2.13.2",
  "calloop",
  "clap_lex",
@@ -5086,7 +5087,7 @@ checksum = "ba467056f1b547ed52077911161fc86985becbc60e8e1857c8a144dab0def891"
 [[package]]
 name = "smithay"
 version = "0.7.0"
-source = "git+https://github.com/skygrango/smithay.git?rev=392944d#392944d0b2a79ab4fc5a6008a3445c0a33d906b4"
+source = "git+https://github.com/skygrango/smithay.git?rev=1d64edb#1d64edb28f2d2c586e82dffd27d997254e24d3bc"
 dependencies = [
  "aliasable",
  "appendlist",
