@@ -1,7 +1,10 @@
 use crate::{
     backend::render::{
-        IndicatorShader, Key, Usage, cursor::CursorState, element::AsGlowRenderer,
-        shadow::ShadowShader, wayland::SurfaceRenderElement,
+        IndicatorShader, Key, Usage,
+        cursor::CursorState,
+        element::AsGlowRenderer,
+        shadow::{ShadowElement, ShadowShader},
+        wayland::SurfaceRenderElement,
     },
     hooks::{Decorations, HOOKS},
     shell::{
@@ -405,7 +408,7 @@ impl CosmicWindow {
         alpha: f32,
     ) -> Option<C>
     where
-        R: AsGlowRenderer,
+        R: AsGlowRenderer + ImportAll + ImportMem,
         R::TextureId: Send + Clone + 'static,
         C: From<CosmicWindowRenderElement<R>>,
     {
@@ -1416,7 +1419,7 @@ impl WaylandFocus for CosmicWindow {
 
 pub enum CosmicWindowRenderElement<R: AsGlowRenderer + ImportAll + ImportMem> {
     Header(IcedRenderElement<R>),
-    Shadow(PixelShaderElement),
+    Shadow(ShadowElement<R>),
     Border(PixelShaderElement),
     Window(SurfaceRenderElement<R>),
 }
@@ -1564,7 +1567,10 @@ where
             CosmicWindowRenderElement::Header(elem) => {
                 elem.draw(frame, src, dst, damage, opaque_regions, cache)
             }
-            CosmicWindowRenderElement::Shadow(elem) | CosmicWindowRenderElement::Border(elem) => {
+            CosmicWindowRenderElement::Shadow(elem) => {
+                elem.draw(frame, src, dst, damage, opaque_regions, cache)
+            }
+            CosmicWindowRenderElement::Border(elem) => {
                 if let Some(glow_frame) = R::glow_frame_mut(frame) {
                     RenderElement::<GlowRenderer>::draw(
                         elem,
@@ -1589,11 +1595,10 @@ where
     fn underlying_storage(&self, renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
         match self {
             CosmicWindowRenderElement::Header(elem) => elem.underlying_storage(renderer),
-            CosmicWindowRenderElement::Shadow(elem) | CosmicWindowRenderElement::Border(elem) => {
-                renderer
-                    .glow_renderer_mut()
-                    .and_then(|glow| elem.underlying_storage(glow))
-            }
+            CosmicWindowRenderElement::Shadow(elem) => elem.underlying_storage(renderer),
+            CosmicWindowRenderElement::Border(elem) => renderer
+                .glow_renderer_mut()
+                .and_then(|glow| elem.underlying_storage(glow)),
             CosmicWindowRenderElement::Window(elem) => elem.underlying_storage(renderer),
         }
     }
@@ -1609,7 +1614,10 @@ where
             CosmicWindowRenderElement::Header(elem) => {
                 elem.capture_framebuffer(frame, src, dst, cache)
             }
-            CosmicWindowRenderElement::Shadow(elem) | CosmicWindowRenderElement::Border(elem) => {
+            CosmicWindowRenderElement::Shadow(elem) => {
+                elem.capture_framebuffer(frame, src, dst, cache)
+            }
+            CosmicWindowRenderElement::Border(elem) => {
                 if let Some(glow_frame) = R::glow_frame_mut(frame) {
                     RenderElement::<GlowRenderer>::capture_framebuffer(
                         elem, glow_frame, src, dst, cache,

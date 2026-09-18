@@ -4,8 +4,11 @@ use super::{
 };
 use crate::{
     backend::render::{
-        IndicatorShader, Key, Usage, cursor::CursorState, element::AsGlowRenderer,
-        shadow::ShadowShader, wayland::SurfaceRenderElement,
+        IndicatorShader, Key, Usage,
+        cursor::CursorState,
+        element::AsGlowRenderer,
+        shadow::{ShadowElement, ShadowShader},
+        wayland::SurfaceRenderElement,
     },
     hooks::{Decorations, HOOKS},
     shell::{
@@ -702,7 +705,7 @@ impl CosmicStack {
         alpha: f32,
     ) -> Option<C>
     where
-        R: AsGlowRenderer,
+        R: AsGlowRenderer + ImportAll + ImportMem,
         R::TextureId: Send + Clone + 'static,
         C: From<CosmicStackRenderElement<R>>,
     {
@@ -2103,7 +2106,7 @@ impl TabletToolTarget<State> for CosmicStack {
 
 pub enum CosmicStackRenderElement<R: Renderer + ImportAll + ImportMem> {
     Header(IcedRenderElement<R>),
-    Shadow(PixelShaderElement),
+    Shadow(ShadowElement<R>),
     Border(PixelShaderElement),
     Window(SurfaceRenderElement<R>),
 }
@@ -2251,7 +2254,10 @@ where
             CosmicStackRenderElement::Header(elem) => {
                 elem.draw(frame, src, dst, damage, opaque_regions, cache)
             }
-            CosmicStackRenderElement::Shadow(elem) | CosmicStackRenderElement::Border(elem) => {
+            CosmicStackRenderElement::Shadow(elem) => {
+                elem.draw(frame, src, dst, damage, opaque_regions, cache)
+            }
+            CosmicStackRenderElement::Border(elem) => {
                 if let Some(glow_frame) = R::glow_frame_mut(frame) {
                     RenderElement::<GlowRenderer>::draw(
                         elem,
@@ -2276,11 +2282,10 @@ where
     fn underlying_storage(&self, renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
         match self {
             CosmicStackRenderElement::Header(elem) => elem.underlying_storage(renderer),
-            CosmicStackRenderElement::Shadow(elem) | CosmicStackRenderElement::Border(elem) => {
-                renderer
-                    .glow_renderer_mut()
-                    .and_then(|glow| elem.underlying_storage(glow))
-            }
+            CosmicStackRenderElement::Shadow(elem) => elem.underlying_storage(renderer),
+            CosmicStackRenderElement::Border(elem) => renderer
+                .glow_renderer_mut()
+                .and_then(|glow| elem.underlying_storage(glow)),
             CosmicStackRenderElement::Window(elem) => elem.underlying_storage(renderer),
         }
     }
@@ -2296,7 +2301,10 @@ where
             CosmicStackRenderElement::Header(elem) => {
                 elem.capture_framebuffer(frame, src, dst, cache)
             }
-            CosmicStackRenderElement::Shadow(elem) | CosmicStackRenderElement::Border(elem) => {
+            CosmicStackRenderElement::Shadow(elem) => {
+                elem.capture_framebuffer(frame, src, dst, cache)
+            }
+            CosmicStackRenderElement::Border(elem) => {
                 if let Some(glow_frame) = R::glow_frame_mut(frame) {
                     RenderElement::<GlowRenderer>::capture_framebuffer(
                         elem, glow_frame, src, dst, cache,
