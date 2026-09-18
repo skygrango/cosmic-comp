@@ -1,6 +1,6 @@
 use crate::{
     backend::render::{
-        IndicatorShader, Key, Usage,
+        IndicatorRenderElement, IndicatorShader, Key, Usage,
         cursor::CursorState,
         element::AsGlowRenderer,
         shadow::{ShadowElement, ShadowShader},
@@ -28,8 +28,6 @@ use smithay::{
         renderer::{
             ImportAll, ImportMem, Renderer,
             element::{Element, Id as RendererId, Kind, RenderElement, UnderlyingStorage},
-            gles::element::PixelShaderElement,
-            glow::GlowRenderer,
             utils::{CommitCounter, DamageSet, OpaqueRegions},
         },
     },
@@ -71,7 +69,7 @@ use std::{
     hash::Hash,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
     },
 };
 use wayland_backend::server::ObjectId;
@@ -102,6 +100,18 @@ pub struct CosmicWindowInternal {
     tiled: AtomicBool,
     theme: Mutex<cosmic::Theme>,
     appearance_conf: Mutex<AppearanceConfig>,
+    pub indicator_ids: [RendererId; crate::backend::render::USAGE_COUNT],
+    pub indicator_commits: [AtomicUsize; crate::backend::render::USAGE_COUNT],
+}
+
+impl CosmicWindowInternal {
+    pub fn id_for_usage(&self, usage: crate::backend::render::Usage) -> RendererId {
+        self.indicator_ids[usage as usize].clone()
+    }
+
+    pub fn commit_for_usage(&self, usage: crate::backend::render::Usage) -> CommitCounter {
+        CommitCounter::from(self.indicator_commits[usage as usize].load(Ordering::Relaxed))
+    }
 }
 
 #[repr(u8)]
@@ -223,6 +233,8 @@ impl CosmicWindow {
                 tiled: AtomicBool::new(false),
                 theme: Mutex::new(theme.clone()),
                 appearance_conf: Mutex::new(appearance),
+                indicator_ids: std::array::from_fn(|_| RendererId::new()),
+                indicator_commits: std::array::from_fn(|_| AtomicUsize::new(0)),
             },
             (width, SSD_HEIGHT),
             handle,
@@ -1420,7 +1432,7 @@ impl WaylandFocus for CosmicWindow {
 pub enum CosmicWindowRenderElement<R: AsGlowRenderer + ImportAll + ImportMem> {
     Header(IcedRenderElement<R>),
     Shadow(ShadowElement<R>),
-    Border(PixelShaderElement),
+    Border(IndicatorRenderElement),
     Window(SurfaceRenderElement<R>),
 }
 
@@ -1571,20 +1583,15 @@ where
                 elem.draw(frame, src, dst, damage, opaque_regions, cache)
             }
             CosmicWindowRenderElement::Border(elem) => {
-                if let Some(glow_frame) = R::glow_frame_mut(frame) {
-                    RenderElement::<GlowRenderer>::draw(
-                        elem,
-                        glow_frame,
-                        src,
-                        dst,
-                        damage,
-                        opaque_regions,
-                        cache,
-                    )
-                    .map_err(R::from_gles_error)
-                } else {
-                    Ok(())
-                }
+                <IndicatorRenderElement as RenderElement<R>>::draw(
+                    elem,
+                    frame,
+                    src,
+                    dst,
+                    damage,
+                    opaque_regions,
+                    cache,
+                )
             }
             CosmicWindowRenderElement::Window(elem) => {
                 elem.draw(frame, src, dst, damage, opaque_regions, cache)
@@ -1596,9 +1603,7 @@ where
         match self {
             CosmicWindowRenderElement::Header(elem) => elem.underlying_storage(renderer),
             CosmicWindowRenderElement::Shadow(elem) => elem.underlying_storage(renderer),
-            CosmicWindowRenderElement::Border(elem) => renderer
-                .glow_renderer_mut()
-                .and_then(|glow| elem.underlying_storage(glow)),
+            CosmicWindowRenderElement::Border(elem) => elem.underlying_storage(renderer),
             CosmicWindowRenderElement::Window(elem) => elem.underlying_storage(renderer),
         }
     }
@@ -1618,14 +1623,9 @@ where
                 elem.capture_framebuffer(frame, src, dst, cache)
             }
             CosmicWindowRenderElement::Border(elem) => {
-                if let Some(glow_frame) = R::glow_frame_mut(frame) {
-                    RenderElement::<GlowRenderer>::capture_framebuffer(
-                        elem, glow_frame, src, dst, cache,
-                    )
-                    .map_err(R::from_gles_error)
-                } else {
-                    Ok(())
-                }
+                <IndicatorRenderElement as RenderElement<R>>::capture_framebuffer(
+                    elem, frame, src, dst, cache,
+                )
             }
             CosmicWindowRenderElement::Window(elem) => {
                 elem.capture_framebuffer(frame, src, dst, cache)

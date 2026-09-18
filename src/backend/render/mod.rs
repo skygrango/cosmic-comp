@@ -55,10 +55,10 @@ use smithay::{
         allocator::Fourcc,
         drm::{DrmDeviceFd, DrmNode},
         renderer::{
-            Color32F, Offscreen, Texture, TextureFilter,
+            Color32F, Frame, Offscreen, Texture, TextureFilter,
             damage::{Error as RenderError, OutputDamageTracker, RenderOutputResult},
             element::{
-                Element, Id, Kind, NamespacedElement, RenderElement, WeakId,
+                Element, Id, Kind, NamespacedElement, RenderElement, UnderlyingStorage, WeakId,
                 texture::{TextureRenderBuffer, TextureRenderElement},
                 utils::{
                     ConstrainAlign, ConstrainScaleBehavior, CropRenderElement, Relocate,
@@ -73,13 +73,15 @@ use smithay::{
             glow::GlowRenderer,
             multigpu::{Error as MultiError, MultiFrame, MultiRenderer},
             sync::SyncPoint,
+            utils::{CommitCounter, DamageSet, OpaqueRegions},
         },
     },
     desktop::utils::bbox_from_surface_tree,
     input::Seat,
     output::{Output, OutputModeSource, OutputNoMode},
     utils::{
-        IsAlive, Logical, Monotonic, Physical, Point, Rectangle, Scale, Size, Time, Transform,
+        Buffer, IsAlive, Logical, Monotonic, Physical, Point, Rectangle, Scale, Size, Time,
+        Transform, user_data::UserDataMap,
     },
     wayland::{compositor::with_states, dmabuf::get_dmabuf, session_lock::LockSurface},
 };
@@ -154,21 +156,23 @@ pub static ACTIVE_GROUP_COLOR: [f32; 3] = [0.58, 0.922, 0.922];
 
 pub struct IndicatorShader(pub GlesPixelProgram);
 
+pub const USAGE_COUNT: usize = 7;
+
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum Usage {
-    OverviewBackdrop,
-    Overlay,
-    MoveGrabIndicator,
-    FocusIndicator,
-    PotentialGroupIndicator,
-    SnappingIndicator,
-    Border,
+    OverviewBackdrop = 0,
+    Overlay = 1,
+    MoveGrabIndicator = 2,
+    FocusIndicator = 3,
+    PotentialGroupIndicator = 4,
+    SnappingIndicator = 5,
+    Border = 6,
 }
 
 #[derive(Clone)]
 pub enum Key {
     Static(WeakId),
-    Group(Weak<()>),
+    Group(Weak<Id>),
     Window(Usage, CosmicMappedKey),
 }
 impl std::hash::Hash for Key {
@@ -205,6 +209,255 @@ impl From<Id> for Key {
     }
 }
 
+impl Key {
+    pub fn key_id(&self) -> Id {
+        match self {
+            Key::Static(weak) => weak.upgrade().unwrap_or_else(Id::new),
+            Key::Group(weak) => weak
+                .upgrade()
+                .map(|id| (*id).clone())
+                .unwrap_or_else(Id::new),
+            Key::Window(usage, mapped) => mapped.id_for_usage(*usage).unwrap_or_else(Id::new),
+        }
+    }
+
+    pub fn commit(&self) -> CommitCounter {
+        match self {
+            Key::Window(usage, mapped) => mapped.commit_for_usage(*usage).unwrap_or_default(),
+            _ => CommitCounter::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OutlineRenderElement {
+    pub id: Id,
+    pub commit: CommitCounter,
+    pub area: Rectangle<i32, Logical>,
+    pub thickness: f32,
+    pub radius: [f32; 4],
+    pub color: [f32; 3],
+    pub alpha: f32,
+}
+
+impl Element for OutlineRenderElement {
+    fn id(&self) -> &Id {
+        &self.id
+    }
+
+    fn current_commit(&self) -> CommitCounter {
+        self.commit
+    }
+
+    fn src(&self) -> Rectangle<f64, Buffer> {
+        Rectangle::from_size(self.area.size.to_f64().to_buffer(1.0, Transform::Normal))
+    }
+
+    fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
+        self.area.to_physical_precise_round(scale)
+    }
+
+    fn opaque_regions(&self, _scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+        OpaqueRegions::default()
+    }
+
+    fn alpha(&self) -> f32 {
+        self.alpha
+    }
+
+    fn kind(&self) -> Kind {
+        Kind::Unspecified
+    }
+}
+
+impl<R: AsGlowRenderer> RenderElement<R> for OutlineRenderElement {
+    fn draw(
+        &self,
+        frame: &mut R::Frame<'_, '_>,
+        _src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        _opaque_regions: &[Rectangle<i32, Physical>],
+        _cache: Option<&UserDataMap>,
+    ) -> Result<(), R::Error> {
+        let logical_width = self.area.size.w;
+        let scale = if logical_width > 0 {
+            dst.size.w as f32 / logical_width as f32
+        } else {
+            1.0
+        };
+        let physical_thickness = self.thickness * scale;
+        let physical_radius = self.radius.map(|r| r * scale);
+        let color_32f = Color32F::new(
+            self.color[0] * self.alpha,
+            self.color[1] * self.alpha,
+            self.color[2] * self.alpha,
+            self.alpha,
+        );
+
+        frame.draw_rounded_outline(dst, damage, physical_thickness, physical_radius, color_32f)
+    }
+
+    #[inline]
+    fn underlying_storage(&self, _renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
+        None
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum IndicatorRenderElement {
+    Gles(PixelShaderElement),
+    Outline(OutlineRenderElement),
+}
+
+impl Element for IndicatorRenderElement {
+    fn id(&self) -> &Id {
+        match self {
+            Self::Gles(e) => e.id(),
+            Self::Outline(e) => e.id(),
+        }
+    }
+
+    fn current_commit(&self) -> CommitCounter {
+        match self {
+            Self::Gles(e) => e.current_commit(),
+            Self::Outline(e) => e.current_commit(),
+        }
+    }
+
+    fn src(&self) -> Rectangle<f64, Buffer> {
+        match self {
+            Self::Gles(e) => e.src(),
+            Self::Outline(e) => e.src(),
+        }
+    }
+
+    fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
+        match self {
+            Self::Gles(e) => e.geometry(scale),
+            Self::Outline(e) => e.geometry(scale),
+        }
+    }
+
+    fn location(&self, scale: Scale<f64>) -> Point<i32, Physical> {
+        match self {
+            Self::Gles(e) => e.location(scale),
+            Self::Outline(e) => e.location(scale),
+        }
+    }
+
+    fn transform(&self) -> Transform {
+        match self {
+            Self::Gles(e) => e.transform(),
+            Self::Outline(e) => e.transform(),
+        }
+    }
+
+    fn damage_since(
+        &self,
+        scale: Scale<f64>,
+        commit: Option<CommitCounter>,
+    ) -> DamageSet<i32, Physical> {
+        match self {
+            Self::Gles(e) => e.damage_since(scale, commit),
+            Self::Outline(e) => e.damage_since(scale, commit),
+        }
+    }
+
+    fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+        match self {
+            Self::Gles(e) => e.opaque_regions(scale),
+            Self::Outline(e) => e.opaque_regions(scale),
+        }
+    }
+
+    fn alpha(&self) -> f32 {
+        match self {
+            Self::Gles(e) => e.alpha(),
+            Self::Outline(e) => e.alpha(),
+        }
+    }
+
+    fn kind(&self) -> Kind {
+        match self {
+            Self::Gles(e) => e.kind(),
+            Self::Outline(e) => e.kind(),
+        }
+    }
+
+    fn is_framebuffer_effect(&self) -> bool {
+        match self {
+            Self::Gles(e) => e.is_framebuffer_effect(),
+            Self::Outline(e) => e.is_framebuffer_effect(),
+        }
+    }
+}
+
+impl<R: AsGlowRenderer> RenderElement<R> for IndicatorRenderElement {
+    fn draw(
+        &self,
+        frame: &mut R::Frame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        cache: Option<&UserDataMap>,
+    ) -> Result<(), R::Error> {
+        match self {
+            Self::Gles(elem) => {
+                let glow_frame = R::glow_frame_mut(frame).unwrap();
+                RenderElement::<GlowRenderer>::draw(
+                    elem,
+                    glow_frame,
+                    src,
+                    dst,
+                    damage,
+                    opaque_regions,
+                    cache,
+                )
+                .map_err(R::from_gles_error)
+            }
+            Self::Outline(elem) => <OutlineRenderElement as RenderElement<R>>::draw(
+                elem,
+                frame,
+                src,
+                dst,
+                damage,
+                opaque_regions,
+                cache,
+            ),
+        }
+    }
+
+    fn underlying_storage(&self, renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
+        match self {
+            Self::Gles(elem) => renderer
+                .glow_renderer_mut()
+                .and_then(|glow| elem.underlying_storage(glow)),
+            Self::Outline(elem) => elem.underlying_storage(renderer),
+        }
+    }
+
+    fn capture_framebuffer(
+        &self,
+        frame: &mut R::Frame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        cache: &UserDataMap,
+    ) -> Result<(), R::Error> {
+        match self {
+            Self::Gles(elem) => {
+                let glow_frame = R::glow_frame_mut(frame).unwrap();
+                RenderElement::<GlowRenderer>::capture_framebuffer(
+                    elem, glow_frame, src, dst, cache,
+                )
+                .map_err(R::from_gles_error)
+            }
+            Self::Outline(_) => Ok(()),
+        }
+    }
+}
+
 #[derive(PartialEq)]
 struct IndicatorSettings {
     thickness: u8,
@@ -238,7 +491,7 @@ impl IndicatorShader {
         alpha: f32,
         scale: f64,
         active_window_hint: [f32; 3],
-    ) -> PixelShaderElement {
+    ) -> IndicatorRenderElement {
         let t = thickness as i32;
         element_geo.loc -= (t, t).into();
         element_geo.size += (t * 2, t * 2).into();
@@ -265,71 +518,86 @@ impl IndicatorShader {
         alpha: f32,
         scale: f64,
         color: [f32; 3],
-    ) -> PixelShaderElement {
-        let settings = IndicatorSettings {
-            thickness,
-            outer_radius,
-            alpha,
-            scale,
-            color,
-        };
-
-        let Some(glow) = renderer.glow_renderer() else {
-            return PixelShaderElement::dummy();
-        };
-        let user_data = Borrow::<GlesRenderer>::borrow(glow)
-            .egl_context()
-            .user_data();
-
-        user_data.insert_if_missing(|| IndicatorCache::new(HashMap::new()));
-        let mut cache = user_data.get::<IndicatorCache>().unwrap().borrow_mut();
-        cache.retain(|k, _| match k {
-            Key::Static(w) => w.upgrade().is_some(),
-            Key::Group(w) => w.upgrade().is_some(),
-            Key::Window(_, w) => w.alive(),
-        });
-
+    ) -> IndicatorRenderElement {
         let key = key.into();
-        if cache
-            .get(&key)
-            .filter(|(old_settings, _)| &settings == old_settings)
-            .is_none()
-        {
-            let thickness: f32 = ((thickness as f64 * scale) / scale) as f32;
+
+        if let Some(glow) = renderer.glow_renderer() {
+            let settings = IndicatorSettings {
+                thickness,
+                outer_radius,
+                alpha,
+                scale,
+                color,
+            };
+
+            let thickness_val: f32 = ((thickness as f64 * scale) / scale) as f32;
             let shader = Self::get(renderer);
 
-            let elem = PixelShaderElement::new(
-                shader,
-                geo.as_logical(),
-                None, //TODO
-                alpha,
-                vec![
-                    Uniform::new(
-                        "color",
-                        [color[0] * alpha, color[1] * alpha, color[2] * alpha],
-                    ),
-                    Uniform::new("thickness", thickness),
-                    Uniform::new(
-                        "radius",
-                        [
-                            outer_radius[3] as f32,
-                            outer_radius[1] as f32,
-                            outer_radius[0] as f32,
-                            outer_radius[2] as f32,
-                        ],
-                    ),
-                    Uniform::new("scale", scale as f32),
-                ],
-                Kind::Unspecified,
-            );
-            cache.insert(key.clone(), (settings, elem));
-        }
+            let create_elem = || {
+                PixelShaderElement::new(
+                    shader,
+                    geo.as_logical(),
+                    None, //TODO
+                    alpha,
+                    vec![
+                        Uniform::new(
+                            "color",
+                            [color[0] * alpha, color[1] * alpha, color[2] * alpha],
+                        ),
+                        Uniform::new("thickness", thickness_val),
+                        Uniform::new(
+                            "radius",
+                            [
+                                outer_radius[3] as f32,
+                                outer_radius[1] as f32,
+                                outer_radius[0] as f32,
+                                outer_radius[2] as f32,
+                            ],
+                        ),
+                        Uniform::new("scale", scale as f32),
+                    ],
+                    Kind::Unspecified,
+                )
+            };
 
-        let elem = &mut cache.get_mut(&key).unwrap().1;
-        if elem.geometry(1.0.into()).to_logical(1) != geo.as_logical() {
-            elem.resize(geo.as_logical(), None);
+            let user_data = Borrow::<GlesRenderer>::borrow(glow)
+                .egl_context()
+                .user_data();
+
+            user_data.insert_if_missing(|| IndicatorCache::new(HashMap::new()));
+            let mut cache = user_data.get::<IndicatorCache>().unwrap().borrow_mut();
+            cache.retain(|k, _| match k {
+                Key::Static(w) => w.upgrade().is_some(),
+                Key::Group(w) => w.upgrade().is_some(),
+                Key::Window(_, w) => w.alive(),
+            });
+
+            if cache
+                .get(&key)
+                .filter(|(old_settings, _)| &settings == old_settings)
+                .is_none()
+            {
+                cache.insert(key.clone(), (settings, create_elem()));
+            }
+
+            let elem = &mut cache.get_mut(&key).unwrap().1;
+            if elem.geometry(1.0.into()).to_logical(1) != geo.as_logical() {
+                elem.resize(geo.as_logical(), None);
+            }
+            IndicatorRenderElement::Gles(elem.clone())
+        } else {
+            let id = key.key_id();
+            let commit = key.commit();
+            IndicatorRenderElement::Outline(OutlineRenderElement {
+                id,
+                commit,
+                area: geo.as_logical(),
+                thickness: thickness as f32,
+                radius: outer_radius.map(|r| r as f32),
+                color,
+                alpha,
+            })
         }
-        elem.clone()
     }
 }
 
@@ -364,58 +632,73 @@ impl BackdropShader {
         radius: f32,
         alpha: f32,
         color: [f32; 3],
-    ) -> PixelShaderElement {
-        let settings = BackdropSettings {
-            radius,
-            alpha,
-            color,
-        };
-
-        let Some(glow) = renderer.glow_renderer() else {
-            return PixelShaderElement::dummy();
-        };
-        let user_data = Borrow::<GlesRenderer>::borrow(glow)
-            .egl_context()
-            .user_data();
-
-        user_data.insert_if_missing(|| BackdropCache::new(HashMap::new()));
-        let mut cache = user_data.get::<BackdropCache>().unwrap().borrow_mut();
-        cache.retain(|k, _| match k {
-            Key::Static(w) => w.upgrade().is_some(),
-            Key::Group(a) => a.upgrade().is_some(),
-            Key::Window(_, w) => w.alive(),
-        });
-
+    ) -> IndicatorRenderElement {
         let key = key.into();
-        if cache
-            .get(&key)
-            .filter(|(old_settings, _)| &settings == old_settings)
-            .is_none()
-        {
+
+        if let Some(glow) = renderer.glow_renderer() {
+            let settings = BackdropSettings {
+                radius,
+                alpha,
+                color,
+            };
+
             let shader = Self::get(renderer);
 
-            let elem = PixelShaderElement::new(
-                shader,
-                geo.as_logical(),
-                None, // TODO
-                alpha,
-                vec![
-                    Uniform::new(
-                        "color",
-                        [color[0] * alpha, color[1] * alpha, color[2] * alpha],
-                    ),
-                    Uniform::new("radius", radius),
-                ],
-                Kind::Unspecified,
-            );
-            cache.insert(key.clone(), (settings, elem));
-        }
+            let create_elem = || {
+                PixelShaderElement::new(
+                    shader,
+                    geo.as_logical(),
+                    None, // TODO
+                    alpha,
+                    vec![
+                        Uniform::new(
+                            "color",
+                            [color[0] * alpha, color[1] * alpha, color[2] * alpha],
+                        ),
+                        Uniform::new("radius", radius),
+                    ],
+                    Kind::Unspecified,
+                )
+            };
 
-        let elem = &mut cache.get_mut(&key).unwrap().1;
-        if elem.geometry(1.0.into()).to_logical(1) != geo.as_logical() {
-            elem.resize(geo.as_logical(), None);
+            let user_data = Borrow::<GlesRenderer>::borrow(glow)
+                .egl_context()
+                .user_data();
+
+            user_data.insert_if_missing(|| BackdropCache::new(HashMap::new()));
+            let mut cache = user_data.get::<BackdropCache>().unwrap().borrow_mut();
+            cache.retain(|k, _| match k {
+                Key::Static(w) => w.upgrade().is_some(),
+                Key::Group(a) => a.upgrade().is_some(),
+                Key::Window(_, w) => w.alive(),
+            });
+
+            if cache
+                .get(&key)
+                .filter(|(old_settings, _)| &settings == old_settings)
+                .is_none()
+            {
+                cache.insert(key.clone(), (settings, create_elem()));
+            }
+
+            let elem = &mut cache.get_mut(&key).unwrap().1;
+            if elem.geometry(1.0.into()).to_logical(1) != geo.as_logical() {
+                elem.resize(geo.as_logical(), None);
+            }
+            IndicatorRenderElement::Gles(elem.clone())
+        } else {
+            let id = key.key_id();
+            let commit = key.commit();
+            IndicatorRenderElement::Outline(OutlineRenderElement {
+                id,
+                commit,
+                area: geo.as_logical(),
+                thickness: 0.0,
+                radius: [radius; 4],
+                color,
+                alpha,
+            })
         }
-        elem.clone()
     }
 }
 

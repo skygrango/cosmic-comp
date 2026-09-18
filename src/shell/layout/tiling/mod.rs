@@ -152,7 +152,7 @@ pub enum Data {
         orientation: Orientation,
         sizes: Vec<i32>,
         last_geometry: Rectangle<i32, Local>,
-        alive: Arc<()>,
+        alive: Arc<Id>,
         pill_indicator: Option<PillIndicator>,
     },
     Mapped {
@@ -185,7 +185,7 @@ impl Data {
                 2
             ],
             last_geometry: geo,
-            alive: Arc::new(()),
+            alive: Arc::new(Id::new()),
             pill_indicator: None,
         }
     }
@@ -335,7 +335,7 @@ impl Data {
 
 #[derive(Debug, Clone)]
 enum FocusedNodeData {
-    Group(Vec<NodeId>, Weak<()>),
+    Group(Vec<NodeId>, Weak<Id>),
     Window(CosmicMapped),
 }
 

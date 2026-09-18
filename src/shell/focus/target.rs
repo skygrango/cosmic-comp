@@ -15,6 +15,7 @@ use crate::{
     wayland::handlers::{image_copy_capture::SessionHolder, xdg_shell::popup::get_popup_toplevel},
 };
 use id_tree::NodeId;
+use smithay::backend::renderer::element::Id;
 use smithay::{
     backend::input::{InputTime, KeyState, TabletToolDescriptor},
     desktop::{LayerSurface, PopupKind, WindowSurface, WindowSurfaceType, space::SpaceElement},
@@ -389,7 +390,7 @@ impl KeyboardFocusTarget {
 #[derive(Debug, Clone)]
 pub struct WindowGroup {
     pub node: NodeId,
-    pub alive: Weak<()>,
+    pub alive: Weak<Id>,
     pub focus_stack: Vec<NodeId>,
 }
 

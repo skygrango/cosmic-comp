@@ -450,6 +450,10 @@ impl<P: Program + Send + 'static + Clone> IcedElement<P> {
 }
 
 impl<P: Program + Send + 'static> IcedElementInternal<P> {
+    pub(crate) fn program(&self) -> &P {
+        &self.state.program().program
+    }
+
     #[profiling::function]
     fn update(&mut self, force: bool) {
         while let Ok(Some(message)) = self.rx.try_recv() {

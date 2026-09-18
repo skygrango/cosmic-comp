@@ -4,7 +4,7 @@ use super::{
 };
 use crate::{
     backend::render::{
-        IndicatorShader, Key, Usage,
+        IndicatorRenderElement, IndicatorShader, Key, Usage,
         cursor::CursorState,
         element::AsGlowRenderer,
         shadow::{ShadowElement, ShadowShader},
@@ -45,8 +45,6 @@ use smithay::{
         renderer::{
             ImportAll, ImportMem, Renderer,
             element::{Element, Id as RendererId, Kind, RenderElement, UnderlyingStorage},
-            gles::element::PixelShaderElement,
-            glow::GlowRenderer,
             utils::{CommitCounter, DamageSet, OpaqueRegions},
         },
     },
@@ -133,9 +131,19 @@ pub struct CosmicStackInternal {
     tiled: AtomicBool,
     theme: Mutex<cosmic::Theme>,
     appearance_conf: Mutex<AppearanceConfig>,
+    pub indicator_ids: [RendererId; crate::backend::render::USAGE_COUNT],
+    pub indicator_commits: [AtomicUsize; crate::backend::render::USAGE_COUNT],
 }
 
 impl CosmicStackInternal {
+    pub fn id_for_usage(&self, usage: crate::backend::render::Usage) -> RendererId {
+        self.indicator_ids[usage as usize].clone()
+    }
+
+    pub fn commit_for_usage(&self, usage: crate::backend::render::Usage) -> CommitCounter {
+        CommitCounter::from(self.indicator_commits[usage as usize].load(Ordering::Relaxed))
+    }
+
     pub fn swap_focus(&self, focus: Option<Focus>) -> Option<Focus> {
         let value = focus.map_or(0, |x| x as u8);
         unsafe { Focus::from_u8(self.pointer_entered.swap(value, Ordering::SeqCst)) }
@@ -193,6 +201,8 @@ impl CosmicStack {
                 tiled: AtomicBool::new(false),
                 theme: Mutex::new(theme.clone()),
                 appearance_conf: Mutex::new(appearance),
+                indicator_ids: std::array::from_fn(|_| RendererId::new()),
+                indicator_commits: std::array::from_fn(|_| AtomicUsize::new(0)),
             },
             (width, TAB_HEIGHT),
             handle,
@@ -2107,7 +2117,7 @@ impl TabletToolTarget<State> for CosmicStack {
 pub enum CosmicStackRenderElement<R: Renderer + ImportAll + ImportMem> {
     Header(IcedRenderElement<R>),
     Shadow(ShadowElement<R>),
-    Border(PixelShaderElement),
+    Border(IndicatorRenderElement),
     Window(SurfaceRenderElement<R>),
 }
 
@@ -2258,20 +2268,15 @@ where
                 elem.draw(frame, src, dst, damage, opaque_regions, cache)
             }
             CosmicStackRenderElement::Border(elem) => {
-                if let Some(glow_frame) = R::glow_frame_mut(frame) {
-                    RenderElement::<GlowRenderer>::draw(
-                        elem,
-                        glow_frame,
-                        src,
-                        dst,
-                        damage,
-                        opaque_regions,
-                        cache,
-                    )
-                    .map_err(R::from_gles_error)
-                } else {
-                    Ok(())
-                }
+                <IndicatorRenderElement as RenderElement<R>>::draw(
+                    elem,
+                    frame,
+                    src,
+                    dst,
+                    damage,
+                    opaque_regions,
+                    cache,
+                )
             }
             CosmicStackRenderElement::Window(elem) => {
                 elem.draw(frame, src, dst, damage, opaque_regions, cache)
@@ -2283,9 +2288,7 @@ where
         match self {
             CosmicStackRenderElement::Header(elem) => elem.underlying_storage(renderer),
             CosmicStackRenderElement::Shadow(elem) => elem.underlying_storage(renderer),
-            CosmicStackRenderElement::Border(elem) => renderer
-                .glow_renderer_mut()
-                .and_then(|glow| elem.underlying_storage(glow)),
+            CosmicStackRenderElement::Border(elem) => elem.underlying_storage(renderer),
             CosmicStackRenderElement::Window(elem) => elem.underlying_storage(renderer),
         }
     }
@@ -2305,14 +2308,9 @@ where
                 elem.capture_framebuffer(frame, src, dst, cache)
             }
             CosmicStackRenderElement::Border(elem) => {
-                if let Some(glow_frame) = R::glow_frame_mut(frame) {
-                    RenderElement::<GlowRenderer>::capture_framebuffer(
-                        elem, glow_frame, src, dst, cache,
-                    )
-                    .map_err(R::from_gles_error)
-                } else {
-                    Ok(())
-                }
+                <IndicatorRenderElement as RenderElement<R>>::capture_framebuffer(
+                    elem, frame, src, dst, cache,
+                )
             }
             CosmicStackRenderElement::Window(elem) => {
                 elem.capture_framebuffer(frame, src, dst, cache)

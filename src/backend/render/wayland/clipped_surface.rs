@@ -6,7 +6,7 @@ use glam::{Affine2, Mat3, Vec2};
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 use smithay::{
     backend::renderer::{
-        ImportAll, Renderer,
+        Frame, ImportAll, Renderer,
         element::{
             Element, Id, Kind, RenderElement, UnderlyingStorage,
             surface::WaylandSurfaceRenderElement,
@@ -40,9 +40,13 @@ impl ClippingShader {
 #[derive(Debug)]
 pub struct ClippedSurfaceRenderElement<R: Renderer> {
     inner: WaylandSurfaceRenderElement<R>,
-    program: GlesTexProgram,
+    program: Option<GlesTexProgram>,
     radius: [u8; 4],
     geometry: Rectangle<f64, Logical>,
+    scale: Scale<f64>,
+    physical_geo: Rectangle<i32, Physical>,
+    physical_radii: [f32; 4],
+    physical_corners: [Rectangle<i32, Physical>; 4],
     uniforms: Vec<Uniform<'static>>,
 }
 
@@ -60,107 +64,177 @@ where
     where
         R: AsGlowRenderer,
     {
-        let elem_geo = elem.geometry(scale);
-        let geo: Rectangle<i32, Physical> = geometry.to_physical_precise_round(scale);
-        let buf_size = elem.buffer_size();
-        let view = elem.view();
+        let physical_geo = geometry.to_physical_precise_round(scale);
+        let physical_corners = Self::physical_corners(geometry, radius, scale);
+        Self::new_precomputed(
+            renderer,
+            elem,
+            scale,
+            geometry,
+            radius,
+            physical_geo,
+            physical_corners,
+        )
+    }
 
-        let transform = elem.transform();
-        let transform_matrix = Affine2::from_translation(Vec2::new(0.5, 0.5))
-            * transform.matrix()
-            * Affine2::from_translation(-Vec2::new(0.5, 0.5));
+    pub fn new_precomputed(
+        renderer: &mut R,
+        elem: WaylandSurfaceRenderElement<R>,
+        scale: Scale<f64>,
+        geometry: Rectangle<f64, Logical>,
+        radius: [u8; 4],
+        physical_geo: Rectangle<i32, Physical>,
+        physical_corners: [Rectangle<i32, Physical>; 4],
+    ) -> Self
+    where
+        R: AsGlowRenderer,
+    {
+        let physical_radii = [
+            radius[0] as f32 * scale.x as f32,
+            radius[1] as f32 * scale.y as f32,
+            radius[2] as f32 * scale.x as f32,
+            radius[3] as f32 * scale.y as f32,
+        ];
 
-        let geo_scale = {
-            let Scale { x, y } = elem_geo.size.to_f64() / geo.size.to_f64();
-            Affine2::from_scale(Vec2::new(x as f32, y as f32))
-        };
+        let (program, uniforms) = if renderer.glow_renderer().is_some() {
+            let elem_geo = elem.geometry(scale);
+            let geo = physical_geo;
+            let buf_size = elem.buffer_size();
+            let view = elem.view();
 
-        let geo_translation = {
-            let offset = (elem_geo.loc - geo.loc).to_f64();
-            Affine2::from_translation(Vec2::new(
-                (offset.x / elem_geo.size.w as f64) as f32,
-                (offset.y / elem_geo.size.h as f64) as f32,
-            ))
-        };
+            let transform = elem.transform();
+            let transform_matrix = Affine2::from_translation(Vec2::new(0.5, 0.5))
+                * transform.matrix()
+                * Affine2::from_translation(-Vec2::new(0.5, 0.5));
 
-        let buf_scale = {
-            let Scale { x, y } = buf_size.to_f64() / view.src.size.to_f64();
-            Affine2::from_scale(Vec2::new(x as f32, y as f32))
-        };
-
-        let buf_translation = Affine2::from_translation(Vec2::new(
-            (view.src.loc.x / buf_size.w as f64) as f32,
-            (view.src.loc.y / buf_size.h as f64) as f32,
-        ));
-
-        let input_to_geo = Mat3::from(
-            transform_matrix * geo_scale * geo_translation * buf_scale * buf_translation,
-        );
-
-        let hdr_config = renderer
-            .glow_renderer()
-            .and_then(|glow| Borrow::<GlesRenderer>::borrow(glow).hdr_output());
-        let (hdr_enabled, ref_white, sdr_gamma, gamut_stretch, hw_offload, is_sdr, max_lum) =
-            if let Some(config) = hdr_config {
-                (
-                    1.0_f32,
-                    config.reference_white,
-                    config.sdr_gamma,
-                    config.gamut_stretch,
-                    if config.hardware_offload {
-                        1.0_f32
-                    } else {
-                        0.0_f32
-                    },
-                    if config.is_sdr { 1.0_f32 } else { 0.0_f32 },
-                    config.max_luminance,
-                )
-            } else {
-                (
-                    0.0_f32, 203.0_f32, 2.2_f32, 0.0_f32, 0.0_f32, 0.0_f32, 1000.0_f32,
-                )
+            let geo_scale = {
+                let Scale { x, y } = elem_geo.size.to_f64() / geo.size.to_f64();
+                Affine2::from_scale(Vec2::new(x as f32, y as f32))
             };
 
-        let uniforms = vec![
-            Uniform::new("geo_size", (geometry.size.w as f32, geometry.size.h as f32)),
-            Uniform::new(
-                "corner_radius",
-                [
-                    radius[0] as f32,
-                    radius[1] as f32,
-                    radius[2] as f32,
-                    radius[3] as f32,
-                ],
-            ),
-            Uniform::new(
-                "input_to_geo",
-                UniformValue::Matrix3x3 {
-                    matrices: vec![*AsRef::<[f32; 9]>::as_ref(&input_to_geo)],
-                    transpose: false,
-                },
-            ),
-            Uniform::new("noise", UniformValue::_1f(0.0)),
-            Uniform::new("hdr_enabled", UniformValue::_1f(hdr_enabled)),
-            Uniform::new("hdr_reference_white", UniformValue::_1f(ref_white)),
-            Uniform::new("hdr_sdr_gamma", UniformValue::_1f(sdr_gamma)),
-            Uniform::new("hdr_gamut_stretch", UniformValue::_1f(gamut_stretch)),
-            Uniform::new("hdr_hardware_offload", UniformValue::_1f(hw_offload)),
-            Uniform::new("hdr_target_is_sdr", UniformValue::_1f(is_sdr)),
-            Uniform::new("hdr_input_pq", UniformValue::_1f(0.0)),
-            Uniform::new("hdr_input_hlg", UniformValue::_1f(0.0)),
-            Uniform::new("hdr_input_primaries", UniformValue::_1f(0.0)),
-            Uniform::new("hdr_content_reference", UniformValue::_1f(203.0)),
-            Uniform::new("hdr_max_content_luminance", UniformValue::_1f(1000.0)),
-            Uniform::new("hdr_max_destination_luminance", UniformValue::_1f(max_lum)),
-        ];
+            let geo_translation = {
+                let offset = (elem_geo.loc - geo.loc).to_f64();
+                Affine2::from_translation(Vec2::new(
+                    (offset.x / elem_geo.size.w as f64) as f32,
+                    (offset.y / elem_geo.size.h as f64) as f32,
+                ))
+            };
+
+            let buf_scale = {
+                let Scale { x, y } = buf_size.to_f64() / view.src.size.to_f64();
+                Affine2::from_scale(Vec2::new(x as f32, y as f32))
+            };
+
+            let buf_translation = Affine2::from_translation(Vec2::new(
+                (view.src.loc.x / buf_size.w as f64) as f32,
+                (view.src.loc.y / buf_size.h as f64) as f32,
+            ));
+
+            let input_to_geo = Mat3::from(
+                transform_matrix * geo_scale * geo_translation * buf_scale * buf_translation,
+            );
+
+            let hdr_config = renderer
+                .glow_renderer()
+                .and_then(|glow| Borrow::<GlesRenderer>::borrow(glow).hdr_output());
+            let (hdr_enabled, ref_white, sdr_gamma, gamut_stretch, hw_offload, is_sdr, max_lum) =
+                if let Some(config) = hdr_config {
+                    (
+                        1.0_f32,
+                        config.reference_white,
+                        config.sdr_gamma,
+                        config.gamut_stretch,
+                        if config.hardware_offload {
+                            1.0_f32
+                        } else {
+                            0.0_f32
+                        },
+                        if config.is_sdr { 1.0_f32 } else { 0.0_f32 },
+                        config.max_luminance,
+                    )
+                } else {
+                    (
+                        0.0_f32, 203.0_f32, 2.2_f32, 0.0_f32, 0.0_f32, 0.0_f32, 1000.0_f32,
+                    )
+                };
+
+            let uniforms = vec![
+                Uniform::new("geo_size", (geometry.size.w as f32, geometry.size.h as f32)),
+                Uniform::new(
+                    "corner_radius",
+                    [
+                        radius[0] as f32,
+                        radius[1] as f32,
+                        radius[2] as f32,
+                        radius[3] as f32,
+                    ],
+                ),
+                Uniform::new(
+                    "input_to_geo",
+                    UniformValue::Matrix3x3 {
+                        matrices: vec![*AsRef::<[f32; 9]>::as_ref(&input_to_geo)],
+                        transpose: false,
+                    },
+                ),
+                Uniform::new("noise", UniformValue::_1f(0.0)),
+                Uniform::new("hdr_enabled", UniformValue::_1f(hdr_enabled)),
+                Uniform::new("hdr_reference_white", UniformValue::_1f(ref_white)),
+                Uniform::new("hdr_sdr_gamma", UniformValue::_1f(sdr_gamma)),
+                Uniform::new("hdr_gamut_stretch", UniformValue::_1f(gamut_stretch)),
+                Uniform::new("hdr_hardware_offload", UniformValue::_1f(hw_offload)),
+                Uniform::new("hdr_target_is_sdr", UniformValue::_1f(is_sdr)),
+                Uniform::new("hdr_input_pq", UniformValue::_1f(0.0)),
+                Uniform::new("hdr_input_hlg", UniformValue::_1f(0.0)),
+                Uniform::new("hdr_input_primaries", UniformValue::_1f(0.0)),
+                Uniform::new("hdr_content_reference", UniformValue::_1f(203.0)),
+                Uniform::new("hdr_max_content_luminance", UniformValue::_1f(1000.0)),
+                Uniform::new("hdr_max_destination_luminance", UniformValue::_1f(max_lum)),
+            ];
+            (Some(ClippingShader::get(renderer)), uniforms)
+        } else {
+            (None, Vec::new())
+        };
 
         Self {
             inner: elem,
-            program: ClippingShader::get(renderer),
+            program,
             radius,
             geometry,
+            scale,
+            physical_geo,
+            physical_radii,
+            physical_corners,
             uniforms,
         }
+    }
+
+    pub fn physical_corners(
+        geo: Rectangle<f64, Logical>,
+        radius: [u8; 4],
+        scale: Scale<f64>,
+    ) -> [Rectangle<i32, Physical>; 4] {
+        let corners = Self::rounded_corners(geo, radius);
+        corners.map(|rect| rect.to_physical_precise_up(scale))
+    }
+
+    #[inline]
+    pub fn will_clip_precomputed(
+        elem: &WaylandSurfaceRenderElement<R>,
+        scale: Scale<f64>,
+        physical_geo: Rectangle<i32, Physical>,
+        physical_corners: &[Rectangle<i32, Physical>; 4],
+    ) -> bool {
+        let elem_geo = elem.geometry(scale);
+
+        // If elem_geo extends outside geometry, it needs clipping.
+        if !physical_geo.contains_rect(elem_geo) {
+            return true;
+        }
+
+        // If elem_geo is inside geo, it needs clipping if and only if it overlaps any non-zero rounded corner.
+        physical_corners
+            .iter()
+            .any(|c| !c.is_empty() && c.overlaps(elem_geo))
     }
 
     pub fn will_clip(
@@ -169,15 +243,9 @@ where
         geometry: Rectangle<f64, Logical>,
         radius: [u8; 4],
     ) -> bool {
-        let elem_geo = elem.geometry(scale);
-        let geo = geometry.to_physical_precise_round(scale);
-
-        let corners = Self::rounded_corners(geometry, radius);
-        let corners = corners
-            .into_iter()
-            .map(|rect| rect.to_physical_precise_up(scale));
-        let geo = Rectangle::subtract_rects_many([geo], corners);
-        !Rectangle::subtract_rects_many([elem_geo], geo).is_empty()
+        let physical_geo = geometry.to_physical_precise_round(scale);
+        let physical_corners = Self::physical_corners(geometry, radius, scale);
+        Self::will_clip_precomputed(elem, scale, physical_geo, &physical_corners)
     }
 
     fn rounded_corners(
@@ -244,7 +312,11 @@ where
         let damage = self.inner.damage_since(scale, commit);
 
         // Intersect with geometry, since we're clipping by it.
-        let mut geo = self.geometry.to_physical_precise_round(scale);
+        let mut geo = if scale == self.scale {
+            self.physical_geo
+        } else {
+            self.geometry.to_physical_precise_round(scale)
+        };
         geo.loc -= self.geometry(scale).loc;
         damage
             .into_iter()
@@ -256,18 +328,25 @@ where
         let regions = self.inner.opaque_regions(scale);
 
         // Intersect with geometry, since we're clipping by it.
-        let mut geo = self.geometry.to_physical_precise_round(scale);
+        let mut geo = if scale == self.scale {
+            self.physical_geo
+        } else {
+            self.geometry.to_physical_precise_round(scale)
+        };
         geo.loc -= self.geometry(scale).loc;
         let regions = regions
             .into_iter()
             .filter_map(|rect| rect.intersection(geo));
 
         // Subtract the rounded corners.
-        let corners = Self::rounded_corners(self.geometry, self.radius);
+        let corners = if scale == self.scale {
+            self.physical_corners
+        } else {
+            Self::physical_corners(self.geometry, self.radius, scale)
+        };
 
         let elem_loc = self.geometry(scale).loc;
-        let corners = corners.into_iter().map(|rect| {
-            let mut rect = rect.to_physical_precise_up(scale);
+        let corners = corners.into_iter().map(|mut rect| {
             rect.loc -= elem_loc;
             rect
         });
@@ -298,12 +377,15 @@ where
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), R::Error> {
+        frame.set_surface_clip(Some((self.physical_geo, self.physical_radii)));
+
         let previous_override =
             <R as AsGlowRenderer>::glow_frame_mut(frame).and_then(|glow_frame| {
                 let gles_frame = BorrowMut::<GlesFrame>::borrow_mut(glow_frame);
                 let previous = gles_frame.take_tex_program_override();
-                gles_frame
-                    .override_default_tex_program(self.program.clone(), self.uniforms.clone());
+                if let Some(ref program) = self.program {
+                    gles_frame.override_default_tex_program(program.clone(), self.uniforms.clone());
+                }
                 previous
             });
         let res = self
@@ -313,11 +395,81 @@ where
             BorrowMut::<GlesFrame>::borrow_mut(glow_frame)
                 .set_tex_program_override(previous_override);
         }
+        frame.set_surface_clip(None);
         res?;
         Ok(())
     }
 
     fn underlying_storage(&self, _renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rounded_corners_calculation() {
+        let geo = Rectangle::new(Point::from((100.0, 200.0)), Size::from((800.0, 600.0)));
+        let radii = [16, 16, 16, 16];
+        let corners = ClippedSurfaceRenderElement::<smithay::backend::renderer::glow::GlowRenderer>::rounded_corners(geo, radii);
+
+        // Top-left
+        assert_eq!(corners[0].loc, Point::from((100.0, 200.0)));
+        assert_eq!(corners[0].size, Size::from((16.0, 16.0)));
+
+        // Top-right
+        assert_eq!(corners[1].loc, Point::from((100.0 + 800.0 - 16.0, 200.0)));
+        assert_eq!(corners[1].size, Size::from((16.0, 16.0)));
+
+        // Bottom-right
+        assert_eq!(
+            corners[2].loc,
+            Point::from((100.0 + 800.0 - 16.0, 200.0 + 600.0 - 16.0))
+        );
+        assert_eq!(corners[2].size, Size::from((16.0, 16.0)));
+
+        // Bottom-left
+        assert_eq!(corners[3].loc, Point::from((100.0, 200.0 + 600.0 - 16.0)));
+        assert_eq!(corners[3].size, Size::from((16.0, 16.0)));
+    }
+
+    #[test]
+    fn test_physical_corners_and_clipping() {
+        let geo = Rectangle::new(Point::from((100.0, 200.0)), Size::from((800.0, 600.0)));
+        let radii = [16, 16, 16, 16];
+        let scale = Scale::from(2.0);
+        let physical_corners = ClippedSurfaceRenderElement::<
+            smithay::backend::renderer::glow::GlowRenderer,
+        >::physical_corners(geo, radii, scale);
+        let physical_geo = geo.to_physical_precise_round(scale);
+
+        assert_eq!(physical_geo.loc, Point::from((200, 400)));
+        assert_eq!(physical_geo.size, Size::from((1600, 1200)));
+
+        assert_eq!(physical_corners[0].loc, Point::from((200, 400)));
+        assert_eq!(physical_corners[0].size, Size::from((32, 32)));
+
+        // Test inner rect that overlaps corner
+        let corner_elem_geo = Rectangle::new(Point::from((200, 400)), Size::from((16, 16)));
+        assert!(
+            physical_corners
+                .iter()
+                .any(|c| !c.is_empty() && c.overlaps(corner_elem_geo))
+        );
+
+        // Test inner rect that is purely in the center (does not overlap any corner)
+        let center_elem_geo = Rectangle::new(Point::from((300, 500)), Size::from((100, 100)));
+        assert!(
+            !physical_corners
+                .iter()
+                .any(|c| !c.is_empty() && c.overlaps(center_elem_geo))
+        );
+        assert!(physical_geo.contains_rect(center_elem_geo));
+
+        // Test rect extending outside bounds
+        let outside_elem_geo = Rectangle::new(Point::from((150, 400)), Size::from((100, 100)));
+        assert!(!physical_geo.contains_rect(outside_elem_geo));
     }
 }

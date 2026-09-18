@@ -54,6 +54,15 @@ pub fn push_render_elements_from_surface_tree<R>(
     let kind = kind.into();
     let mut passed_main = false;
 
+    let clip_params = if should_clip && radii.iter().any(|r| *r != 0) {
+        let physical_geo = geometry.to_physical_precise_round(scale);
+        let physical_corners =
+            ClippedSurfaceRenderElement::<R>::physical_corners(geometry, radii, scale);
+        Some((physical_geo, physical_corners))
+    } else {
+        None
+    };
+
     compositor::with_surface_tree_downward(
         main_surface,
         location,
@@ -101,21 +110,30 @@ pub fn push_render_elements_from_surface_tree<R>(
                                 radii,
                                 blur_strength,
                             );
-                            let elem: SurfaceRenderElement<R> = if renderer
-                                .glow_renderer()
-                                .is_some()
-                                && radii.iter().any(|r| *r != 0)
-                                && should_clip
-                                && ClippedSurfaceRenderElement::will_clip(
-                                    &element, scale, geometry, radii,
-                                ) {
-                                ClippedSurfaceRenderElement::new(
-                                    renderer, element, scale, geometry, radii,
-                                )
-                                .into()
-                            } else {
-                                element.into()
-                            };
+                            let elem: SurfaceRenderElement<R> =
+                                if let Some((physical_geo, physical_corners)) = clip_params {
+                                    if ClippedSurfaceRenderElement::will_clip_precomputed(
+                                        &element,
+                                        scale,
+                                        physical_geo,
+                                        &physical_corners,
+                                    ) {
+                                        ClippedSurfaceRenderElement::new_precomputed(
+                                            renderer,
+                                            element,
+                                            scale,
+                                            geometry,
+                                            radii,
+                                            physical_geo,
+                                            physical_corners,
+                                        )
+                                        .into()
+                                    } else {
+                                        element.into()
+                                    }
+                                } else {
+                                    element.into()
+                                };
                             if let Some(push_below) = push_below.as_mut()
                                 && passed_main
                             {

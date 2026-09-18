@@ -810,7 +810,8 @@ mod test {
                 continue;
             };
 
-            let mut usage = vk::ImageUsageFlags::STORAGE
+            let mut usage = vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | vk::ImageUsageFlags::STORAGE
                 | vk::ImageUsageFlags::TRANSFER_SRC
                 | vk::ImageUsageFlags::SAMPLED;
             if renderer.supports_optimal_host_copy() {
@@ -906,7 +907,8 @@ mod test {
                 continue;
             };
 
-            let mut usage = vk::ImageUsageFlags::STORAGE
+            let mut usage = vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | vk::ImageUsageFlags::STORAGE
                 | vk::ImageUsageFlags::TRANSFER_SRC
                 | vk::ImageUsageFlags::SAMPLED;
             if renderer.supports_optimal_host_copy() {
@@ -1017,7 +1019,8 @@ mod test {
 
             renderer.set_hdr_output(Some(HdrOutputConfig::default()));
 
-            let mut usage = vk::ImageUsageFlags::STORAGE
+            let mut usage = vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | vk::ImageUsageFlags::STORAGE
                 | vk::ImageUsageFlags::TRANSFER_SRC
                 | vk::ImageUsageFlags::SAMPLED;
             if renderer.supports_optimal_host_copy() {
@@ -1132,7 +1135,8 @@ mod test {
             };
 
             // Framebuffer: 64x64 RGBA
-            let mut usage = vk::ImageUsageFlags::STORAGE
+            let mut usage = vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | vk::ImageUsageFlags::STORAGE
                 | vk::ImageUsageFlags::TRANSFER_SRC
                 | vk::ImageUsageFlags::SAMPLED;
             if renderer.supports_optimal_host_copy() {
@@ -1292,7 +1296,8 @@ mod test {
                 continue;
             };
 
-            let mut usage = vk::ImageUsageFlags::STORAGE
+            let mut usage = vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | vk::ImageUsageFlags::STORAGE
                 | vk::ImageUsageFlags::TRANSFER_SRC
                 | vk::ImageUsageFlags::SAMPLED;
             if renderer.supports_optimal_host_copy() {
@@ -1410,7 +1415,8 @@ mod test {
 
             renderer.set_hdr_output(Some(HdrOutputConfig::default()));
 
-            let mut usage = vk::ImageUsageFlags::STORAGE
+            let mut usage = vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | vk::ImageUsageFlags::STORAGE
                 | vk::ImageUsageFlags::TRANSFER_SRC
                 | vk::ImageUsageFlags::SAMPLED;
             if renderer.supports_optimal_host_copy() {
@@ -1543,7 +1549,8 @@ mod test {
             };
             renderer.set_hdr_output(Some(config));
 
-            let mut usage = vk::ImageUsageFlags::STORAGE
+            let mut usage = vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | vk::ImageUsageFlags::STORAGE
                 | vk::ImageUsageFlags::TRANSFER_SRC
                 | vk::ImageUsageFlags::SAMPLED;
             if renderer.supports_optimal_host_copy() {
@@ -1724,7 +1731,8 @@ mod test {
             };
             renderer.set_hdr_output(Some(config));
 
-            let mut usage = vk::ImageUsageFlags::STORAGE
+            let mut usage = vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | vk::ImageUsageFlags::STORAGE
                 | vk::ImageUsageFlags::TRANSFER_SRC
                 | vk::ImageUsageFlags::SAMPLED;
             if renderer.supports_optimal_host_copy() {
