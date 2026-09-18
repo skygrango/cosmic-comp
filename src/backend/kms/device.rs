@@ -73,9 +73,8 @@ use std::{
 
 use super::{
     drm_helpers,
-    thread::{KmsMessage, start_kms_thread},
+    thread::{KmsThread, KmsThreadHandle, start_kms_thread},
 };
-use smithay::reexports::calloop::channel::Sender;
 
 #[derive(Debug)]
 pub struct EGLInternals {
@@ -116,7 +115,7 @@ pub type GbmDrmOutputManager = DrmOutputManager<
 pub struct Device {
     pub inner: InnerDevice,
     pub drm: GbmDrmOutputManager,
-    pub kms_thread: Sender<KmsMessage>,
+    pub kms_thread: KmsThread,
 
     pub texture_formats: FormatSet,
     event_token: Option<RegistrationToken>,
@@ -139,7 +138,7 @@ struct OldDeviceState {
 pub struct LockedDevice<'a> {
     pub inner: &'a mut InnerDevice,
     pub drm: LockedGbmDrmOutputManager<'a>,
-    pub kms_thread: &'a mut Sender<KmsMessage>,
+    pub kms_thread: &'a mut KmsThread,
 }
 
 pub struct InnerDevice {
@@ -734,7 +733,7 @@ impl Device {
                     )
                 })?,
         ));
-        let (drm, notifier) = DrmDevice::new(fd.clone(), false)
+        let (drm, _notifier) = DrmDevice::new(fd.clone(), false)
             .with_context(|| format!("Failed to initialize drm device for: {}", path.display()))?;
         let dev_node = DrmNode::from_dev_id(dev)?;
 
@@ -812,7 +811,8 @@ impl Device {
                 )
             };
 
-        let kms_thread = start_kms_thread(notifier);
+        let kms_thread = start_kms_thread(fd.clone())
+            .with_context(|| format!("Failed to start KMS thread for: {}", path.display()))?;
 
         let ReusableDevice {
             leasing_global,
@@ -1108,7 +1108,7 @@ impl InnerDevice {
         screen_filter: ScreenFilter,
         shell: Arc<parking_lot::RwLock<Shell>>,
         startup_done: Arc<AtomicBool>,
-        kms_thread: &Sender<KmsMessage>,
+        kms_thread: &KmsThreadHandle,
     ) -> Result<(Output, bool)> {
         let output = self
             .outputs
