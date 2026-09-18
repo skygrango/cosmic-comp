@@ -74,9 +74,11 @@ mod device;
 pub(crate) mod drm_helpers;
 pub mod render;
 mod surface;
+mod thread;
 use device::*;
 pub use surface::{OutputVulkanTimeline, Timings, output_vulkan_timeline};
 pub(crate) use surface::{Surface, emergency_shutdown_hdr_surfaces};
+pub use thread::{KmsMessage, start_kms_thread};
 
 use super::render::{CLEAR_COLOR, CursorMode, output_elements};
 
@@ -1337,6 +1339,7 @@ impl KmsGuard<'_> {
                         screen_filter.clone(),
                         shell.clone(),
                         startup_done.clone(),
+                        &device.kms_thread,
                     )?;
                     if output.mirroring().is_none() {
                         w += output.geometry().size.w as u32;
