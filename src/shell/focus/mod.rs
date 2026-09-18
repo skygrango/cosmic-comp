@@ -12,7 +12,7 @@ use smithay::{
     backend::input::InputTime,
     desktop::{
         LayerSurface, PopupUngrabStrategy, WindowSurfaceType, find_popup_root_surface,
-        layer_map_for_output, space::spaceelement,
+        layer_map_for_output,
     },
     input::{Seat, pointer::MotionEvent},
     output::Output,
