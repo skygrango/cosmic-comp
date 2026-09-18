@@ -276,6 +276,44 @@ where
             ),
         ]
     }
+
+    pub fn clip_for_dst(
+        &self,
+        dst: Rectangle<i32, Physical>,
+    ) -> (Rectangle<i32, Physical>, [f32; 4]) {
+        if dst == self.physical_geo {
+            (self.physical_geo, self.physical_radii)
+        } else {
+            let inner_geo = self.inner.geometry(self.scale);
+            if dst == inner_geo {
+                (self.physical_geo, self.physical_radii)
+            } else if inner_geo.size.w > 0 && inner_geo.size.h > 0 {
+                let sx = dst.size.w as f64 / inner_geo.size.w as f64;
+                let sy = dst.size.h as f64 / inner_geo.size.h as f64;
+                let ox = (self.physical_geo.loc.x - inner_geo.loc.x) as f64;
+                let oy = (self.physical_geo.loc.y - inner_geo.loc.y) as f64;
+
+                let clip_loc = Point::from((
+                    dst.loc.x + (ox * sx).round() as i32,
+                    dst.loc.y + (oy * sy).round() as i32,
+                ));
+                let clip_size = Size::from((
+                    (self.physical_geo.size.w as f64 * sx).round() as i32,
+                    (self.physical_geo.size.h as f64 * sy).round() as i32,
+                ));
+                let s_radius = (sx.min(sy)) as f32;
+                let clip_radii = [
+                    self.physical_radii[0] * s_radius,
+                    self.physical_radii[1] * s_radius,
+                    self.physical_radii[2] * s_radius,
+                    self.physical_radii[3] * s_radius,
+                ];
+                (Rectangle::new(clip_loc, clip_size), clip_radii)
+            } else {
+                (self.physical_geo, self.physical_radii)
+            }
+        }
+    }
 }
 
 impl<R> Element for ClippedSurfaceRenderElement<R>
@@ -377,7 +415,7 @@ where
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), R::Error> {
-        frame.set_surface_clip(Some((self.physical_geo, self.physical_radii)));
+        frame.set_surface_clip(Some(self.clip_for_dst(dst)));
 
         let previous_override =
             <R as AsGlowRenderer>::glow_frame_mut(frame).and_then(|glow_frame| {
