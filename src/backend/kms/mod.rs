@@ -78,7 +78,7 @@ mod thread;
 use device::*;
 pub use surface::{OutputVulkanTimeline, Timings, output_vulkan_timeline};
 pub(crate) use surface::{Surface, emergency_shutdown_hdr_surfaces};
-pub use thread::{KmsThread, KmsThreadHandle, start_kms_thread};
+pub use thread::{KmsMessage, start_kms_thread};
 
 use super::render::{CLEAR_COLOR, CursorMode, output_elements};
 

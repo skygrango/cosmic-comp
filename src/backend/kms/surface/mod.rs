@@ -121,7 +121,7 @@ pub use self::timings::Timings;
 use super::{
     drm_helpers,
     render::{gles::GbmGlowBackend, vulkan::GbmVulkanBackend},
-    thread::KmsThreadHandle,
+    thread::KmsMessage,
 };
 use smithay::backend::renderer::vulkan::VulkanRenderer;
 
@@ -191,7 +191,7 @@ pub struct Surface {
     thread: Option<JoinHandle<()>>,
     emergency_shutdown_id: Option<u64>,
 
-    kms_thread: KmsThreadHandle,
+    kms_thread: Sender<KmsMessage>,
 
     dpms: bool,
     pub is_vulkan: bool,
@@ -505,7 +505,7 @@ impl Surface {
         shell: Arc<parking_lot::RwLock<Shell>>,
         startup_done: Arc<AtomicBool>,
         is_vulkan: bool,
-        kms_thread: &KmsThreadHandle,
+        kms_thread: &Sender<KmsMessage>,
     ) -> Result<Self> {
         unsafe {
             let min_priority = libc::sched_get_priority_max(libc::SCHED_RR);
@@ -522,7 +522,7 @@ impl Surface {
             }
         }
         let (tx, rx) = channel::<ThreadCommand>();
-        kms_thread.register(crtc, tx.clone());
+        let _ = kms_thread.send(KmsMessage::RegisterSurface(crtc, tx.clone()));
         let (tx2, rx2) = channel::<SurfaceCommand>();
         let active = Arc::new(AtomicBool::new(false));
 
@@ -885,7 +885,9 @@ impl Surface {
 
 impl Drop for Surface {
     fn drop(&mut self) {
-        self.kms_thread.unregister(self.crtc);
+        let _ = self
+            .kms_thread
+            .send(KmsMessage::UnregisterSurface(self.crtc));
         if let Some(id) = self.emergency_shutdown_id.take()
             && let Some(senders) = HDR_SURFACE_SENDERS.get()
         {
