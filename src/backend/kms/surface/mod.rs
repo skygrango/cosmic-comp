@@ -1313,7 +1313,7 @@ fn apply_cursor_buffer_transform(
                 ))
             }
         };
-        compositor.set_cursor_buffer_transform(transform);
+        compositor.set_cursor_buffer_transform(None);
 
         let post_blend_transform: Option<CursorBufferTransformFn> = if hdr_enabled {
             let peak = (hdr_reference_white * 5.0).max(1000.0);
@@ -1327,7 +1327,7 @@ fn apply_cursor_buffer_transform(
         } else {
             None
         };
-        compositor.set_cursor_buffer_transform_post_blend(post_blend_transform);
+        compositor.set_cursor_buffer_transform_post_blend(None);
     }
 }
 
