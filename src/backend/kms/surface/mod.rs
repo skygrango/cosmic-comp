@@ -1334,12 +1334,12 @@ fn apply_cursor_buffer_transform(
 impl SurfaceThreadState {
     fn update_scanout_color_management(
         &mut self,
-        scanout_plan: ScanoutPlan,
+        scanout_plan: Option<ScanoutPlan>,
         fullscreen_surface: Option<&FullscreenOccupied>,
         allow_primary_scanout: &mut bool,
     ) {
         let compositor = self.compositor.as_ref().unwrap();
-        if *allow_primary_scanout {
+        if *allow_primary_scanout && let Some(scanout_plan) = scanout_plan {
             match scanout_plan {
                 ScanoutPlan::PlaneColorop(conv) => {
                     let wl_surf = fullscreen_surface.and_then(|f| f.surface.wl_surface());
@@ -1837,23 +1837,16 @@ impl SurfaceThreadState {
                     drives_refresh_rate,
                     animations_going,
                     prefers_async,
-                    scanout_plan,
+                    Some(scanout_plan),
                     Some(fullscreen_surface),
                 )
             } else {
-                (
-                    false,
-                    false,
-                    animations_going,
-                    false,
-                    ScanoutPlan::DirectPassthrough,
-                    None,
-                )
+                (false, false, animations_going, false, None, None)
             }
         };
 
         let mut allow_primary_scanout = has_active_fullscreen
-            && scanout_plan.allows_primary_scanout()
+            && scanout_plan.is_some_and(|plan| plan.allows_primary_scanout())
             && self.screen_filter.is_noop()
             && self.mirroring.is_none()
             && !*DISABLE_DIRECT_SCANOUT;
@@ -2364,23 +2357,16 @@ impl SurfaceThreadState {
                     drives_refresh_rate,
                     animations_going,
                     prefers_async,
-                    scanout_plan,
+                    Some(scanout_plan),
                     Some(fullscreen_surface),
                 )
             } else {
-                (
-                    false,
-                    false,
-                    animations_going,
-                    false,
-                    ScanoutPlan::DirectPassthrough,
-                    None,
-                )
+                (false, false, animations_going, false, None, None)
             }
         };
 
         let mut allow_primary_scanout = has_active_fullscreen
-            && scanout_plan.allows_primary_scanout()
+            && scanout_plan.is_some_and(|plan| plan.allows_primary_scanout())
             && self.screen_filter.is_noop()
             && self.mirroring.is_none()
             && !*DISABLE_DIRECT_SCANOUT;
