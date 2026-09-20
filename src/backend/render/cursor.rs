@@ -36,7 +36,8 @@ use smithay::{
     },
     render_elements,
     utils::{
-        Buffer as BufferCoords, Logical, Monotonic, Physical, Point, Scale, Size, Time, Transform,
+        Buffer as BufferCoords, Logical, Monotonic, Physical, Point, Rectangle, Scale, Size, Time,
+        Transform,
     },
     wayland::compositor::{get_role, with_states},
 };
@@ -901,7 +902,31 @@ fn hide_cursor(state: &mut State, seat: &Seat<State>) {
         inner.idle_timer = None;
         inner.last_armed = None;
     }
-    let outputs: Vec<_> = state.common.shell.read().outputs().cloned().collect();
+    let shell = state.common.shell.read();
+    let outputs: Vec<_> = if let Some(ptr) = seat.get_pointer() {
+        let pos = ptr.current_location().as_global();
+        let cursor_outputs: Vec<_> = shell
+            .outputs()
+            .filter(|o| {
+                let geo = o.geometry().to_f64();
+                let margin = 128.0;
+                Rectangle::new(
+                    Point::from((geo.loc.x - margin, geo.loc.y - margin)),
+                    Size::from((geo.size.w + margin * 2.0, geo.size.h + margin * 2.0)),
+                )
+                .contains(pos)
+            })
+            .cloned()
+            .collect();
+        if cursor_outputs.is_empty() {
+            vec![seat.active_output()]
+        } else {
+            cursor_outputs
+        }
+    } else {
+        vec![seat.active_output()]
+    };
+    drop(shell);
     for output in outputs {
         state.backend.schedule_render(&output);
     }

@@ -2340,6 +2340,36 @@ impl Shell {
             })
     }
 
+    pub fn output_animations_going(&self, output: &Output) -> bool {
+        self.workspaces.sets.get(output).is_some_and(|set| {
+            set.previously_active
+                .as_ref()
+                .is_some_and(|(_, delta)| delta.is_animating())
+                || set.sticky_layer.animations_going()
+        }) || !matches!(
+            self.overview_mode,
+            OverviewMode::None | OverviewMode::Active(_)
+        ) || !matches!(
+            self.resize_mode,
+            ResizeMode::None | ResizeMode::Active(_, _)
+        ) || self
+            .workspaces
+            .spaces_for_output(output)
+            .any(|workspace| workspace.animations_going())
+            || (self.zoom_state.is_some()
+                && output
+                    .user_data()
+                    .get::<Mutex<OutputZoomState>>()
+                    .is_some_and(|state| state.lock().unwrap().is_animating()))
+            || self.seats.iter().any(|seat| {
+                seat.active_output() == *output
+                    && seat
+                        .user_data()
+                        .get::<crate::backend::render::cursor::CursorState>()
+                        .is_some_and(|state| state.lock().unwrap().is_magnifying())
+            })
+    }
+
     pub fn update_animations(&mut self) -> HashMap<ClientId, Client> {
         let mut clients = HashMap::new();
         for set in self.workspaces.sets.values_mut() {

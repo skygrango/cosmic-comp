@@ -851,7 +851,14 @@ pub fn cursor_elements<'a, 'frame, R>(
             });
         let cursor_center = location.to_physical(scale).to_i32_round();
 
-        if mode != CursorMode::None {
+        let output_geo = output.geometry().to_f64();
+        let cursor_margin = (128.0 * zoom_scale * cursor_magnification as f64).max(128.0);
+        let cursor_overlap = location.x >= -cursor_margin
+            && location.x <= output_geo.size.w + cursor_margin
+            && location.y >= -cursor_margin
+            && location.y <= output_geo.size.h + cursor_margin;
+
+        if cursor_overlap && mode != CursorMode::None {
             cursor::draw_cursor(
                 renderer,
                 seat,
@@ -883,14 +890,19 @@ pub fn cursor_elements<'a, 'frame, R>(
         }
 
         if !exclude_dnd_icon && let Some(dnd_icon) = get_dnd_icon(seat) {
-            cursor::draw_dnd_icon(
-                renderer,
-                &dnd_icon.surface,
-                (location + dnd_icon.offset.to_f64()).to_i32_round(),
-                scale,
-                blur_strength,
-                &mut |elem| push(CosmicElement::Dnd(elem)),
-            );
+            let dnd_loc = location + dnd_icon.offset.to_f64();
+            let dnd_bbox = bbox_from_surface_tree(&dnd_icon.surface, dnd_loc.to_i32_round());
+            let output_rect = Rectangle::new((0, 0).into(), output.geometry().as_logical().size);
+            if output_rect.overlaps_or_touches(dnd_bbox) {
+                cursor::draw_dnd_icon(
+                    renderer,
+                    &dnd_icon.surface,
+                    dnd_loc,
+                    scale,
+                    blur_strength,
+                    &mut |elem| push(CosmicElement::Dnd(elem)),
+                );
+            }
         }
 
         let theme = theme.cosmic();

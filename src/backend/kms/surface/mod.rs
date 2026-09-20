@@ -1615,7 +1615,9 @@ impl SurfaceThreadState {
             QueueState::WaitingForEstimatedVBlankAndQueued { .. } => unreachable!(),
         };
 
-        if redraw_needed || (!self.timings.vrr() && self.shell.read().animations_going()) {
+        if redraw_needed
+            || (!self.timings.vrr() && self.shell.read().output_animations_going(&self.output))
+        {
             let vblank_frame = tracy_client::Client::running()
                 .unwrap()
                 .non_continuous_frame(self.vblank_frame_name);
@@ -1642,7 +1644,8 @@ impl SurfaceThreadState {
 
         self.frame_callback_seq = self.frame_callback_seq.wrapping_add(1);
 
-        if force || (!self.timings.vrr() && self.shell.read().animations_going()) {
+        if force || (!self.timings.vrr() && self.shell.read().output_animations_going(&self.output))
+        {
             self.queue_redraw(false, false);
         }
         self.send_frame_callbacks();
@@ -1818,8 +1821,8 @@ impl SurfaceThreadState {
             fullscreen_surface,
         ) = {
             let shell = self.shell.read();
-            let animations_going = shell.animations_going();
             let output = self.mirroring.as_ref().unwrap_or(&self.output);
+            let animations_going = shell.output_animations_going(output);
             if let Some(fullscreen_surface) = output.is_foreground_fullscreen_occupied()
                 && fullscreen_surface.alive()
             {
@@ -2338,8 +2341,8 @@ impl SurfaceThreadState {
             fullscreen_surface,
         ) = {
             let shell = self.shell.read();
-            let animations_going = shell.animations_going();
             let output = self.mirroring.as_ref().unwrap_or(&self.output);
+            let animations_going = shell.output_animations_going(output);
             if let Some(fullscreen_surface) = output.is_foreground_fullscreen_occupied()
                 && fullscreen_surface.alive()
             {
@@ -3737,8 +3740,10 @@ fn postprocess_elements<'a>(
     };
 
     let mut elements: [Option<TextureShaderElement>; 2] = [None, None];
-    if let Some(cursor_texture) = postprocess_state.cursor_texture.as_ref() {
-        let cursor_geometry = pre_postprocess_data.cursor_geometry.unwrap();
+    if let (Some(cursor_texture), Some(cursor_geometry)) = (
+        postprocess_state.cursor_texture.as_ref(),
+        pre_postprocess_data.cursor_geometry.as_ref(),
+    ) {
         let texture_elem = TextureRenderElement::from_texture_render_buffer(
             cursor_geometry.loc.to_f64(),
             cursor_texture,
