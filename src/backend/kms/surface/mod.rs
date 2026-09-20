@@ -1294,7 +1294,7 @@ fn apply_cursor_buffer_transform(
 
     if *current_mode != Some(desired_mode) {
         *current_mode = Some(desired_mode);
-        let transform: Option<CursorBufferTransformFn> = match desired_mode {
+        let _transform: Option<CursorBufferTransformFn> = match desired_mode {
             CursorTransformMode::Passthrough => None,
             CursorTransformMode::PqEncode { ref_white } => {
                 let encoder = SrgbToPqEncoder::new(ref_white as f32 / 10000.0);
@@ -1315,7 +1315,7 @@ fn apply_cursor_buffer_transform(
         };
         compositor.set_cursor_buffer_transform(None);
 
-        let post_blend_transform: Option<CursorBufferTransformFn> = if hdr_enabled {
+        let _post_blend_transform: Option<CursorBufferTransformFn> = if hdr_enabled {
             let peak = (hdr_reference_white * 5.0).max(1000.0);
             let scale = (hdr_reference_white / peak).min(1.0);
             let encoder = SrgbToPqEncoder::new_linear(scale, false);

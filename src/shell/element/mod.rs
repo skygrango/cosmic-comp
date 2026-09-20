@@ -460,6 +460,12 @@ impl CosmicMapped {
         }
     }
 
+    pub fn set_hidden(&self, hidden: bool) {
+        for (w, _) in self.windows() {
+            w.set_hidden(hidden);
+        }
+    }
+
     pub fn pending_size(&self) -> Option<Size<i32, Logical>> {
         match &self.element {
             CosmicMappedInternal::Stack(s) => s.pending_size(),

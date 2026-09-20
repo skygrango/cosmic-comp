@@ -520,14 +520,20 @@ impl CosmicSurface {
             .load(Ordering::SeqCst)
     }
 
+    pub fn set_hidden(&self, hidden: bool) {
+        if let WindowSurface::X11(surface) = self.0.underlying_surface() {
+            let _ = surface.set_hidden(hidden);
+        }
+    }
+
     pub fn set_minimized(&self, minimized: bool) {
         self.0
             .user_data()
             .get_or_insert_threadsafe(Minimized::default)
             .0
             .store(minimized, Ordering::SeqCst);
-        if let WindowSurface::X11(surface) = self.0.underlying_surface() {
-            let _ = surface.set_hidden(minimized);
+        if !minimized {
+            self.set_hidden(false);
         }
     }
 

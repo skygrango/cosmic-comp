@@ -685,6 +685,8 @@ impl FloatingLayout {
                     target_geometry: to,
                 },
             );
+        } else if window.is_minimized() {
+            window.set_hidden(true);
         }
 
         if window.floating_tiled.lock().unwrap().take().is_some() {
@@ -1414,12 +1416,16 @@ impl FloatingLayout {
 
     pub fn update_animation_state(&mut self) {
         let was_empty = self.animations.is_empty();
-        self.animations.retain(|_, anim| {
+        self.animations.retain(|elem, anim| {
             let duration = match anim {
                 Animation::Tiled { .. } => ANIMATION_DURATION,
                 _ => MINIMIZE_ANIMATION_DURATION,
             };
-            Instant::now().duration_since(*anim.start()) < duration
+            let keep = Instant::now().duration_since(*anim.start()) < duration;
+            if !keep && matches!(anim, Animation::Minimize { .. }) {
+                elem.set_hidden(true);
+            }
+            keep
         });
         if self.animations.is_empty() != was_empty {
             self.dirty.store(true, Ordering::SeqCst);

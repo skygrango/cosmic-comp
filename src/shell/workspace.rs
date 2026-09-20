@@ -1064,6 +1064,7 @@ impl Workspace {
             }
 
             fullscreen_state.surface.set_minimized(true);
+            fullscreen_state.surface.set_hidden(true);
             return Some(MinimizedWindow::Fullscreen {
                 surface: fullscreen_state.surface,
                 previous: fullscreen_state

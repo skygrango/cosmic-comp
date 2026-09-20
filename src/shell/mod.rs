@@ -3414,6 +3414,7 @@ impl Shell {
                         self.appearance_conf,
                     ));
                     window.set_minimized(true);
+                    window.set_hidden(true);
                     MinimizedWindow::Floating { window, previous }
                 }
                 WorkspaceRestoreData::Tiling(previous) => {
@@ -3424,10 +3425,12 @@ impl Shell {
                         self.appearance_conf,
                     ));
                     window.set_minimized(true);
+                    window.set_hidden(true);
                     MinimizedWindow::Tiling { window, previous }
                 }
                 WorkspaceRestoreData::Fullscreen(previous) => {
                     window.set_minimized(true);
+                    window.set_hidden(true);
                     MinimizedWindow::Fullscreen {
                         surface: window.clone(),
                         previous,

@@ -1365,6 +1365,8 @@ impl TilingLayout {
                 {
                     *minimize_to = Some(to);
                 }
+            } else if window.is_minimized() {
+                window.set_hidden(true);
             }
 
             window.output_leave(&self.output);
@@ -2400,10 +2402,15 @@ impl TilingLayout {
                         .collect::<Vec<_>>()
                         .into_iter()
                     {
-                        if let Data::Mapped { minimize_rect, .. } =
-                            front.0.get_mut(&node).unwrap().data_mut()
+                        if let Data::Mapped {
+                            minimize_rect,
+                            mapped,
+                            ..
+                        } = front.0.get_mut(&node).unwrap().data_mut()
                         {
-                            minimize_rect.take();
+                            if minimize_rect.take().is_some() {
+                                mapped.set_hidden(true);
+                            }
                         }
                     }
                 }
