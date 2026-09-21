@@ -170,6 +170,16 @@ static DISABLE_OVERLAY_SCANOUT: LazyLock<bool> =
     LazyLock::new(|| bool_var("COSMIC_DISABLE_OVERLAY_SCANOUT").unwrap_or(false));
 
 const _30_HZ: Duration = Duration::from_nanos(1_000_000_000 / 30);
+const MIN_VRR_TARGET_RATE: u32 = 30_000; // 30Hz in milliHz
+
+#[inline]
+pub fn resolve_vrr_target_rate(rate: u32, origin_rate: u32) -> u32 {
+    if rate < MIN_VRR_TARGET_RATE {
+        origin_rate
+    } else {
+        rate
+    }
+}
 
 #[cfg(feature = "debug")]
 use smithay_egui::EguiState;
@@ -789,6 +799,13 @@ impl Surface {
     }
 
     pub fn set_vrr_target_rate(&mut self, rate: u32) {
+        let origin_rate = self
+            .output
+            .current_mode()
+            .map(|m| m.refresh as u32)
+            .filter(|&r| r > 0)
+            .unwrap_or(60000);
+        let rate = resolve_vrr_target_rate(rate, origin_rate);
         let _ = self
             .thread_command
             .send(ThreadCommand::UpdateVrrTargetRate(rate));
@@ -1116,12 +1133,25 @@ fn surface_thread(
                 state.vrr_mode = vrr;
             }
             Event::Msg(ThreadCommand::UpdateVrrTargetRate(rate)) => {
-                state.vrr_target_rate = rate;
-                state
-                    .timings
-                    .set_vrr_target_rate_interval(Some(Duration::from_secs_f64(
-                        1000. / rate as f64,
-                    )));
+                let origin_rate = state
+                    .output
+                    .current_mode()
+                    .map(|m| m.refresh as u32)
+                    .filter(|&r| r > 0)
+                    .unwrap_or(60000);
+                let is_below_30hz = rate < MIN_VRR_TARGET_RATE;
+                let target_rate = resolve_vrr_target_rate(rate, origin_rate);
+                state.vrr_target_rate = target_rate;
+                let interval = if is_below_30hz {
+                    state
+                        .timings
+                        .origin_refresh_interval_ns
+                        .map(|ns| Duration::from_nanos(ns.get()))
+                        .unwrap_or_else(|| Duration::from_secs_f64(1000. / origin_rate as f64))
+                } else {
+                    Duration::from_secs_f64(1000. / target_rate as f64)
+                };
+                state.timings.set_vrr_target_rate_interval(Some(interval));
                 if state.timings.vrr() {
                     state.timings.refresh_interval_ns = state.timings.vrr_target_rate_internal_ns;
                     state.timings.previous_frames.clear();
@@ -4818,5 +4848,23 @@ mod tests {
             mode_passthrough,
             CursorTransformMode::PqEncode { ref_white: 203 }
         );
+    }
+
+    #[test]
+    fn test_vrr_target_rate_below_30hz_fallback_to_origin() {
+        let origin_rate = 60_000;
+        // Rates below 30Hz (30,000 mHz) must fallback to origin_rate
+        assert_eq!(resolve_vrr_target_rate(0, origin_rate), origin_rate);
+        assert_eq!(resolve_vrr_target_rate(24, origin_rate), origin_rate);
+        assert_eq!(resolve_vrr_target_rate(24_000, origin_rate), origin_rate);
+        assert_eq!(resolve_vrr_target_rate(29_970, origin_rate), origin_rate);
+        assert_eq!(resolve_vrr_target_rate(29_999, origin_rate), origin_rate);
+
+        // Rates at or above 30Hz (30,000 mHz) must be preserved
+        assert_eq!(resolve_vrr_target_rate(30_000, origin_rate), 30_000);
+        assert_eq!(resolve_vrr_target_rate(50_000, origin_rate), 50_000);
+        assert_eq!(resolve_vrr_target_rate(60_000, origin_rate), 60_000);
+        assert_eq!(resolve_vrr_target_rate(120_000, origin_rate), 120_000);
+        assert_eq!(resolve_vrr_target_rate(144_000, origin_rate), 144_000);
     }
 }
