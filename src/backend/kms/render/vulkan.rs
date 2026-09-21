@@ -457,30 +457,40 @@ mod test {
         use smithay::utils::Transform;
 
         let Ok(instance) = Instance::new(Version::VERSION_1_3, None) else {
+            eprintln!("Instance::new failed!");
             return;
         };
 
+        let mut tested_count = 0;
         for phd in PhysicalDevice::enumerate(&instance).unwrap() {
             if phd.api_version() < Version::VERSION_1_3 {
                 continue;
             }
 
-            let Ok(file) = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open("/dev/dri/card1")
-            else {
-                continue;
-            };
-            let owned: rustix::fd::OwnedFd = file.into();
-            let drm_fd = DrmDeviceFd::new(smithay::utils::DeviceFd::from(owned));
-            let Ok(gbm) = GbmDevice::new(drm_fd.clone()) else {
-                continue;
-            };
+            let mut drm_dev = None;
+            for path in &["/dev/dri/card1", "/dev/dri/renderD128", "/dev/dri/card0"] {
+                let Ok(file) = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(path)
+                else {
+                    continue;
+                };
+                let owned: rustix::fd::OwnedFd = file.into();
+                let drm_fd = DrmDeviceFd::new(smithay::utils::DeviceFd::from(owned));
+                let Ok(gbm) = GbmDevice::new(drm_fd.clone()) else {
+                    continue;
+                };
+                if let Ok(renderer) = VulkanRenderer::new(&phd, Some(drm_fd.clone())) {
+                    drm_dev = Some((drm_fd, gbm, renderer));
+                    break;
+                }
+            }
 
-            let Ok(renderer) = VulkanRenderer::new(&phd, Some(drm_fd.clone())) else {
+            let Some((drm_fd, gbm, renderer)) = drm_dev else {
                 continue;
             };
+            let renderer_device = renderer.device().clone();
 
             let node = phd
                 .render_node()
@@ -568,7 +578,54 @@ mod test {
             );
             let multi_tex = imported_tex.unwrap();
 
-            // Try rendering it onto a framebuffer
+            // Rigorous test: Test YUV (NV12) dmabuf allocation, import, and YCbCr rendering
+            let yuv_dmabuf = gbm_allocator
+                .create_buffer(
+                    64,
+                    64,
+                    smithay::backend::allocator::Fourcc::Nv12,
+                    &[smithay::backend::allocator::Modifier::Linear],
+                )
+                .ok()
+                .and_then(|buf| buf.export().ok())
+                .or_else(|| {
+                    use smithay::backend::vulkan::ash::vk;
+                    use smithay::backend::vulkan::image::VulkanImage;
+                    println!(
+                        "GBM did not allocate NV12, falling back to VulkanImage::new_exportable"
+                    );
+                    VulkanImage::new_exportable(
+                        &renderer_device,
+                        64,
+                        64,
+                        smithay::backend::allocator::Fourcc::Nv12,
+                        [smithay::backend::allocator::Modifier::Linear].into_iter(),
+                        vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC,
+                    )
+                    .map_err(|e| println!("VulkanImage::new_exportable error: {:?}", e))
+                    .ok()
+                    .and_then(|img| img.export().ok())
+                })
+                .expect("Failed to allocate NV12 client dmabuf via both GBM and VulkanImage");
+
+            println!(
+                "client YUV dmabuf allocation: format: {:?}, node: {:?}",
+                yuv_dmabuf.format(),
+                yuv_dmabuf.node()
+            );
+            let imported_yuv = single.import_dmabuf(&yuv_dmabuf, None);
+            println!(
+                "single.import_dmabuf(YUV NV12) result: {:?}",
+                imported_yuv.as_ref().map(|_| ())
+            );
+            assert!(
+                imported_yuv.is_ok(),
+                "import_dmabuf for NV12 YUV dmabuf failed: {:?}",
+                imported_yuv.err()
+            );
+            let yuv_tex = imported_yuv.unwrap();
+
+            // Try rendering both onto a target framebuffer
             let target_gbm = gbm_allocator
                 .create_buffer(
                     64,
@@ -601,14 +658,46 @@ mod test {
                 Transform::Normal,
                 1.0,
             );
-            println!("frame.render_texture_from_to result: {:?}", render_res);
+            println!(
+                "ARGB8888 frame.render_texture_from_to result: {:?}",
+                render_res
+            );
             assert!(render_res.is_ok());
+
+            let yuv_render_res = frame.render_texture_from_to(
+                &yuv_tex,
+                smithay::utils::Rectangle::new((0.0, 0.0).into(), (64.0, 64.0).into()),
+                smithay::utils::Rectangle::new((0, 0).into(), (64, 64).into()),
+                &[smithay::utils::Rectangle::new(
+                    (0, 0).into(),
+                    (64, 64).into(),
+                )],
+                &[],
+                Transform::Normal,
+                1.0,
+            );
+            println!(
+                "YUV NV12 frame.render_texture_from_to result: {:?}",
+                yuv_render_res
+            );
+            assert!(
+                yuv_render_res.is_ok(),
+                "render_texture_from_to for YUV NV12 failed: {:?}",
+                yuv_render_res.err()
+            );
+
             let sync = frame.finish().expect("frame.finish failed");
             println!("frame.finish sync: {:?}", sync);
             let _ = sync.wait();
             let _ = single.cleanup_texture_cache();
+            tested_count += 1;
             break;
         }
+
+        assert!(
+            tested_count > 0,
+            "Expected at least one Vulkan physical device to be tested, but 0 were tested"
+        );
     }
 
     #[test]

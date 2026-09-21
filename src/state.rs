@@ -78,10 +78,13 @@ use smithay::{
     wayland::{
         alpha_modifier::AlphaModifierState,
         background_effect::BackgroundEffectState,
-        color::management::{
-            ColorManagementState, Feature as ColorFeature, ImageDescription,
-            Primaries as ColorPrimaries, RenderIntent as ColorRenderIntent,
-            TransferFunction as ColorTransferFunction,
+        color::{
+            management::{
+                ColorManagementState, Feature as ColorFeature, ImageDescription,
+                Primaries as ColorPrimaries, RenderIntent as ColorRenderIntent,
+                TransferFunction as ColorTransferFunction,
+            },
+            representation::ColorRepresentationState,
         },
         commit_timing::CommitTimingManagerState,
         compositor::{CompositorClientState, CompositorState, SurfaceData},
@@ -287,6 +290,7 @@ pub struct Common {
     // wayland state
     pub compositor_state: CompositorState,
     pub color_management_state: ColorManagementState,
+    pub color_representation_state: ColorRepresentationState,
     pub corner_radius_state: CornerRadiusState,
     pub data_device_state: DataDeviceState,
     pub dmabuf_state: DmabufState,
@@ -751,6 +755,8 @@ impl State {
             move |_| advertise_hdr,
         );
 
+        let color_representation_state = ColorRepresentationState::default_state::<Self>(dh);
+
         // let color_management_state = ColorManagementState::new::<Self, _>(
         //     dh,
         //     [
@@ -918,6 +924,7 @@ impl State {
 
                 compositor_state,
                 color_management_state,
+                color_representation_state,
                 corner_radius_state,
                 data_device_state,
                 dmabuf_state,

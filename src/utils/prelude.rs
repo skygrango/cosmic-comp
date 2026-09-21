@@ -1,14 +1,22 @@
 use cosmic_comp_config::output::comp::{AdaptiveSync, OutputConfig, OutputState};
 use parking_lot::RwLock;
 use smithay::{
-    backend::drm::{DrmScanoutCapabilities, ScanoutPlan, VrrSupport as Support},
+    backend::{
+        allocator::{Buffer as _, format::is_ycbcr},
+        drm::{
+            DrmScanoutCapabilities, ScanoutCandidate, ScanoutPlan, ScanoutTarget,
+            VrrSupport as Support, color::PlaneColorConversion,
+        },
+        renderer::utils::RendererSurfaceStateUserData,
+    },
     desktop::utils::with_surfaces_surface_tree,
     output::{Output, WeakOutput},
     reexports::wayland_server::{Client, protocol::wl_surface::WlSurface},
     utils::Rectangle,
     wayland::{
-        color::management::ImageDescription,
-        compositor::{Barrier, CompositorHandler},
+        color::management::{ImageDescription, surface_description_from_states},
+        compositor::{Barrier, BufferAssignment, CompositorHandler, SurfaceAttributes},
+        dmabuf::get_dmabuf,
         seat::WaylandFocus,
         tearing_control::prefer_async_from_states,
     },
@@ -19,6 +27,7 @@ pub use crate::shell::{SeatExt, Shell, Workspace};
 pub use crate::state::{Common, State};
 pub use crate::wayland::handlers::xdg_shell::popup::update_reactive_popups;
 use crate::{
+    backend::kms::drm_helpers::HdrOutputState,
     config::EdidProduct,
     shell::{CosmicSurface, element::surface::WeakCosmicSurface, zoom::OutputZoomState},
 };
@@ -58,8 +67,8 @@ pub trait OutputExt {
     fn set_avg_frametime(&self, duration: Option<Duration>);
     fn get_avg_frametime(&self) -> Option<Duration>;
 
-    fn scanout_capabilities(&self) -> Option<DrmScanoutCapabilities>;
     fn set_scanout_capabilities(&self, caps: DrmScanoutCapabilities);
+    fn scanout_capabilities(&self) -> Option<DrmScanoutCapabilities>;
 
     fn set_fullscreen_occupied(&self, occupied: Option<FullscreenOccupied>);
     fn is_foreground_fullscreen_occupied(&self) -> Option<FullscreenOccupied>;
@@ -77,6 +86,7 @@ pub struct FullscreenOccupied {
     pub surface: CosmicSurface,
     pub prefers_async: bool,
     pub is_hdr: bool,
+    pub is_yuv: bool,
     pub color_description: Option<ImageDescription>,
     pub scanout_plan: ScanoutPlan,
     pub fallback_plan: Option<ScanoutPlan>,
@@ -98,10 +108,15 @@ impl FullscreenOccupied {
         is_hdr: bool,
         color_description: Option<ImageDescription>,
     ) -> Self {
+        let is_yuv = surface
+            .wl_surface()
+            .as_deref()
+            .is_some_and(surface_tree_is_yuv);
         Self {
             surface,
             prefers_async,
             is_hdr,
+            is_yuv,
             color_description,
             scanout_plan: ScanoutPlan::DirectPassthrough,
             fallback_plan: None,
@@ -137,16 +152,13 @@ pub fn fallback_for_scanout_plan(
     match plan {
         ScanoutPlan::PlaneColorop(conv) => {
             let crtc_supported = match conv {
-                smithay::backend::drm::color::PlaneColorConversion::ScRgbToPq { .. }
-                | smithay::backend::drm::color::PlaneColorConversion::ScRgbToSrgb => {
+                PlaneColorConversion::ScRgbToPq { .. } | PlaneColorConversion::ScRgbToSrgb => {
                     caps.supports_scrgb_hardware_scanout()
                 }
-                smithay::backend::drm::color::PlaneColorConversion::SrgbToPq { .. } => {
+                PlaneColorConversion::SrgbToPq { .. } => {
                     caps.supports_sdr_to_hdr_hardware_scanout()
                 }
-                smithay::backend::drm::color::PlaneColorConversion::HlgToPq { .. } => {
-                    caps.supports_hlg_to_hdr_hardware_scanout()
-                }
+                PlaneColorConversion::HlgToPq { .. } => caps.supports_hlg_to_hdr_hardware_scanout(),
                 _ => false,
             };
             if crtc_supported {
@@ -166,6 +178,7 @@ struct WeakFullscreenOccupied {
     surface: WeakCosmicSurface,
     prefers_async: bool,
     is_hdr: bool,
+    is_yuv: bool,
     color_description: Option<ImageDescription>,
     scanout_plan: ScanoutPlan,
     fallback_plan: Option<ScanoutPlan>,
@@ -407,7 +420,7 @@ impl OutputExt for Output {
         if let Some(ref mut occ) = occupied {
             // Check output HDR status, reference white, and peak luminance
             let (output_hdr_enabled, output_ref_white, output_peak) = user_data
-                .get::<crate::backend::kms::drm_helpers::HdrOutputState>()
+                .get::<HdrOutputState>()
                 .and_then(|s| s.get().or_else(|| s.staged()))
                 .map(|hdr| {
                     (
@@ -436,13 +449,24 @@ impl OutputExt for Output {
                 }
             }
 
-            // Determine scanout plan using smithay's evaluate_scanout_plan_with_peak
-            let plan = caps.evaluate_scanout_plan_with_peak(
-                output_hdr_enabled,
-                occ.color_description.as_ref(),
-                output_ref_white,
-                output_peak,
-            );
+            let is_yuv = occ
+                .surface
+                .wl_surface()
+                .as_deref()
+                .is_some_and(surface_tree_is_yuv);
+            occ.is_yuv = is_yuv;
+
+            // Determine scanout plan using smithay's unified evaluate_scanout
+            let candidate = ScanoutCandidate {
+                image_description: occ.color_description.as_ref(),
+                is_yuv,
+            };
+            let target = ScanoutTarget {
+                hdr_enabled: output_hdr_enabled,
+                reference_white: output_ref_white,
+                peak_luminance: output_peak,
+            };
+            let plan = caps.evaluate_scanout(candidate, target);
             let fallback = fallback_for_scanout_plan(plan, &caps);
 
             tracing::info!(
@@ -451,6 +475,7 @@ impl OutputExt for Output {
                 output_ref_white,
                 output_peak = ?output_peak,
                 color_desc = ?occ.color_description,
+                is_yuv,
                 ?plan,
                 ?fallback,
                 "Fullscreen occupied: evaluated hardware scanout plan"
@@ -465,6 +490,7 @@ impl OutputExt for Output {
             surface: occ.surface.downgrade(),
             prefers_async: occ.prefers_async,
             is_hdr: occ.is_hdr,
+            is_yuv: occ.is_yuv,
             color_description: occ.color_description,
             scanout_plan: occ.scanout_plan,
             fallback_plan: occ.fallback_plan,
@@ -481,6 +507,7 @@ impl OutputExt for Output {
             surface,
             prefers_async: weak_occ.prefers_async,
             is_hdr: weak_occ.is_hdr,
+            is_yuv: weak_occ.is_yuv,
             color_description: weak_occ.color_description.clone(),
             scanout_plan: weak_occ.scanout_plan,
             fallback_plan: weak_occ.fallback_plan,
@@ -492,7 +519,7 @@ impl OutputExt for Output {
         let Some(state) = self.user_data().get::<OutputFullscreenOccupied>() else {
             return;
         };
-        let (surface, current_async, current_desc) = {
+        let (surface, current_async, current_desc, current_is_yuv) = {
             let guard = state.0.read();
             let Some(weak_occ) = guard.as_ref() else {
                 return;
@@ -504,6 +531,7 @@ impl OutputExt for Output {
                 surface,
                 weak_occ.prefers_async,
                 weak_occ.color_description.clone(),
+                weak_occ.is_yuv,
             )
         };
         let prefers_async = surface
@@ -514,12 +542,17 @@ impl OutputExt for Output {
             .wl_surface()
             .as_deref()
             .and_then(surface_tree_color_description);
-        if current_async == prefers_async && current_desc == color_desc {
+        let is_yuv = surface
+            .wl_surface()
+            .as_deref()
+            .is_some_and(surface_tree_is_yuv);
+        if current_async == prefers_async && current_desc == color_desc && current_is_yuv == is_yuv
+        {
             return;
         }
         let (output_hdr_enabled, output_ref_white, output_peak) = self
             .user_data()
-            .get::<crate::backend::kms::drm_helpers::HdrOutputState>()
+            .get::<HdrOutputState>()
             .and_then(|s| s.get().or_else(|| s.staged()))
             .map(|hdr| {
                 (
@@ -538,12 +571,16 @@ impl OutputExt for Output {
             })
             .unwrap_or((false, 203, None));
         let caps = self.scanout_capabilities().unwrap_or_default();
-        let plan = caps.evaluate_scanout_plan_with_peak(
-            output_hdr_enabled,
-            color_desc.as_ref(),
-            output_ref_white,
-            output_peak,
-        );
+        let candidate = ScanoutCandidate {
+            image_description: color_desc.as_ref(),
+            is_yuv,
+        };
+        let target = ScanoutTarget {
+            hdr_enabled: output_hdr_enabled,
+            reference_white: output_ref_white,
+            peak_luminance: output_peak,
+        };
+        let plan = caps.evaluate_scanout(candidate, target);
         let fallback = fallback_for_scanout_plan(plan, &caps);
         let mut guard = state.0.write();
         let Some(weak_occ) = guard.as_mut() else {
@@ -551,6 +588,7 @@ impl OutputExt for Output {
         };
         if weak_occ.surface.upgrade().as_ref() == Some(&surface) {
             weak_occ.prefers_async = prefers_async;
+            weak_occ.is_yuv = is_yuv;
             weak_occ.color_description = color_desc;
             weak_occ.scanout_plan = plan;
             weak_occ.fallback_plan = fallback;
@@ -586,9 +624,7 @@ pub fn surface_tree_color_description(surface: &WlSurface) -> Option<ImageDescri
     let mut desc = None;
     with_surfaces_surface_tree(surface, |_, states| {
         if desc.is_none() {
-            if let (Some(d), _) =
-                smithay::wayland::color::management::surface_description_from_states(states)
-            {
+            if let (Some(d), _) = surface_description_from_states(states) {
                 desc = Some(d);
             }
         }
@@ -599,11 +635,38 @@ pub fn surface_tree_color_description(surface: &WlSurface) -> Option<ImageDescri
 pub fn surface_tree_is_hdr(surface: &WlSurface) -> bool {
     let mut found = false;
     with_surfaces_surface_tree(surface, |_, states| {
-        if smithay::wayland::color::management::surface_description_from_states(states)
+        if surface_description_from_states(states)
             .0
             .is_some_and(|description| description.is_pq_bt2020())
         {
             found = true;
+        }
+    });
+    found
+}
+
+pub fn surface_tree_is_yuv(surface: &WlSurface) -> bool {
+    let mut found = false;
+    with_surfaces_surface_tree(surface, |_, states| {
+        if found {
+            return;
+        }
+        if let Some(data) = states.data_map.get::<RendererSurfaceStateUserData>() {
+            if let Ok(guard) = data.lock() {
+                if guard.is_ycbcr() {
+                    found = true;
+                    return;
+                }
+            }
+        }
+        let mut guard = states.cached_state.get::<SurfaceAttributes>();
+        let attrs = guard.current();
+        if let Some(BufferAssignment::NewBuffer(buffer)) = &attrs.buffer {
+            if let Ok(dmabuf) = get_dmabuf(buffer) {
+                if is_ycbcr(dmabuf.format().code) {
+                    found = true;
+                }
+            }
         }
     });
     found

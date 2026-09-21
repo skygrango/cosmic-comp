@@ -9,9 +9,12 @@ use smithay::{
         wayland_server::protocol::wl_surface::WlSurface,
     },
     wayland::{
-        color::management::{
-            ColorManagementHandler, ColorManagementState, ImageDescription, Primaries,
-            PrimariesOption, TransferFunction, send_image_description_info,
+        color::{
+            management::{
+                ColorManagementHandler, ColorManagementState, ImageDescription, Primaries,
+                PrimariesOption, TransferFunction, send_image_description_info,
+            },
+            representation::{ColorRepresentationHandler, ColorRepresentationState},
         },
         compositor::{get_parent, with_states},
     },
@@ -97,6 +100,12 @@ impl ColorManagementHandler for State {
         self.common.event_loop_handle.insert_idle(move |_state| {
             send_image_description_info(&info, &desc);
         });
+    }
+}
+
+impl ColorRepresentationHandler for State {
+    fn color_representation_state(&mut self) -> &mut ColorRepresentationState {
+        &mut self.common.color_representation_state
     }
 }
 

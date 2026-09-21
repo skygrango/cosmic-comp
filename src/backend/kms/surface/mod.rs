@@ -2,12 +2,13 @@
 
 use crate::{
     backend::{
-        kms::surface::timings::SAMPLE_TIME_WINDOW,
+        kms::{drm_helpers::HdrOutputState, surface::timings::SAMPLE_TIME_WINDOW},
         render::{
             CLEAR_COLOR, CursorMode, GlMultiError, GlMultiRenderer, PostprocessOutputConfig,
             PostprocessShader, PostprocessState, VulkanMultiRenderer,
             element::{CosmicElement, DamageElement},
             init_shaders, output_elements, postprocess_intermediate_format, set_hdr_client_blend,
+            wayland::SurfaceRenderElement,
         },
     },
     config::ScreenFilter,
@@ -1360,7 +1361,7 @@ impl SurfaceThreadState {
                             let peak = self
                                 .output
                                 .user_data()
-                                .get::<crate::backend::kms::drm_helpers::HdrOutputState>()
+                                .get::<HdrOutputState>()
                                 .and_then(|s| s.get().or_else(|| s.staged()))
                                 .map(|hdr| hdr.capabilities.max_luminance as f64)
                                 .unwrap_or(1000.0);
@@ -3543,9 +3544,7 @@ fn send_toplevel_screencopy_result_vulkan<'a>(
     };
 
     let loc_phys: Point<i32, Physical> = geometry.loc.to_f64().to_physical(scale).to_i32_round();
-    let mut elements: Vec<
-        crate::backend::render::wayland::SurfaceRenderElement<VulkanMultiRenderer>,
-    > = Vec::new();
+    let mut elements: Vec<SurfaceRenderElement<VulkanMultiRenderer>> = Vec::new();
     toplevel.push_render_elements(
         renderer,
         Point::from((-loc_phys.x, -loc_phys.y)),
@@ -3902,7 +3901,9 @@ mod tests {
                 has_ctm: true,
             },
             supports_plane_colorop: false,
-            primary_plane_color_pipelines: Vec::new(),
+            primary_plane_color_pipelines: vec![
+                smithay::backend::drm::colorop::ColorPipeline::synthetic(),
+            ],
             primary_plane_formats: FormatSet::default(),
             supports_fp16: true,
             supports_10bit: true,
@@ -4085,7 +4086,7 @@ mod tests {
         let tr = srgb
             .to_scanout_color_transform()
             .expect("sRGB to PQ transform");
-        assert_eq!(tr.decode, Some(Curve1DType::SrgbEotf));
+        assert_eq!(tr.decode, Some(Curve1DType::Gamma22));
         assert_eq!(tr.encode, Some(Curve1DType::Pq125InvEotf));
         assert!((tr.multiplier - (203.0 / 80.0)).abs() < 1e-6);
 
