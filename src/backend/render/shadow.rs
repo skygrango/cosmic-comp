@@ -528,6 +528,10 @@ where
     ) -> Result<(), R::Error> {
         Ok(())
     }
+
+    fn prepare_texture(&self, frame: &mut R::Frame<'_, '_>) -> Result<(), R::Error> {
+        frame.prepare_textures(std::iter::once(&self.texture))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -688,6 +692,20 @@ where
                         elem, glow_frame, src, dst, cache,
                     )
                     .map_err(R::from_gles_error)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    fn prepare_texture(&self, frame: &mut R::Frame<'_, '_>) -> Result<(), R::Error> {
+        match self {
+            ShadowElement::NinePatch(elem) => RenderElement::<R>::prepare_texture(elem, frame),
+            ShadowElement::Pixel(elem) => {
+                if let Some(glow_frame) = R::glow_frame_mut(frame) {
+                    RenderElement::<GlowRenderer>::prepare_texture(elem, glow_frame)
+                        .map_err(R::from_gles_error)
                 } else {
                     Ok(())
                 }

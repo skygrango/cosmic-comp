@@ -502,6 +502,10 @@ where
     fn underlying_storage(&self, _renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
         None
     }
+
+    fn prepare_texture(&self, frame: &mut R::Frame<'_, '_>) -> Result<(), R::Error> {
+        self.inner.prepare_texture(frame)
+    }
 }
 
 #[cfg(test)]

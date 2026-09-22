@@ -346,6 +346,34 @@ where
             }
         }
     }
+
+    fn prepare_texture(&self, frame: &mut R::Frame<'_, '_>) -> Result<(), R::Error> {
+        match self {
+            CosmicElement::Workspace(elem) => elem.prepare_texture(frame),
+            CosmicElement::Cursor(elem) => elem.prepare_texture(frame),
+            CosmicElement::Dnd(elem) => elem.prepare_texture(frame),
+            CosmicElement::MoveGrab(elem) => elem.prepare_texture(frame),
+            CosmicElement::Postprocess(elem) => {
+                if let Some(glow_frame) = R::glow_frame_mut(frame) {
+                    RenderElement::<GlowRenderer>::prepare_texture(elem, glow_frame)
+                        .map_err(R::from_gles_error)
+                } else {
+                    Ok(())
+                }
+            }
+            CosmicElement::Zoom(elem) => elem.prepare_texture(frame),
+            CosmicElement::Damage(elem) => RenderElement::<R>::prepare_texture(elem, frame),
+            #[cfg(feature = "debug")]
+            CosmicElement::Egui(elem) => {
+                if let Some(glow_frame) = R::glow_frame_mut(frame) {
+                    RenderElement::<GlowRenderer>::prepare_texture(elem, glow_frame)
+                        .map_err(R::from_gles_error)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
 }
 
 impl<R> From<CropRenderElement<RescaleRenderElement<WorkspaceRenderElement<R>>>>

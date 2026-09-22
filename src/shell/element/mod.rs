@@ -1556,6 +1556,37 @@ where
             }
         }
     }
+
+    fn prepare_texture(&self, frame: &mut R::Frame<'_, '_>) -> Result<(), R::Error> {
+        match self {
+            CosmicMappedRenderElement::Stack(elem) => elem.prepare_texture(frame),
+            CosmicMappedRenderElement::Window(elem) => elem.prepare_texture(frame),
+            CosmicMappedRenderElement::TiledStack(elem) => elem.prepare_texture(frame),
+            CosmicMappedRenderElement::TiledWindow(elem) => elem.prepare_texture(frame),
+            CosmicMappedRenderElement::TiledOverlay(elem) => {
+                RenderElement::<R>::prepare_texture(elem, frame)
+            }
+            CosmicMappedRenderElement::MovingStack(elem) => elem.prepare_texture(frame),
+            CosmicMappedRenderElement::MovingWindow(elem) => elem.prepare_texture(frame),
+            CosmicMappedRenderElement::GrabbedStack(elem) => elem.prepare_texture(frame),
+            CosmicMappedRenderElement::GrabbedWindow(elem) => elem.prepare_texture(frame),
+            CosmicMappedRenderElement::FocusIndicator(elem) => {
+                <IndicatorRenderElement as RenderElement<R>>::prepare_texture(elem, frame)
+            }
+            CosmicMappedRenderElement::Overlay(elem) => {
+                <IndicatorRenderElement as RenderElement<R>>::prepare_texture(elem, frame)
+            }
+            CosmicMappedRenderElement::StackHoverIndicator(elem) => elem.prepare_texture(frame),
+            #[cfg(feature = "debug")]
+            CosmicMappedRenderElement::Egui(elem) => {
+                if let Some(glow_frame) = R::glow_frame_mut(frame) {
+                    RenderElement::<GlowRenderer>::prepare_texture(elem, glow_frame)
+                        .map_err(R::from_gles_error)?;
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 impl<R> From<stack::CosmicStackRenderElement<R>> for CosmicMappedRenderElement<R>

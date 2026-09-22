@@ -1632,4 +1632,15 @@ where
             }
         }
     }
+
+    fn prepare_texture(&self, frame: &mut <R>::Frame<'_, '_>) -> Result<(), <R>::Error> {
+        match self {
+            CosmicWindowRenderElement::Header(elem) => elem.prepare_texture(frame),
+            CosmicWindowRenderElement::Shadow(elem) => elem.prepare_texture(frame),
+            CosmicWindowRenderElement::Border(elem) => {
+                <IndicatorRenderElement as RenderElement<R>>::prepare_texture(elem, frame)
+            }
+            CosmicWindowRenderElement::Window(elem) => elem.prepare_texture(frame),
+        }
+    }
 }
