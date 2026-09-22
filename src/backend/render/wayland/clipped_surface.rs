@@ -277,42 +277,103 @@ where
         ]
     }
 
+    pub fn recover_uncropped_dst(
+        element_src: Rectangle<f64, Buffer>,
+        transform: Transform,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+    ) -> Rectangle<i32, Physical> {
+        if src != element_src && src.size.w > 0.0 && src.size.h > 0.0 {
+            let unscaled_physical_crop = transform.invert().transform_size(dst.size).to_f64();
+            if unscaled_physical_crop.w > 0.0 && unscaled_physical_crop.h > 0.0 {
+                let physical_to_buffer_scale = Scale::from((
+                    src.size.w / unscaled_physical_crop.w,
+                    src.size.h / unscaled_physical_crop.h,
+                ));
+                let mut relative_src = src;
+                relative_src.loc -= element_src.loc;
+                let relative_logical =
+                    relative_src.to_logical(physical_to_buffer_scale, transform, &element_src.size);
+                let uncropped_size_logical = element_src
+                    .size
+                    .to_logical(physical_to_buffer_scale, transform);
+                let uncropped_size = transform.transform_size(uncropped_size_logical);
+                let uncropped_loc = Point::from((
+                    dst.loc.x - relative_logical.loc.x.round() as i32,
+                    dst.loc.y - relative_logical.loc.y.round() as i32,
+                ));
+
+                Rectangle::new(
+                    uncropped_loc,
+                    Size::from((
+                        uncropped_size.w.round() as i32,
+                        uncropped_size.h.round() as i32,
+                    )),
+                )
+            } else {
+                dst
+            }
+        } else {
+            dst
+        }
+    }
+
+    pub fn clip_for_uncropped(
+        physical_geo: Rectangle<i32, Physical>,
+        physical_radii: [f32; 4],
+        inner_geo: Rectangle<i32, Physical>,
+        uncropped_dst: Rectangle<i32, Physical>,
+    ) -> (Rectangle<i32, Physical>, [f32; 4]) {
+        if uncropped_dst == physical_geo || uncropped_dst == inner_geo {
+            (physical_geo, physical_radii)
+        } else if inner_geo.size.w > 0 && inner_geo.size.h > 0 {
+            let sx = uncropped_dst.size.w as f64 / inner_geo.size.w as f64;
+            let sy = uncropped_dst.size.h as f64 / inner_geo.size.h as f64;
+            let ox = (physical_geo.loc.x - inner_geo.loc.x) as f64;
+            let oy = (physical_geo.loc.y - inner_geo.loc.y) as f64;
+
+            let clip_loc = Point::from((
+                uncropped_dst.loc.x + (ox * sx).round() as i32,
+                uncropped_dst.loc.y + (oy * sy).round() as i32,
+            ));
+            let clip_size = Size::from((
+                (physical_geo.size.w as f64 * sx).round() as i32,
+                (physical_geo.size.h as f64 * sy).round() as i32,
+            ));
+            let s_radius = (sx.min(sy)) as f32;
+            let clip_radii = [
+                physical_radii[0] * s_radius,
+                physical_radii[1] * s_radius,
+                physical_radii[2] * s_radius,
+                physical_radii[3] * s_radius,
+            ];
+            (Rectangle::new(clip_loc, clip_size), clip_radii)
+        } else {
+            (physical_geo, physical_radii)
+        }
+    }
+
+    pub fn clip_for_draw(
+        &self,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+    ) -> (Rectangle<i32, Physical>, [f32; 4]) {
+        let uncropped_dst =
+            Self::recover_uncropped_dst(self.inner.src(), self.inner.transform(), src, dst);
+        Self::clip_for_uncropped(
+            self.physical_geo,
+            self.physical_radii,
+            self.inner.geometry(self.scale),
+            uncropped_dst,
+        )
+    }
+
+    #[inline]
     pub fn clip_for_dst(
         &self,
         dst: Rectangle<i32, Physical>,
     ) -> (Rectangle<i32, Physical>, [f32; 4]) {
-        if dst == self.physical_geo {
-            (self.physical_geo, self.physical_radii)
-        } else {
-            let inner_geo = self.inner.geometry(self.scale);
-            if dst == inner_geo {
-                (self.physical_geo, self.physical_radii)
-            } else if inner_geo.size.w > 0 && inner_geo.size.h > 0 {
-                let sx = dst.size.w as f64 / inner_geo.size.w as f64;
-                let sy = dst.size.h as f64 / inner_geo.size.h as f64;
-                let ox = (self.physical_geo.loc.x - inner_geo.loc.x) as f64;
-                let oy = (self.physical_geo.loc.y - inner_geo.loc.y) as f64;
-
-                let clip_loc = Point::from((
-                    dst.loc.x + (ox * sx).round() as i32,
-                    dst.loc.y + (oy * sy).round() as i32,
-                ));
-                let clip_size = Size::from((
-                    (self.physical_geo.size.w as f64 * sx).round() as i32,
-                    (self.physical_geo.size.h as f64 * sy).round() as i32,
-                ));
-                let s_radius = (sx.min(sy)) as f32;
-                let clip_radii = [
-                    self.physical_radii[0] * s_radius,
-                    self.physical_radii[1] * s_radius,
-                    self.physical_radii[2] * s_radius,
-                    self.physical_radii[3] * s_radius,
-                ];
-                (Rectangle::new(clip_loc, clip_size), clip_radii)
-            } else {
-                (self.physical_geo, self.physical_radii)
-            }
-        }
+        self.clip_for_draw(self.inner.src(), dst)
     }
 }
 
@@ -415,7 +476,7 @@ where
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), R::Error> {
-        frame.set_surface_clip(Some(self.clip_for_dst(dst)));
+        frame.set_surface_clip(Some(self.clip_for_draw(src, dst)));
 
         let previous_override =
             <R as AsGlowRenderer>::glow_frame_mut(frame).and_then(|glow_frame| {
@@ -509,5 +570,165 @@ mod tests {
         // Test rect extending outside bounds
         let outside_elem_geo = Rectangle::new(Point::from((150, 400)), Size::from((100, 100)));
         assert!(!physical_geo.contains_rect(outside_elem_geo));
+    }
+
+    #[test]
+    fn test_recover_uncropped_dst_fractional_scale() {
+        // Simulating a window at logical x = -100, y = 100, w = 800, h = 600 at 1.5x scale:
+        // Physical uncropped: x = -150, y = 150, w = 1200, h = 900
+        // Buffer src: loc (0, 0), size (1200, 900)
+        let element_src: Rectangle<f64, Buffer> =
+            Rectangle::new(Point::from((0.0, 0.0)), Size::from((1200.0, 900.0)));
+        let transform = Transform::Normal;
+
+        // 1. Crossing left screen edge at x = 0:
+        // Visible physical part on screen: loc (0, 150), size (1050, 900)
+        // Buffer src cropped by 150px: loc (150, 0), size (1050, 900)
+        let cropped_dst: Rectangle<i32, Physical> =
+            Rectangle::new(Point::from((0, 150)), Size::from((1050, 900)));
+        let cropped_src: Rectangle<f64, Buffer> =
+            Rectangle::new(Point::from((150.0, 0.0)), Size::from((1050.0, 900.0)));
+
+        let recovered = ClippedSurfaceRenderElement::<smithay::backend::renderer::glow::GlowRenderer>::recover_uncropped_dst(
+            element_src,
+            transform,
+            cropped_src,
+            cropped_dst,
+        );
+
+        assert_eq!(recovered.loc, Point::from((-150, 150)));
+        assert_eq!(recovered.size, Size::from((1200, 900)));
+
+        // 2. Crossing right screen edge (e.g. at 2560px with window at 2000px):
+        // Visible physical part on screen: loc (2000, 150), size (560, 900)
+        // Buffer src cropped on right: loc (0, 0), size (560, 900)
+        let right_cropped_dst: Rectangle<i32, Physical> =
+            Rectangle::new(Point::from((2000, 150)), Size::from((560, 900)));
+        let right_cropped_src: Rectangle<f64, Buffer> =
+            Rectangle::new(Point::from((0.0, 0.0)), Size::from((560.0, 900.0)));
+
+        let recovered_right = ClippedSurfaceRenderElement::<
+            smithay::backend::renderer::glow::GlowRenderer,
+        >::recover_uncropped_dst(
+            element_src, transform, right_cropped_src, right_cropped_dst
+        );
+
+        assert_eq!(recovered_right.loc, Point::from((2000, 150)));
+        assert_eq!(recovered_right.size, Size::from((1200, 900)));
+
+        // 3. Top and bottom crops:
+        let top_cropped_dst: Rectangle<i32, Physical> =
+            Rectangle::new(Point::from((150, 0)), Size::from((1200, 800)));
+        let top_cropped_src: Rectangle<f64, Buffer> =
+            Rectangle::new(Point::from((0.0, 100.0)), Size::from((1200.0, 800.0)));
+
+        let recovered_top = ClippedSurfaceRenderElement::<
+            smithay::backend::renderer::glow::GlowRenderer,
+        >::recover_uncropped_dst(
+            element_src, transform, top_cropped_src, top_cropped_dst
+        );
+
+        assert_eq!(recovered_top.loc, Point::from((150, -100)));
+        assert_eq!(recovered_top.size, Size::from((1200, 900)));
+
+        // 4. 100% scale (unscaled 1.0x):
+        let elem_src_100: Rectangle<f64, Buffer> =
+            Rectangle::new(Point::from((0.0, 0.0)), Size::from((800.0, 600.0)));
+        // Crossing left edge: x = -200, w = 800 -> visible dst: [0, 100, 600, 600], src: [200, 0, 600, 600]
+        let cropped_dst_100: Rectangle<i32, Physical> =
+            Rectangle::new(Point::from((0, 100)), Size::from((600, 600)));
+        let cropped_src_100: Rectangle<f64, Buffer> =
+            Rectangle::new(Point::from((200.0, 0.0)), Size::from((600.0, 600.0)));
+
+        let recovered_100 = ClippedSurfaceRenderElement::<
+            smithay::backend::renderer::glow::GlowRenderer,
+        >::recover_uncropped_dst(
+            elem_src_100, transform, cropped_src_100, cropped_dst_100
+        );
+        assert_eq!(recovered_100.loc, Point::from((-200, 100)));
+        assert_eq!(recovered_100.size, Size::from((800, 600)));
+    }
+
+    #[test]
+    fn test_clip_for_uncropped_no_false_edge_rounding() {
+        let physical_geo: Rectangle<i32, Physical> =
+            Rectangle::new(Point::from((-150, 150)), Size::from((1200, 900)));
+        let physical_radii = [12.0f32, 12.0f32, 12.0f32, 12.0f32];
+        let inner_geo = physical_geo;
+
+        // When recovered uncropped destination matches the true window position:
+        let uncropped_dst = physical_geo;
+
+        let (clip_rect, clip_radii) = ClippedSurfaceRenderElement::<
+            smithay::backend::renderer::glow::GlowRenderer,
+        >::clip_for_uncropped(
+            physical_geo, physical_radii, inner_geo, uncropped_dst
+        );
+
+        // Clip rectangle remains at the true window position, NOT at the screen edge (x = 0)
+        assert_eq!(clip_rect, physical_geo);
+        assert_eq!(clip_radii, physical_radii);
+
+        // Test subsurface within the window:
+        let subsurface_geo: Rectangle<i32, Physical> =
+            Rectangle::new(Point::from((-50, 200)), Size::from((400, 300)));
+        let (sub_clip_rect, sub_clip_radii) = ClippedSurfaceRenderElement::<
+            smithay::backend::renderer::glow::GlowRenderer,
+        >::clip_for_uncropped(
+            physical_geo,
+            physical_radii,
+            subsurface_geo,
+            subsurface_geo,
+        );
+        // Subsurface clip still covers the entire window bounding box:
+        assert_eq!(sub_clip_rect, physical_geo);
+        assert_eq!(sub_clip_radii, physical_radii);
+    }
+
+    #[test]
+    fn test_outline_render_element_recovers_uncropped_dst() {
+        use crate::backend::render::OutlineRenderElement;
+        use smithay::backend::renderer::element::Element;
+        use smithay::utils::Transform;
+
+        // Logical area: loc (-200, 100), size (800, 600)
+        let area: Rectangle<i32, Logical> =
+            Rectangle::new(Point::from((-200, 100)), Size::from((800, 600)));
+        let outline = OutlineRenderElement {
+            id: smithay::backend::renderer::element::Id::new(),
+            commit: smithay::backend::renderer::utils::CommitCounter::default(),
+            area,
+            thickness: 2.0,
+            radius: [16.0, 16.0, 16.0, 16.0],
+            color: [1.0, 1.0, 1.0],
+            alpha: 1.0,
+        };
+
+        // At 1.5x scale, physical uncropped geometry is (-300, 150, 1200, 900)
+        let element_src = outline.src();
+        assert_eq!(element_src.size, Size::from((800.0, 600.0)));
+
+        // Cropped by left screen boundary (x = 0):
+        // Visible physical dst: loc (0, 150), size (900, 900)
+        // Relative cropped src: loc (200, 0), size (600, 600)
+        let cropped_dst: Rectangle<i32, Physical> =
+            Rectangle::new(Point::from((0, 150)), Size::from((900, 900)));
+        let cropped_src: Rectangle<f64, Buffer> =
+            Rectangle::new(Point::from((200.0, 0.0)), Size::from((600.0, 600.0)));
+
+        let recovered_dst = ClippedSurfaceRenderElement::<
+            smithay::backend::renderer::glow::GlowRenderer,
+        >::recover_uncropped_dst(
+            element_src, Transform::Normal, cropped_src, cropped_dst
+        );
+
+        assert_eq!(recovered_dst.loc, Point::from((-300, 150)));
+        assert_eq!(recovered_dst.size, Size::from((1200, 900)));
+
+        // Verify invariant scale calculation:
+        let scale = recovered_dst.size.w as f32 / area.size.w as f32;
+        assert_eq!(scale, 1.5);
+        assert_eq!(outline.thickness * scale, 3.0);
+        assert_eq!(outline.radius.map(|r| r * scale), [24.0, 24.0, 24.0, 24.0]);
     }
 }

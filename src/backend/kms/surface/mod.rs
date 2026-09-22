@@ -3825,13 +3825,7 @@ fn postprocess_elements<'a>(
     constrain_render_elements(
         elements.into_iter().flatten(),
         (0, 0),
-        Rectangle::from_size(
-            output
-                .geometry()
-                .size
-                .as_logical()
-                .to_physical_precise_round(output.current_scale().fractional_scale()),
-        ),
+        Rectangle::new(Point::from((0, 0)), postprocess_state.output_config.size),
         Rectangle::new(Point::from((0, 0)), postprocess_state.output_config.size),
         ConstrainScaleBehavior::Fit,
         ConstrainAlign::CENTER,

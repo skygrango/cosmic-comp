@@ -20,7 +20,7 @@ use crate::{
             wayland::{
                 SurfaceRenderElement,
                 blur_effect::BlurShaders,
-                clipped_surface::{CLIPPING_SHADER, ClippingShader},
+                clipped_surface::{CLIPPING_SHADER, ClippedSurfaceRenderElement, ClippingShader},
                 push_render_elements_from_surface_tree,
             },
         },
@@ -274,15 +274,21 @@ impl<R: AsGlowRenderer> RenderElement<R> for OutlineRenderElement {
     fn draw(
         &self,
         frame: &mut R::Frame<'_, '_>,
-        _src: Rectangle<f64, Buffer>,
+        src: Rectangle<f64, Buffer>,
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
         _opaque_regions: &[Rectangle<i32, Physical>],
         _cache: Option<&UserDataMap>,
     ) -> Result<(), R::Error> {
+        let uncropped_dst = ClippedSurfaceRenderElement::<R>::recover_uncropped_dst(
+            self.src(),
+            Transform::Normal,
+            src,
+            dst,
+        );
         let logical_width = self.area.size.w;
         let scale = if logical_width > 0 {
-            dst.size.w as f32 / logical_width as f32
+            uncropped_dst.size.w as f32 / logical_width as f32
         } else {
             1.0
         };
@@ -295,7 +301,14 @@ impl<R: AsGlowRenderer> RenderElement<R> for OutlineRenderElement {
             self.alpha,
         );
 
-        frame.draw_rounded_outline(dst, damage, physical_thickness, physical_radius, color_32f)
+        frame.draw_rounded_outline(
+            dst,
+            damage,
+            physical_thickness,
+            physical_radius,
+            color_32f,
+            Some(uncropped_dst),
+        )
     }
 
     #[inline]
@@ -1151,10 +1164,15 @@ where
     };
 
     let output_size = output
-        .geometry()
-        .size
-        .as_logical()
-        .to_physical_precise_round(scale);
+        .current_mode()
+        .map(|m| output.current_transform().transform_size(m.size))
+        .unwrap_or_else(|| {
+            output
+                .geometry()
+                .size
+                .as_logical()
+                .to_physical_precise_round(scale)
+        });
     let (focal_point, zoom_scale) = zoom_level
         .map(|state| {
             (
