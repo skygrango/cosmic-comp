@@ -2745,7 +2745,16 @@ impl SurfaceThreadState {
                             let _ = self.vblank_frame.take();
 
                             if self.fullscreen.is_some() && self.timings.vrr() {
-                                let _ = mem::replace(&mut self.state, QueueState::Idle);
+                                match mem::replace(&mut self.state, QueueState::Idle) {
+                                    QueueState::WaitingForEstimatedVBlank(token)
+                                    | QueueState::WaitingForEstimatedVBlankAndQueued {
+                                        estimated_vblank: token,
+                                        ..
+                                    } => {
+                                        self.loop_handle.remove(token);
+                                    }
+                                    _ => {}
+                                }
                                 self.frame_callback_seq = self.frame_callback_seq.wrapping_add(1);
                                 if let Some(fullscreen) = &self.fullscreen {
                                     fullscreen.0.send_frame(
