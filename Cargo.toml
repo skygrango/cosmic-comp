@@ -156,4 +156,4 @@ drm = { git = "https://github.com/skygrango/drm-rs.git", rev = "79d3d68" }
 drm-ffi = { git = "https://github.com/skygrango/drm-rs.git", rev = "79d3d68" }
 drm-sys = { git = "https://github.com/skygrango/drm-rs.git", rev = "79d3d68" }
 gbm = { git = "https://github.com/skygrango/gbm.rs.git", rev = "4001b10" }
-smithay = { git = "https://github.com/skygrango/smithay.git", rev = "f7547b5" }
+smithay = { git = "https://github.com/skygrango/smithay.git", rev = "ab29b5d" }

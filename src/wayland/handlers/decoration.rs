@@ -162,6 +162,9 @@ impl XdgDecorationHandler for State {
                 .find(|(window, _)| window.wl_surface().as_deref() == Some(toplevel.wl_surface()))
                 && let Some(toplevel) = window.0.toplevel()
             {
+                if PreferredDecorationMode::mode(&window.0) == Some(mode) {
+                    return;
+                }
                 PreferredDecorationMode::update(&window.0, Some(mode));
                 toplevel.with_pending_state(|state| {
                     state.decoration_mode = Some(mode);
@@ -169,6 +172,11 @@ impl XdgDecorationHandler for State {
                 toplevel.send_configure();
             }
         } else {
+            let already_pending =
+                toplevel.with_pending_state(|state| state.decoration_mode == Some(mode));
+            if already_pending {
+                return;
+            }
             toplevel.with_pending_state(|state| state.decoration_mode = Some(mode));
             if let Some(pending) = shell
                 .pending_windows
@@ -202,6 +210,32 @@ impl XdgDecorationHandler for State {
         } else {
             toplevel.with_pending_state(|state| {
                 state.decoration_mode = Some(XdgMode::from_preference(self.default_decoration()))
+            });
+            if let Some(pending) = shell
+                .pending_windows
+                .iter()
+                .find(|pending| pending.surface.0.toplevel().is_some_and(|t| t == &toplevel))
+            {
+                PreferredDecorationMode::update(&pending.surface.0, None);
+            }
+        }
+    }
+
+    fn decoration_destroyed(&mut self, toplevel: ToplevelSurface) {
+        let shell = self.common.shell.read();
+        if let Some(mapped) = shell.element_for_surface(toplevel.wl_surface())
+            && let Some((window, _)) = mapped
+                .windows()
+                .find(|(window, _)| window.wl_surface().as_deref() == Some(toplevel.wl_surface()))
+            && let Some(toplevel) = window.0.toplevel()
+        {
+            PreferredDecorationMode::update(&window.0, None);
+            toplevel.with_pending_state(|state| {
+                state.decoration_mode = Some(XdgMode::ClientSide);
+            });
+        } else {
+            toplevel.with_pending_state(|state| {
+                state.decoration_mode = Some(XdgMode::ClientSide);
             });
             if let Some(pending) = shell
                 .pending_windows
