@@ -2301,10 +2301,11 @@ impl SurfaceThreadState {
                             // If postprocessing, use states from first render
                             let states = pre_postprocess_data.states.unwrap_or(frame_result.states);
                             self.send_dmabuf_feedback(states);
-                            self.send_signal_fifo_callbacks();
                         }
 
                         if x.is_ok() {
+                            self.send_signal_fifo_callbacks();
+
                             if let Some(hdr_state) =
                                 self.output.user_data().get::<drm_helpers::HdrOutputState>()
                             {
@@ -2715,7 +2716,7 @@ impl SurfaceThreadState {
                             let _ = self
                                 .thread_sender
                                 .send(SurfaceCommand::RenderStates(frame_result.states));
-                            let _ = self.thread_sender.send(SurfaceCommand::SignalFIFO);
+                            self.send_signal_fifo_callbacks();
                         }
 
                         if x.is_ok() {
@@ -2727,6 +2728,7 @@ impl SurfaceThreadState {
                                 // accepted by KMS.
                                 hdr_state.commit();
                             }
+
                             if self.mirroring.is_none() {
                                 self.frame_callback_seq = self.frame_callback_seq.wrapping_add(1);
                                 let _ = self
@@ -2736,11 +2738,24 @@ impl SurfaceThreadState {
                         } else {
                             let _ = self.vblank_frame.take();
 
-                            self.queue_estimated_vblank(
-                                estimated_presentation,
-                                additional_frame_flags
-                                    .contains(FrameFlags::SKIP_CURSOR_ONLY_UPDATES),
-                            );
+                            if self.fullscreen.is_some() && self.timings.vrr() {
+                                let _ = mem::replace(&mut self.state, QueueState::Idle);
+                                self.frame_callback_seq = self.frame_callback_seq.wrapping_add(1);
+                                if let Some(fullscreen) = &self.fullscreen {
+                                    fullscreen.0.send_frame(
+                                        &self.output,
+                                        self.clock.now(),
+                                        None,
+                                        |_, _| Some(self.output.clone()),
+                                    );
+                                }
+                            } else {
+                                self.queue_estimated_vblank(
+                                    estimated_presentation,
+                                    additional_frame_flags
+                                        .contains(FrameFlags::SKIP_CURSOR_ONLY_UPDATES),
+                                );
+                            }
                         }
                     }
                     Err(err) => {
