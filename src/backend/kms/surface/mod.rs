@@ -1981,6 +1981,9 @@ impl SurfaceThreadState {
         {
             additional_frame_flags |= FrameFlags::SKIP_CURSOR_ONLY_UPDATES;
         };
+        if has_active_fullscreen {
+            additional_frame_flags |= FrameFlags::FULLSCREEN_PACING;
+        }
         self.timings.set_vrr(vrr);
         self.timings.elements_done(&self.clock);
 
@@ -2523,6 +2526,9 @@ impl SurfaceThreadState {
         {
             additional_frame_flags |= FrameFlags::SKIP_CURSOR_ONLY_UPDATES;
         };
+        if has_active_fullscreen {
+            additional_frame_flags |= FrameFlags::FULLSCREEN_PACING;
+        }
         self.timings.set_vrr(vrr);
         self.timings.elements_done(&self.clock);
 
@@ -4875,5 +4881,34 @@ mod tests {
         assert_eq!(resolve_vrr_target_rate(60_000, origin_rate), 60_000);
         assert_eq!(resolve_vrr_target_rate(120_000, origin_rate), 120_000);
         assert_eq!(resolve_vrr_target_rate(144_000, origin_rate), 144_000);
+    }
+
+    #[test]
+    fn test_fullscreen_pacing_flag_logic() {
+        let base_flags = FrameFlags::DEFAULT;
+        let mut additional_flags = FrameFlags::empty();
+        let remove_flags = FrameFlags::empty();
+
+        let has_active_fullscreen = true;
+        if has_active_fullscreen {
+            additional_flags |= FrameFlags::FULLSCREEN_PACING;
+        }
+
+        let effective_flags = base_flags.union(additional_flags).difference(remove_flags);
+        assert!(
+            effective_flags.contains(FrameFlags::FULLSCREEN_PACING),
+            "FULLSCREEN_PACING must be set when has_active_fullscreen is true"
+        );
+
+        let mut non_fs_flags = FrameFlags::empty();
+        let has_active_fullscreen = false;
+        if has_active_fullscreen {
+            non_fs_flags |= FrameFlags::FULLSCREEN_PACING;
+        }
+        let effective_non_fs = base_flags.union(non_fs_flags).difference(remove_flags);
+        assert!(
+            !effective_non_fs.contains(FrameFlags::FULLSCREEN_PACING),
+            "FULLSCREEN_PACING must not be set when has_active_fullscreen is false"
+        );
     }
 }
