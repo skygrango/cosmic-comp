@@ -3150,6 +3150,7 @@ fn send_screencopy_result<'a>(
         }
     };
 
+    let mut fullscreen_rendered = false;
     if let Some(ref damage) = damage {
         let (output_size, output_scale, output_transform) = (
             output.current_mode().ok_or(OutputNoMode)?.size,
@@ -3247,37 +3248,189 @@ fn send_screencopy_result<'a>(
                 fb = Some(tex_fb);
             }
         } else {
-            sync = frame_result
-                .blit_frame_result(
-                    output_size,
-                    output_transform,
-                    output_scale,
+            let fullscreen_surface = output
+                .is_foreground_fullscreen_occupied()
+                .filter(|f| f.surface.alive());
+
+            if let Some(fullscreen) = fullscreen_surface {
+                let toplevel = &fullscreen.surface;
+                let geometry = toplevel.geometry();
+                let loc_phys: Point<i32, Physical> = geometry
+                    .loc
+                    .to_f64()
+                    .to_physical(output_scale)
+                    .to_i32_round();
+                let mut toplevel_elements: Vec<SurfaceRenderElement<GlMultiRenderer>> = Vec::new();
+                toplevel.push_render_elements(
                     renderer,
-                    fb.as_mut().unwrap(),
-                    adjusted,
-                    filter,
-                )
-                .map_err(|err| match err {
-                    BlitFrameResultError::Rendering(err) => {
-                        RenderError::<<GlMultiRenderer as RendererSuper>::Error>::Rendering(err)
+                    Point::from((-loc_phys.x, -loc_phys.y)),
+                    Scale::from(output_scale),
+                    1.0,
+                    None,
+                    None,
+                    false,
+                    [0; 4],
+                    0,
+                    &mut |elem| toplevel_elements.push(elem),
+                    None,
+                );
+
+                if !toplevel_elements.is_empty() {
+                    let mut direct_blit_done = false;
+                    let dst_rect = Rectangle::from_size(output_size);
+                    if toplevel_elements.len() == 1 {
+                        if let Some(wl_surface) = toplevel.wl_surface() {
+                            let window_dmabuf =
+                                smithay::backend::renderer::utils::with_renderer_surface_state(
+                                    &wl_surface,
+                                    |state| {
+                                        let buffer = state.buffer()?;
+                                        get_dmabuf(buffer).ok().cloned()
+                                    },
+                                )
+                                .flatten();
+
+                            if let Some(mut src_dmabuf) = window_dmabuf {
+                                let src_size = src_dmabuf
+                                    .size()
+                                    .to_logical(1, Transform::Normal)
+                                    .to_physical(1);
+                                if src_size == dst_rect.size {
+                                    if let Ok(src_fb) = renderer.bind(&mut src_dmabuf) {
+                                        if let Ok(blit_sync) = renderer.blit(
+                                            &src_fb,
+                                            fb.as_mut().unwrap(),
+                                            dst_rect,
+                                            dst_rect,
+                                            TextureFilter::Nearest,
+                                        ) {
+                                            sync = blit_sync;
+                                            direct_blit_done = true;
+                                            fullscreen_rendered = true;
+                                        }
+                                    }
+                                } else if let Ok(src_fb) = renderer.bind(&mut src_dmabuf) {
+                                    if let Ok(blit_sync) = renderer.blit(
+                                        &src_fb,
+                                        fb.as_mut().unwrap(),
+                                        Rectangle::from_size(src_size),
+                                        dst_rect,
+                                        TextureFilter::Linear,
+                                    ) {
+                                        sync = blit_sync;
+                                        direct_blit_done = true;
+                                        fullscreen_rendered = true;
+                                    }
+                                }
+                            }
+                        }
                     }
-                    BlitFrameResultError::Export(_) => {
-                        RenderError::<<GlMultiRenderer as RendererSuper>::Error>::Rendering(
-                            MultiError::DeviceMissing,
+
+                    if !direct_blit_done {
+                        let mut frame = renderer
+                            .render(fb.as_mut().unwrap(), output_size, output_transform)
+                            .map_err(
+                                RenderError::<<GlMultiRenderer as RendererSuper>::Error>::Rendering,
+                            )?;
+
+                        frame.clear(Color32F::BLACK, &[dst_rect]).map_err(
+                            RenderError::<<GlMultiRenderer as RendererSuper>::Error>::Rendering,
+                        )?;
+
+                        let _ = smithay::backend::renderer::utils::draw_render_elements(
+                            &mut frame,
+                            Scale::from(output_scale),
+                            &toplevel_elements,
+                            &[dst_rect],
                         )
+                        .map_err(
+                            RenderError::<<GlMultiRenderer as RendererSuper>::Error>::Rendering,
+                        )?;
+
+                        if session.draw_cursor() {
+                            let cursor_elements = elements
+                                .iter()
+                                .filter(|elem| matches!(elem, CosmicElement::Cursor(_)))
+                                .collect::<Vec<_>>();
+                            if !cursor_elements.is_empty() {
+                                let _ = smithay::backend::renderer::utils::draw_render_elements(
+                                    &mut frame,
+                                    Scale::from(output_scale),
+                                    &cursor_elements,
+                                    &[dst_rect],
+                                );
+                            }
+                        }
+
+                        sync = frame.finish().map_err(
+                            RenderError::<<GlMultiRenderer as RendererSuper>::Error>::Rendering,
+                        )?;
+                        fullscreen_rendered = true;
+                    } else if session.draw_cursor() {
+                        let cursor_elements = elements
+                            .iter()
+                            .filter(|elem| matches!(elem, CosmicElement::Cursor(_)))
+                            .collect::<Vec<_>>();
+                        if !cursor_elements.is_empty() {
+                            let mut frame = renderer
+                                .render(fb.as_mut().unwrap(), output_size, output_transform)
+                                .map_err(RenderError::<<GlMultiRenderer as RendererSuper>::Error>::Rendering)?;
+                            let _ = smithay::backend::renderer::utils::draw_render_elements(
+                                &mut frame,
+                                Scale::from(output_scale),
+                                &cursor_elements,
+                                &[dst_rect],
+                            );
+                            sync = frame.finish().map_err(
+                                RenderError::<<GlMultiRenderer as RendererSuper>::Error>::Rendering,
+                            )?;
+                        }
                     }
-                })?;
+                }
+            }
+
+            if !fullscreen_rendered {
+                sync = frame_result
+                    .blit_frame_result(
+                        output_size,
+                        output_transform,
+                        output_scale,
+                        renderer,
+                        fb.as_mut().unwrap(),
+                        adjusted,
+                        filter,
+                    )
+                    .map_err(|err| match err {
+                        BlitFrameResultError::Rendering(err) => {
+                            RenderError::<<GlMultiRenderer as RendererSuper>::Error>::Rendering(err)
+                        }
+                        BlitFrameResultError::Export(_) => {
+                            RenderError::<<GlMultiRenderer as RendererSuper>::Error>::Rendering(
+                                MultiError::DeviceMissing,
+                            )
+                        }
+                    })?;
+            }
         };
     }
 
     let transform = output.current_transform();
+
+    let full_damage_slice = [Rectangle::from_size(
+        buffer_size.to_logical(1, Transform::Normal).to_physical(1),
+    )];
+    let final_damage = if fullscreen_rendered {
+        Some(&full_damage_slice[..])
+    } else {
+        damage.as_deref()
+    };
 
     if let Some(data) = submit_buffer(
         frame,
         renderer,
         shm_buffer.then_some(fb.as_mut().unwrap()),
         transform,
-        damage.as_deref(),
+        final_damage,
         sync,
         // Don't reference `Buffer`s since we blit from framebuffer/postprocess buffer
         vec![],
@@ -3395,6 +3548,7 @@ fn send_screencopy_result_vulkan<'a>(
         )
     };
 
+    let mut fullscreen_rendered = false;
     if let Some(ref damage) = damage {
         let (output_size, output_scale, output_transform) = (
             output.current_mode().ok_or(OutputNoMode)?.size,
@@ -3432,32 +3586,199 @@ fn send_screencopy_result_vulkan<'a>(
             })
             .collect::<Vec<_>>();
 
-        sync = frame_result
-            .blit_frame_result(
-                output_size,
-                output_transform,
-                output_scale,
+        let fullscreen_surface = output
+            .is_foreground_fullscreen_occupied()
+            .filter(|f| f.surface.alive());
+
+        if let Some(fullscreen) = fullscreen_surface {
+            let toplevel = &fullscreen.surface;
+            let geometry = toplevel.geometry();
+            let loc_phys: Point<i32, Physical> = geometry
+                .loc
+                .to_f64()
+                .to_physical(output_scale)
+                .to_i32_round();
+            let mut toplevel_elements: Vec<SurfaceRenderElement<VulkanMultiRenderer>> = Vec::new();
+            toplevel.push_render_elements(
                 renderer,
-                fb.as_mut().unwrap(),
-                adjusted,
-                filter,
-            )
-            .map_err(|err| {
-                tracing::error!(
-                    "send_screencopy_result_vulkan: blit_frame_result failed: {:#}",
-                    err
-                );
-                match err {
-                    BlitFrameResultError::Rendering(err) => {
-                        RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(err)
-                    }
-                    BlitFrameResultError::Export(_) => {
-                        RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(
-                            MultiError::DeviceMissing,
-                        )
+                Point::from((-loc_phys.x, -loc_phys.y)),
+                Scale::from(output_scale),
+                1.0,
+                None,
+                None,
+                false,
+                [0; 4],
+                0,
+                &mut |elem| toplevel_elements.push(elem),
+                None,
+            );
+
+            if !toplevel_elements.is_empty() {
+                let mut direct_blit_done = false;
+                let dst_rect = Rectangle::from_size(output_size);
+                if toplevel_elements.len() == 1 {
+                    if let Some(wl_surface) = toplevel.wl_surface() {
+                        let window_dmabuf =
+                            smithay::backend::renderer::utils::with_renderer_surface_state(
+                                &wl_surface,
+                                |state| {
+                                    let buffer = state.buffer()?;
+                                    get_dmabuf(buffer).ok().cloned()
+                                },
+                            )
+                            .flatten();
+
+                        if let Some(mut src_dmabuf) = window_dmabuf {
+                            let src_size = src_dmabuf
+                                .size()
+                                .to_logical(1, Transform::Normal)
+                                .to_physical(1);
+                            if src_size == dst_rect.size {
+                                if let Ok(src_fb) = renderer.bind(&mut src_dmabuf) {
+                                    if let Ok(blit_sync) = renderer.blit(
+                                        &src_fb,
+                                        fb.as_mut().unwrap(),
+                                        dst_rect,
+                                        dst_rect,
+                                        TextureFilter::Nearest,
+                                    ) {
+                                        sync = blit_sync;
+                                        direct_blit_done = true;
+                                        fullscreen_rendered = true;
+                                    }
+                                }
+                            } else if let Ok(src_fb) = renderer.bind(&mut src_dmabuf) {
+                                if let Ok(blit_sync) = renderer.blit(
+                                    &src_fb,
+                                    fb.as_mut().unwrap(),
+                                    Rectangle::from_size(src_size),
+                                    dst_rect,
+                                    TextureFilter::Linear,
+                                ) {
+                                    sync = blit_sync;
+                                    direct_blit_done = true;
+                                    fullscreen_rendered = true;
+                                }
+                            }
+                        }
                     }
                 }
-            })?;
+
+                if !direct_blit_done {
+                    let mut frame = renderer
+                        .render(fb.as_mut().unwrap(), output_size, output_transform)
+                        .map_err(|err| {
+                            tracing::error!(
+                                "send_screencopy_result_vulkan: fullscreen render failed: {:#}",
+                                err
+                            );
+                            RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(
+                                err,
+                            )
+                        })?;
+
+                    frame.clear(Color32F::BLACK, &[dst_rect]).map_err(|err| {
+                        tracing::error!(
+                            "send_screencopy_result_vulkan: fullscreen clear failed: {:#}",
+                            err
+                        );
+                        RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(err)
+                    })?;
+
+                    let _ = smithay::backend::renderer::utils::draw_render_elements(
+                        &mut frame,
+                        Scale::from(output_scale),
+                        &toplevel_elements,
+                        &[dst_rect],
+                    )
+                    .map_err(|err| {
+                        tracing::error!(
+                            "send_screencopy_result_vulkan: fullscreen draw_render_elements failed: {:#}",
+                            err
+                        );
+                        RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(err)
+                    })?;
+
+                    if session.draw_cursor() {
+                        let cursor_elements = elements
+                            .iter()
+                            .filter(|elem| matches!(elem, CosmicElement::Cursor(_)))
+                            .collect::<Vec<_>>();
+                        if !cursor_elements.is_empty() {
+                            let _ = smithay::backend::renderer::utils::draw_render_elements(
+                                &mut frame,
+                                Scale::from(output_scale),
+                                &cursor_elements,
+                                &[dst_rect],
+                            );
+                        }
+                    }
+
+                    sync = frame.finish().map_err(|err| {
+                        tracing::error!(
+                            "send_screencopy_result_vulkan: fullscreen frame.finish failed: {:#}",
+                            err
+                        );
+                        RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(err)
+                    })?;
+                    fullscreen_rendered = true;
+                } else if session.draw_cursor() {
+                    let cursor_elements = elements
+                        .iter()
+                        .filter(|elem| matches!(elem, CosmicElement::Cursor(_)))
+                        .collect::<Vec<_>>();
+                    if !cursor_elements.is_empty() {
+                        let mut frame = renderer
+                            .render(fb.as_mut().unwrap(), output_size, output_transform)
+                            .map_err(|err| {
+                                RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(err)
+                            })?;
+                        let _ = smithay::backend::renderer::utils::draw_render_elements(
+                            &mut frame,
+                            Scale::from(output_scale),
+                            &cursor_elements,
+                            &[dst_rect],
+                        );
+                        sync = frame.finish().map_err(|err| {
+                            RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(
+                                err,
+                            )
+                        })?;
+                    }
+                }
+            }
+        }
+
+        if !fullscreen_rendered {
+            sync = frame_result
+                .blit_frame_result(
+                    output_size,
+                    output_transform,
+                    output_scale,
+                    renderer,
+                    fb.as_mut().unwrap(),
+                    adjusted,
+                    filter,
+                )
+                .map_err(|err| {
+                    tracing::error!(
+                        "send_screencopy_result_vulkan: blit_frame_result failed: {:#}",
+                        err
+                    );
+                    match err {
+                        BlitFrameResultError::Rendering(err) => {
+                            RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(
+                                err,
+                            )
+                        }
+                        BlitFrameResultError::Export(_) => {
+                            RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(
+                                MultiError::DeviceMissing,
+                            )
+                        }
+                    }
+                })?;
+        }
     }
 
     let transform = output.current_transform();
@@ -3487,15 +3808,19 @@ fn send_screencopy_result_vulkan<'a>(
                     MultiError::Render(err),
                 )
             })?;
-        let damage_rects = damage
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .map(|rect| {
-                let logical = rect.to_logical(1);
-                logical.to_buffer(1, transform.invert(), &buffer_size.to_logical(1, transform))
-            })
-            .collect();
+        let damage_rects = if fullscreen_rendered {
+            vec![Rectangle::from_size(buffer_size)]
+        } else {
+            damage
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(|rect| {
+                    let logical = rect.to_logical(1);
+                    logical.to_buffer(1, transform.invert(), &buffer_size.to_logical(1, transform))
+                })
+                .collect()
+        };
         let capture = PendingShmCapture {
             task,
             frame,
@@ -3509,12 +3834,21 @@ fn send_screencopy_result_vulkan<'a>(
         return Ok(());
     }
 
+    let full_damage_slice = [Rectangle::from_size(
+        buffer_size.to_logical(1, Transform::Normal).to_physical(1),
+    )];
+    let final_damage = if fullscreen_rendered {
+        Some(&full_damage_slice[..])
+    } else {
+        damage.as_deref()
+    };
+
     if let Some(data) = submit_buffer(
         frame,
         renderer,
         None,
         transform,
-        damage.as_deref(),
+        final_damage,
         sync,
         // Don't reference `Buffer`s since we blit from framebuffer/postprocess buffer
         vec![],
