@@ -2416,6 +2416,8 @@ impl SurfaceThreadState {
                 &mut allow_primary_scanout,
             );
             self.fullscreen = fullscreen_surface;
+            self.is_scanout = false;
+            self.swapchin_is_scanout = false;
         }
 
         let compositor = self.compositor.as_mut().unwrap();
