@@ -68,7 +68,8 @@ tracing-subscriber = { version = "0.3.22", features = [
     "tracing-log",
 ] }
 tracy-client = { version = "0.18.4", default-features = false }
-wayland-backend = "0.3.12"
+wayland-backend = { version = "0.3.12", features = ["libwayland_server_1_23"] }
+wayland-server = { version = "0.31", features = ["libwayland_1_23"] }
 wayland-scanner = "0.31.8"
 xcursor = "0.3.10"
 xdg = "^3.0"
