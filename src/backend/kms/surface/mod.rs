@@ -1414,7 +1414,6 @@ impl SurfaceThreadState {
                         let _ = compositor.use_crtc_color_state(CrtcColorState::default());
                         compositor.use_color_transforms(transforms, self.hdr_enabled);
                         compositor.use_post_blend_encode(post_blend, linear_transforms);
-
                         self.active_scanout_plan = Some(scanout_plan);
                     } else {
                         *allow_primary_scanout = false;
@@ -1444,11 +1443,11 @@ impl SurfaceThreadState {
                             warn!(
                                 ?err,
                                 ?scanout_plan,
-                                "CRTC color state rejected; falling back to fallback plan"
+                                "CRTC color state rejected; falling back to Vulkan fast direct flip"
                             );
                             let _ = compositor.use_crtc_color_state(CrtcColorState::default());
                             self.active_scanout_plan = Some(ScanoutPlan::VulkanFastDirectFlip);
-                            self.output.set_fullscreen_failed_scanout_plan(scanout_plan);
+                            self.output.set_fullscreen_scanout_plan(ScanoutPlan::VulkanFastDirectFlip);
                             *allow_primary_scanout = false;
                         }
                     }
@@ -1885,7 +1884,10 @@ impl SurfaceThreadState {
             && self.mirroring.is_none()
             && !*DISABLE_DIRECT_SCANOUT;
 
-        if self.fullscreen != fullscreen_surface || self.is_scanout != allow_primary_scanout {
+        if self.fullscreen != fullscreen_surface
+            || self.is_scanout != allow_primary_scanout
+            || self.active_scanout_plan != scanout_plan
+        {
             self.update_scanout_color_management(
                 scanout_plan,
                 fullscreen_surface.as_ref(),
@@ -2409,7 +2411,10 @@ impl SurfaceThreadState {
             && self.mirroring.is_none()
             && !*DISABLE_DIRECT_SCANOUT;
 
-        if self.fullscreen != fullscreen_surface || self.is_scanout != allow_primary_scanout {
+        if self.fullscreen != fullscreen_surface
+            || self.is_scanout != allow_primary_scanout
+            || self.active_scanout_plan != scanout_plan
+        {
             self.update_scanout_color_management(
                 scanout_plan,
                 fullscreen_surface.as_ref(),

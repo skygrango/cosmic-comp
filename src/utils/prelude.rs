@@ -5,7 +5,7 @@ use smithay::{
         allocator::{Buffer as _, format::is_ycbcr},
         drm::{
             DrmScanoutCapabilities, ScanoutCandidate, ScanoutPlan, ScanoutTarget,
-            VrrSupport as Support, color::PlaneColorConversion,
+            VrrSupport as Support,
         },
         renderer::utils::RendererSurfaceStateUserData,
     },
@@ -73,7 +73,7 @@ pub trait OutputExt {
     fn set_fullscreen_occupied(&self, occupied: Option<FullscreenOccupied>);
     fn is_foreground_fullscreen_occupied(&self) -> Option<FullscreenOccupied>;
     fn refresh_fullscreen_occupied_flags(&self);
-    fn set_fullscreen_failed_scanout_plan(&self, plan: ScanoutPlan);
+    fn set_fullscreen_scanout_plan(&self, plan: ScanoutPlan);
 }
 
 struct Vrr(AtomicU8);
@@ -89,8 +89,6 @@ pub struct FullscreenOccupied {
     pub is_yuv: bool,
     pub color_description: Option<ImageDescription>,
     pub scanout_plan: ScanoutPlan,
-    pub fallback_plan: Option<ScanoutPlan>,
-    pub failed_scanout_plan: Option<ScanoutPlan>,
 }
 
 impl std::ops::Deref for FullscreenOccupied {
@@ -119,19 +117,12 @@ impl FullscreenOccupied {
             is_yuv,
             color_description,
             scanout_plan: ScanoutPlan::DirectPassthrough,
-            fallback_plan: None,
-            failed_scanout_plan: None,
         }
     }
 
     #[inline]
     pub fn effective_scanout_plan(&self) -> ScanoutPlan {
-        if self.failed_scanout_plan.as_ref() == Some(&self.scanout_plan) {
-            self.fallback_plan
-                .unwrap_or(ScanoutPlan::VulkanFastDirectFlip)
-        } else {
-            self.scanout_plan
-        }
+        self.scanout_plan
     }
 
     #[inline]
@@ -145,34 +136,6 @@ impl FullscreenOccupied {
     }
 }
 
-pub fn fallback_for_scanout_plan(
-    plan: ScanoutPlan,
-    caps: &DrmScanoutCapabilities,
-) -> Option<ScanoutPlan> {
-    match plan {
-        ScanoutPlan::PlaneColorop(conv) => {
-            let crtc_supported = match conv {
-                PlaneColorConversion::ScRgbToPq { .. } | PlaneColorConversion::ScRgbToSrgb => {
-                    caps.supports_scrgb_hardware_scanout()
-                }
-                PlaneColorConversion::SrgbToPq { .. } => {
-                    caps.supports_sdr_to_hdr_hardware_scanout()
-                }
-                PlaneColorConversion::HlgToPq { .. } => caps.supports_hlg_to_hdr_hardware_scanout(),
-                _ => false,
-            };
-            if crtc_supported {
-                Some(ScanoutPlan::CrtcHardware(conv))
-            } else {
-                Some(ScanoutPlan::VulkanFastDirectFlip)
-            }
-        }
-        ScanoutPlan::CrtcHardware(_) => Some(ScanoutPlan::VulkanFastDirectFlip),
-        ScanoutPlan::DirectPassthrough => Some(ScanoutPlan::VulkanFastDirectFlip),
-        ScanoutPlan::VulkanFastDirectFlip => None,
-    }
-}
-
 #[derive(Debug, Clone)]
 struct WeakFullscreenOccupied {
     surface: WeakCosmicSurface,
@@ -181,8 +144,6 @@ struct WeakFullscreenOccupied {
     is_yuv: bool,
     color_description: Option<ImageDescription>,
     scanout_plan: ScanoutPlan,
-    fallback_plan: Option<ScanoutPlan>,
-    failed_scanout_plan: Option<ScanoutPlan>,
 }
 
 struct OutputFullscreenOccupied(RwLock<Option<WeakFullscreenOccupied>>);
@@ -467,8 +428,6 @@ impl OutputExt for Output {
                 peak_luminance: output_peak,
             };
             let plan = caps.evaluate_scanout(candidate, target);
-            let fallback = fallback_for_scanout_plan(plan, &caps);
-
             tracing::info!(
                 output = %self.name(),
                 output_hdr = output_hdr_enabled,
@@ -477,13 +436,10 @@ impl OutputExt for Output {
                 color_desc = ?occ.color_description,
                 is_yuv,
                 ?plan,
-                ?fallback,
                 "Fullscreen occupied: evaluated hardware scanout plan"
             );
 
             occ.scanout_plan = plan;
-            occ.fallback_plan = fallback;
-            occ.failed_scanout_plan = None;
         }
 
         *lock.write() = occupied.map(|occ| WeakFullscreenOccupied {
@@ -493,8 +449,6 @@ impl OutputExt for Output {
             is_yuv: occ.is_yuv,
             color_description: occ.color_description,
             scanout_plan: occ.scanout_plan,
-            fallback_plan: occ.fallback_plan,
-            failed_scanout_plan: occ.failed_scanout_plan,
         });
     }
 
@@ -510,8 +464,6 @@ impl OutputExt for Output {
             is_yuv: weak_occ.is_yuv,
             color_description: weak_occ.color_description.clone(),
             scanout_plan: weak_occ.scanout_plan,
-            fallback_plan: weak_occ.fallback_plan,
-            failed_scanout_plan: weak_occ.failed_scanout_plan,
         })
     }
 
@@ -581,7 +533,6 @@ impl OutputExt for Output {
             peak_luminance: output_peak,
         };
         let plan = caps.evaluate_scanout(candidate, target);
-        let fallback = fallback_for_scanout_plan(plan, &caps);
         let mut guard = state.0.write();
         let Some(weak_occ) = guard.as_mut() else {
             return;
@@ -591,18 +542,16 @@ impl OutputExt for Output {
             weak_occ.is_yuv = is_yuv;
             weak_occ.color_description = color_desc;
             weak_occ.scanout_plan = plan;
-            weak_occ.fallback_plan = fallback;
-            weak_occ.failed_scanout_plan = None;
         }
     }
 
-    fn set_fullscreen_failed_scanout_plan(&self, plan: ScanoutPlan) {
+    fn set_fullscreen_scanout_plan(&self, plan: ScanoutPlan) {
         let Some(state) = self.user_data().get::<OutputFullscreenOccupied>() else {
             return;
         };
         let mut guard = state.0.write();
         if let Some(ref mut weak_occ) = *guard {
-            weak_occ.failed_scanout_plan = Some(plan);
+            weak_occ.scanout_plan = plan;
         }
     }
 }
@@ -670,51 +619,4 @@ pub fn surface_tree_is_yuv(surface: &WlSurface) -> bool {
         }
     });
     found
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use smithay::backend::drm::color::{DrmScanoutCapabilities, PlaneColorConversion, ScanoutPlan};
-
-    #[test]
-    fn test_fallback_for_scanout_plan() {
-        let mut caps = DrmScanoutCapabilities::default();
-        let conv = PlaneColorConversion::ScRgbToPq {
-            reference_white: 203,
-        };
-
-        // Without CRTC hardware support, PlaneColorop falls back to VulkanFastDirectFlip
-        assert_eq!(
-            fallback_for_scanout_plan(ScanoutPlan::PlaneColorop(conv), &caps),
-            Some(ScanoutPlan::VulkanFastDirectFlip)
-        );
-
-        // With CRTC hardware support (FP16 + gamma LUT + CTM), PlaneColorop falls back to CrtcHardware
-        caps.supports_fp16 = true;
-        caps.crtc_color.has_gamma_lut = true;
-        caps.crtc_color.has_ctm = true;
-        assert_eq!(
-            fallback_for_scanout_plan(ScanoutPlan::PlaneColorop(conv), &caps),
-            Some(ScanoutPlan::CrtcHardware(conv))
-        );
-
-        // CrtcHardware falls back to VulkanFastDirectFlip
-        assert_eq!(
-            fallback_for_scanout_plan(ScanoutPlan::CrtcHardware(conv), &caps),
-            Some(ScanoutPlan::VulkanFastDirectFlip)
-        );
-
-        // DirectPassthrough falls back to VulkanFastDirectFlip
-        assert_eq!(
-            fallback_for_scanout_plan(ScanoutPlan::DirectPassthrough, &caps),
-            Some(ScanoutPlan::VulkanFastDirectFlip)
-        );
-
-        // VulkanFastDirectFlip has no fallback (it's already the lowest tier)
-        assert_eq!(
-            fallback_for_scanout_plan(ScanoutPlan::VulkanFastDirectFlip, &caps),
-            None
-        );
-    }
 }
