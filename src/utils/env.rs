@@ -40,6 +40,9 @@ pub struct HdrPolicy {
     /// of zeros. Zero ("unknown") keeps panels from tone-mapping the desktop
     /// into a matte look when MaxCLL equals their own peak.
     pub metadata_luminance_from_panel: bool,
+    /// Remap HDR content luminance metadata (MaxCLL/mastering luminance) to the sink's peak
+    /// capability, preserving Direct Scanout instead of falling back to shader tonemapping.
+    pub remap_metadata: bool,
     pub safe_exit_grace: Duration,
     pub teardown_timeout: Duration,
 }
@@ -115,6 +118,8 @@ impl HdrPolicy {
             metadata_luminance_from_panel: lookup("COSMIC_HDR_METADATA_LUMINANCE").is_some_and(
                 |value| value.eq_ignore_ascii_case("panel") || parse_bool_token(&value),
             ),
+            remap_metadata: lookup("COSMIC_HDR_REMAP_METADATA")
+                .is_none_or(|value| parse_bool_token(&value)),
             safe_exit_grace: Duration::from_millis(bounded_ms(
                 lookup("COSMIC_HDR_SAFE_EXIT_GRACE_MS"),
                 5_000,

@@ -30,6 +30,7 @@ use crate::{
     backend::kms::drm_helpers::HdrOutputState,
     config::EdidProduct,
     shell::{CosmicSurface, element::surface::WeakCosmicSurface, zoom::OutputZoomState},
+    utils::env,
 };
 
 use std::{
@@ -142,7 +143,10 @@ struct WeakFullscreenOccupied {
     prefers_async: bool,
     is_hdr: bool,
     is_yuv: bool,
+    raw_color_description: Option<ImageDescription>,
     color_description: Option<ImageDescription>,
+    cached_peak: Option<u32>,
+    cached_ref_white: u32,
     scanout_plan: ScanoutPlan,
 }
 
@@ -410,6 +414,17 @@ impl OutputExt for Output {
                 }
             }
 
+            let raw_desc = occ.color_description;
+
+            if env::hdr_policy().remap_metadata && output_hdr_enabled {
+                if let (Some(desc), Some(peak)) = (occ.color_description.as_ref(), output_peak) {
+                    if desc.is_pq_bt2020() {
+                        occ.color_description =
+                            Some(desc.remap_metadata_to_peak(peak as u32, output_ref_white as u32));
+                    }
+                }
+            }
+
             let is_yuv = occ
                 .surface
                 .wl_surface()
@@ -440,16 +455,24 @@ impl OutputExt for Output {
             );
 
             occ.scanout_plan = plan;
-        }
 
-        *lock.write() = occupied.map(|occ| WeakFullscreenOccupied {
-            surface: occ.surface.downgrade(),
-            prefers_async: occ.prefers_async,
-            is_hdr: occ.is_hdr,
-            is_yuv: occ.is_yuv,
-            color_description: occ.color_description,
-            scanout_plan: occ.scanout_plan,
-        });
+            let cached_peak = output_peak.map(|p| p as u32);
+            let cached_ref_white = output_ref_white as u32;
+
+            *lock.write() = Some(WeakFullscreenOccupied {
+                surface: occ.surface.downgrade(),
+                prefers_async: occ.prefers_async,
+                is_hdr: occ.is_hdr,
+                is_yuv: occ.is_yuv,
+                raw_color_description: raw_desc,
+                color_description: occ.color_description,
+                cached_peak,
+                cached_ref_white,
+                scanout_plan: occ.scanout_plan,
+            });
+        } else {
+            *lock.write() = None;
+        }
     }
 
     fn is_foreground_fullscreen_occupied(&self) -> Option<FullscreenOccupied> {
@@ -471,7 +494,14 @@ impl OutputExt for Output {
         let Some(state) = self.user_data().get::<OutputFullscreenOccupied>() else {
             return;
         };
-        let (surface, current_async, current_desc, current_is_yuv) = {
+        let (
+            surface,
+            current_async,
+            current_raw_desc,
+            current_is_yuv,
+            current_peak,
+            current_ref_white,
+        ) = {
             let guard = state.0.read();
             let Some(weak_occ) = guard.as_ref() else {
                 return;
@@ -482,15 +512,17 @@ impl OutputExt for Output {
             (
                 surface,
                 weak_occ.prefers_async,
-                weak_occ.color_description.clone(),
+                weak_occ.raw_color_description,
                 weak_occ.is_yuv,
+                weak_occ.cached_peak,
+                weak_occ.cached_ref_white,
             )
         };
         let prefers_async = surface
             .wl_surface()
             .as_deref()
             .is_some_and(surface_tree_prefers_async);
-        let color_desc = surface
+        let raw_color_desc = surface
             .wl_surface()
             .as_deref()
             .and_then(surface_tree_color_description);
@@ -498,10 +530,7 @@ impl OutputExt for Output {
             .wl_surface()
             .as_deref()
             .is_some_and(surface_tree_is_yuv);
-        if current_async == prefers_async && current_desc == color_desc && current_is_yuv == is_yuv
-        {
-            return;
-        }
+
         let (output_hdr_enabled, output_ref_white, output_peak) = self
             .user_data()
             .get::<HdrOutputState>()
@@ -522,6 +551,29 @@ impl OutputExt for Output {
                 )
             })
             .unwrap_or((false, 203, None));
+
+        let peak_u32 = output_peak.map(|p| p as u32);
+        let ref_white_u32 = output_ref_white as u32;
+
+        if current_async == prefers_async
+            && current_raw_desc == raw_color_desc
+            && current_is_yuv == is_yuv
+            && current_peak == peak_u32
+            && current_ref_white == ref_white_u32
+        {
+            return;
+        }
+
+        let mut color_desc = raw_color_desc;
+        if env::hdr_policy().remap_metadata && output_hdr_enabled {
+            if let (Some(desc), Some(peak)) = (color_desc.as_ref(), output_peak) {
+                if desc.is_pq_bt2020() {
+                    color_desc =
+                        Some(desc.remap_metadata_to_peak(peak as u32, output_ref_white as u32));
+                }
+            }
+        }
+
         let caps = self.scanout_capabilities().unwrap_or_default();
         let candidate = ScanoutCandidate {
             image_description: color_desc.as_ref(),
@@ -540,7 +592,10 @@ impl OutputExt for Output {
         if weak_occ.surface.upgrade().as_ref() == Some(&surface) {
             weak_occ.prefers_async = prefers_async;
             weak_occ.is_yuv = is_yuv;
+            weak_occ.raw_color_description = raw_color_desc;
             weak_occ.color_description = color_desc;
+            weak_occ.cached_peak = peak_u32;
+            weak_occ.cached_ref_white = ref_white_u32;
             weak_occ.scanout_plan = plan;
         }
     }

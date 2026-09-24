@@ -1447,7 +1447,8 @@ impl SurfaceThreadState {
                             );
                             let _ = compositor.use_crtc_color_state(CrtcColorState::default());
                             self.active_scanout_plan = Some(ScanoutPlan::VulkanFastDirectFlip);
-                            self.output.set_fullscreen_scanout_plan(ScanoutPlan::VulkanFastDirectFlip);
+                            self.output
+                                .set_fullscreen_scanout_plan(ScanoutPlan::VulkanFastDirectFlip);
                             *allow_primary_scanout = false;
                         }
                     }
@@ -3998,6 +3999,51 @@ mod tests {
         let plan = caps.evaluate_scanout_plan(true, Some(&ImageDescription::WINDOWS_SCRGB), 203);
         assert_eq!(plan, ScanoutPlan::VulkanFastDirectFlip);
         assert!(!plan.allows_primary_scanout());
+    }
+
+    #[test]
+    fn test_hdr_metadata_remapping_preserves_direct_scanout() {
+        use smithay::backend::drm::color::{CrtcColorCapabilities, DrmScanoutCapabilities};
+
+        let caps = DrmScanoutCapabilities {
+            supports_fp16: true,
+            supports_10bit: true,
+            supports_plane_colorop: false,
+            primary_plane_color_pipelines: Vec::new(),
+            primary_plane_formats: FormatSet::default(),
+            crtc_color: CrtcColorCapabilities {
+                has_degamma_lut: true,
+                degamma_lut_size: 4096,
+                has_ctm: true,
+                has_gamma_lut: true,
+                gamma_lut_size: 4096,
+            },
+        };
+
+        // Parametric PQ BT.2020 description with MaxCLL = 1500 nits from a game
+        let mut pq_desc = ImageDescription::WINDOWS_BT2100;
+        pq_desc.windows_bt2100 = false;
+        pq_desc.max_cll = Some(1500);
+        pq_desc.max_fall = Some(400);
+        pq_desc.mastering_luminance = Some((50, 1500));
+
+        let sink_peak = 1000;
+        let ref_white = 203;
+
+        // Un-remapped: exceeds 1000 nits -> falls back to VulkanFastDirectFlip (shader tonemapping)
+        let plan_over =
+            caps.evaluate_scanout_plan_with_peak(true, Some(&pq_desc), ref_white, Some(sink_peak));
+        assert_eq!(plan_over, ScanoutPlan::VulkanFastDirectFlip);
+        assert!(!plan_over.allows_primary_scanout());
+
+        // Remapped with BT.2408 curve: metadata is mapped to 1000 nits -> allows DirectPassthrough!
+        let remapped = pq_desc.remap_metadata_to_peak(sink_peak as u32, ref_white as u32);
+        assert_eq!(remapped.max_cll, Some(1000));
+        assert!(remapped.max_fall.unwrap() < 400);
+        let plan_direct =
+            caps.evaluate_scanout_plan_with_peak(true, Some(&remapped), ref_white, Some(sink_peak));
+        assert_eq!(plan_direct, ScanoutPlan::DirectPassthrough);
+        assert!(plan_direct.allows_primary_scanout());
     }
 
     #[test]
