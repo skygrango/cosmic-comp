@@ -4549,9 +4549,12 @@ mod tests {
         use smithay::backend::drm::colorop::{ColorOpKind, plane_color_pipelines};
         use smithay::reexports::drm::ClientCapability;
         use smithay::reexports::drm::Device as BasicDevice;
-        use smithay::reexports::drm::control::Device as ControlDevice;
+        use smithay::reexports::drm::control::{
+            Device as ControlDevice, ModeTypeFlags, connector::State as ConnectorState, crtc,
+        };
         use smithay::utils::DeviceFd;
         use smithay::wayland::color::management::TransferFunction;
+        use std::collections::HashMap;
 
         println!(
             "\n================================================================================"
@@ -4605,6 +4608,117 @@ mod tests {
                 continue;
             };
 
+            let mut connectors_report = Vec::new();
+            let mut crtc_to_connectors: HashMap<crtc::Handle, Vec<usize>> = HashMap::new();
+
+            for conn_handle in res.connectors() {
+                let Ok(conn_info) = drm_fd.get_connector(*conn_handle, false) else {
+                    continue;
+                };
+
+                let name = crate::backend::kms::drm_helpers::interface_name(&drm_fd, *conn_handle)
+                    .unwrap_or_else(|_| format!("Connector {:?}", conn_handle));
+
+                let edid = crate::backend::kms::drm_helpers::edid_info(&drm_fd, *conn_handle).ok();
+                let make = edid
+                    .as_ref()
+                    .and_then(|info| info.make())
+                    .unwrap_or_else(|| "Unknown".to_string());
+                let model = edid
+                    .as_ref()
+                    .and_then(|info| info.model())
+                    .unwrap_or_else(|| "Unknown".to_string());
+                let serial = edid
+                    .as_ref()
+                    .and_then(|info| info.serial())
+                    .unwrap_or_else(|| "Unknown".to_string());
+
+                let mut bound_crtc = None;
+                if let Ok(conn_props) = drm_fd.get_properties(*conn_handle) {
+                    for (&p_h, &p_v) in &conn_props {
+                        if let Ok(p_info) = drm_fd.get_property(p_h) {
+                            if p_info.name().to_string_lossy() == "CRTC_ID" {
+                                bound_crtc = p_info.value_type().convert_value(p_v).as_crtc();
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if bound_crtc.is_none() {
+                    if let Some(enc_handle) = conn_info.current_encoder() {
+                        if let Ok(enc_info) = drm_fd.get_encoder(enc_handle) {
+                            bound_crtc = enc_info.crtc();
+                        }
+                    }
+                }
+
+                let preferred_mode = conn_info
+                    .modes()
+                    .iter()
+                    .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
+                    .map(|m| format!("{}x{} @ {}Hz", m.size().0, m.size().1, m.vrefresh()));
+
+                let idx = connectors_report.len();
+                if let Some(crtc) = bound_crtc {
+                    crtc_to_connectors.entry(crtc).or_default().push(idx);
+                }
+
+                connectors_report.push((
+                    *conn_handle,
+                    name,
+                    conn_info.state(),
+                    bound_crtc,
+                    make,
+                    model,
+                    serial,
+                    conn_info.size(),
+                    preferred_mode,
+                ));
+            }
+
+            println!("\n  [Discovered Connectors / Screens]");
+            if connectors_report.is_empty() {
+                println!("    No connectors reported by DRM");
+            } else {
+                for (handle, name, state, bound_crtc, make, model, serial, size, pref_mode) in
+                    &connectors_report
+                {
+                    let state_str = match state {
+                        ConnectorState::Connected => "Connected",
+                        ConnectorState::Disconnected => "Disconnected",
+                        _ => "Unknown",
+                    };
+                    let bound_str = match bound_crtc {
+                        Some(crtc) => format!("Bound to {:?}", crtc),
+                        None => "Unbound / Inactive".to_string(),
+                    };
+                    if *state == ConnectorState::Connected {
+                        let size_str = size
+                            .map(|(w, h)| format!("{}x{} mm", w, h))
+                            .unwrap_or_else(|| "unknown size".to_string());
+                        let pref_str = pref_mode.as_deref().unwrap_or("none");
+                        println!(
+                            "    - {} ({:?}): {} | {} | Monitor: {} {} (Serial: {}, Size: {}, Preferred: {})",
+                            name,
+                            handle,
+                            state_str,
+                            bound_str,
+                            make,
+                            model,
+                            serial,
+                            size_str,
+                            pref_str
+                        );
+                    } else {
+                        println!(
+                            "    - {} ({:?}): {} | {}",
+                            name, handle, state_str, bound_str
+                        );
+                    }
+                }
+            }
+
             for crtc_handle in res.crtcs() {
                 let Ok(crtc_info) = drm_fd.get_crtc(*crtc_handle) else {
                     continue;
@@ -4640,7 +4754,31 @@ mod tests {
                     .map(|m| format!("{}x{} @ {}Hz", m.size().0, m.size().1, m.vrefresh()))
                     .unwrap_or_else(|| "Inactive/Disabled".to_string());
 
+                let connected_screens: Vec<String> = crtc_to_connectors
+                    .get(crtc_handle)
+                    .map(|indices| {
+                        indices
+                            .iter()
+                            .map(|&idx| {
+                                let (_, name, _, _, make, model, _, _, _) = &connectors_report[idx];
+                                if make != "Unknown" || model != "Unknown" {
+                                    format!("{} (\"{} {}\")", name, make, model)
+                                } else {
+                                    name.clone()
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let screens_summary = if connected_screens.is_empty() {
+                    "None (Headless / Inactive)".to_string()
+                } else {
+                    connected_screens.join(", ")
+                };
+
                 println!("\n  [CRTC {:?}] Mode: {}", crtc_handle, mode_str);
+                println!("    - Attached Screen(s):   {}", screens_summary);
                 println!(
                     "    - Hardware GAMMA_LUT:   {} (Max entries: {})",
                     if has_gamma_lut { "YES" } else { "NO" },
@@ -4878,6 +5016,12 @@ mod tests {
                         "    EVALUATING SCANOUT SCHEMES ACROSS COLOR SPACES (CRTC {:?})",
                         crtc_handle
                     );
+                    if !connected_screens.is_empty() {
+                        println!(
+                            "    Active Output Screen(s): {}",
+                            connected_screens.join(", ")
+                        );
+                    }
                     println!(
                         "    ----------------------------------------------------------------------------"
                     );
@@ -5066,10 +5210,18 @@ mod tests {
                     println!(
                         "\n    ------------------------------------------------------------------------------------------------"
                     );
-                    println!(
-                        "    SCANOUT COLOR SCHEMES DECISION MATRIX SUMMARY (CRTC {:?})",
-                        crtc_handle
-                    );
+                    if !connected_screens.is_empty() {
+                        println!(
+                            "    SCANOUT COLOR SCHEMES DECISION MATRIX SUMMARY (CRTC {:?} - {})",
+                            crtc_handle,
+                            connected_screens.join(", ")
+                        );
+                    } else {
+                        println!(
+                            "    SCANOUT COLOR SCHEMES DECISION MATRIX SUMMARY (CRTC {:?})",
+                            crtc_handle
+                        );
+                    }
                     println!(
                         "    ------------------------------------------------------------------------------------------------"
                     );
