@@ -1758,10 +1758,11 @@ impl SurfaceThreadState {
             // To prevent the fullscreen surface from unexpectedly stopping updates, register a fallback redraw request.
             // If the fullscreen surface commits an update within the min_vrr interval, it will replace this fallback request.
             self.min_vrr_frame_time.unwrap_or(_30_HZ)
-        } else if immediate || (self.timings.is_fullscreen && self.timings.vrr() && fifo) {
+        } else if immediate {
             Duration::ZERO
         } else {
-            self.timings.next_render_time(&self.clock)
+            self.timings
+                .render_time_for_presentation(estimated_presentation)
         };
 
         let timer = if render_start.is_zero() {
