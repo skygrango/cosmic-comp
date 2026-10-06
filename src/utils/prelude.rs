@@ -1,4 +1,4 @@
-use cosmic_comp_config::output::comp::{AdaptiveSync, OutputConfig, OutputState};
+pub use cosmic_comp_config::output::comp::{AdaptiveSync, OutputConfig, OutputState};
 use parking_lot::RwLock;
 use smithay::{
     backend::{
@@ -11,8 +11,8 @@ use smithay::{
     },
     desktop::utils::with_surfaces_surface_tree,
     output::{Output, WeakOutput},
-    reexports::wayland_server::{Client, protocol::wl_surface::WlSurface},
-    utils::Rectangle,
+    reexports::wayland_server::{Client, Resource, protocol::wl_surface::WlSurface},
+    utils::{Monotonic, Rectangle, Time},
     wayland::{
         color::management::{ImageDescription, surface_description_from_states},
         compositor::{Barrier, BufferAssignment, CompositorHandler, SurfaceAttributes},
@@ -35,9 +35,10 @@ use crate::{
 
 use std::{
     cell::{Ref, RefCell, RefMut},
+    collections::VecDeque,
     sync::{
         Mutex,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::Duration,
 };
@@ -53,6 +54,11 @@ pub trait OutputExt {
     fn set_adaptive_sync_support(&self, vrr: Option<Support>);
     fn vrr_target_rate(&self) -> Option<u32>;
     fn set_vrr_target_rate(&self, rate: Option<u32>);
+    fn fullscreen_vrr_fifo(&self) -> bool;
+    fn set_fullscreen_vrr_fifo(&self, fifo: bool);
+    fn record_fullscreen_commit(&self, now: Time<Monotonic>);
+    fn avg_fullscreen_commit_interval(&self) -> Option<Duration>;
+    fn reset_fullscreen_commit_pacer(&self);
     fn mirroring(&self) -> Option<Output>;
     fn set_mirroring(&self, output: Option<Output>);
 
@@ -64,6 +70,13 @@ pub trait OutputExt {
 
     fn fifo_barrier(&self, barrier: Barrier, surface: WlSurface, client: Client);
     fn signal_fifo(&self, state: &mut State);
+
+    fn set_surface_queue_state(&self, state: OutputQueueState);
+    fn surface_queue_state(&self) -> OutputQueueState;
+    fn is_fullscreen_render_queued(&self) -> bool;
+    fn push_fullscreen_blocker(&self, barrier: Barrier, surface: WlSurface, client: Client);
+    fn signal_fullscreen_blocker(&self, state: &mut State) -> bool;
+    fn clear_fullscreen_blockers(&self, state: &mut State);
 
     fn set_avg_frametime(&self, duration: Option<Duration>);
     fn get_avg_frametime(&self) -> Option<Duration>;
@@ -77,7 +90,18 @@ pub trait OutputExt {
     fn set_fullscreen_scanout_plan(&self, plan: ScanoutPlan);
 }
 
+pub const FULLSCREEN_VRR_PACER_WINDOW: usize = 12;
+
+struct FullscreenCommitPacer {
+    last_commit: Option<Time<Monotonic>>,
+    intervals: VecDeque<Duration>,
+    avg_interval: Option<Duration>,
+}
+
+struct OutputFullscreenCommitPacer(parking_lot::RwLock<FullscreenCommitPacer>);
+
 struct Vrr(AtomicU8);
+struct FullscreenVrrFifo(AtomicBool);
 struct VrrSupport(AtomicU8);
 struct Mirroring(Mutex<Option<WeakOutput>>);
 struct OutputScanoutCapabilities(RwLock<Option<DrmScanoutCapabilities>>);
@@ -161,6 +185,25 @@ pub struct FifoBarrierItem {
 
 #[derive(Default)]
 struct FifoBarriers(Mutex<Vec<FifoBarrierItem>>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputQueueState {
+    #[default]
+    Idle,
+    Queued {
+        is_fullscreen: bool,
+    },
+    WaitingForVBlank {
+        fullscreen_request: bool,
+    },
+    WaitingForEstimatedVBlank,
+}
+
+#[derive(Default)]
+struct OutputQueueStateHolder(RwLock<OutputQueueState>);
+
+#[derive(Default)]
+struct FullscreenBlockers(Mutex<VecDeque<FifoBarrierItem>>);
 
 struct AvgFrameTime(RwLock<Option<Duration>>);
 
@@ -256,6 +299,66 @@ impl OutputExt for Output {
         self.config_mut().vrr_target_rate = rate;
     }
 
+    fn fullscreen_vrr_fifo(&self) -> bool {
+        self.user_data()
+            .get::<FullscreenVrrFifo>()
+            .map(|p| p.0.load(Ordering::Relaxed))
+            .unwrap_or(false)
+    }
+
+    fn set_fullscreen_vrr_fifo(&self, fifo: bool) {
+        let user_data = self.user_data();
+        user_data.insert_if_missing_threadsafe(|| FullscreenVrrFifo(AtomicBool::new(false)));
+        user_data
+            .get::<FullscreenVrrFifo>()
+            .unwrap()
+            .0
+            .store(fifo, Ordering::Relaxed);
+    }
+
+    fn record_fullscreen_commit(&self, now: Time<Monotonic>) {
+        let pacer = self
+            .user_data()
+            .get_or_insert_threadsafe(|| {
+                OutputFullscreenCommitPacer(parking_lot::RwLock::new(FullscreenCommitPacer {
+                    last_commit: None,
+                    intervals: VecDeque::with_capacity(FULLSCREEN_VRR_PACER_WINDOW),
+                    avg_interval: None,
+                }))
+            });
+
+        let mut guard = pacer.0.write();
+        if let Some(last) = guard.last_commit {
+            let diff = Time::elapsed(&last, now);
+            if diff > Duration::from_millis(250) {
+                guard.intervals.clear();
+                guard.avg_interval = None;
+            } else if !diff.is_zero() {
+                guard.intervals.push_back(diff);
+                if guard.intervals.len() > FULLSCREEN_VRR_PACER_WINDOW {
+                    guard.intervals.pop_front();
+                }
+                let sum: Duration = guard.intervals.iter().sum();
+                guard.avg_interval = Some(sum / (guard.intervals.len() as u32));
+            }
+        }
+        guard.last_commit = Some(now);
+    }
+
+    fn avg_fullscreen_commit_interval(&self) -> Option<Duration> {
+        let pacer = self.user_data().get::<OutputFullscreenCommitPacer>()?;
+        pacer.0.read().avg_interval
+    }
+
+    fn reset_fullscreen_commit_pacer(&self) {
+        if let Some(pacer) = self.user_data().get::<OutputFullscreenCommitPacer>() {
+            let mut guard = pacer.0.write();
+            guard.last_commit = None;
+            guard.intervals.clear();
+            guard.avg_interval = None;
+        }
+    }
+
     fn mirroring(&self) -> Option<Output> {
         self.user_data().get::<Mirroring>().and_then(|mirroring| {
             mirroring
@@ -320,6 +423,95 @@ impl OutputExt for Output {
         fifo_barriers.0.lock().unwrap().drain(..).for_each(|item| {
             item.barrier.signal();
             if !items.iter().any(|(s, _)| s == &item.surface) {
+                items.push((item.surface, item.client));
+            }
+        });
+
+        let dh = state.common.display_handle.clone();
+        for (surface, client) in items {
+            state
+                .client_compositor_state(&client)
+                .surface_blocker_cleared(&surface, state, &dh);
+        }
+    }
+
+    fn set_surface_queue_state(&self, state: OutputQueueState) {
+        *self
+            .user_data()
+            .get_or_insert_threadsafe(|| {
+                OutputQueueStateHolder(RwLock::new(OutputQueueState::Idle))
+            })
+            .0
+            .write() = state;
+    }
+
+    fn surface_queue_state(&self) -> OutputQueueState {
+        self.user_data()
+            .get::<OutputQueueStateHolder>()
+            .map(|holder| *holder.0.read())
+            .unwrap_or(OutputQueueState::Idle)
+    }
+
+    fn is_fullscreen_render_queued(&self) -> bool {
+        let has_pending = self
+            .user_data()
+            .get::<FullscreenBlockers>()
+            .map(|b| !b.0.lock().unwrap().is_empty())
+            .unwrap_or(false);
+
+        has_pending
+            || matches!(
+                self.surface_queue_state(),
+                OutputQueueState::Queued {
+                    is_fullscreen: true
+                } | OutputQueueState::WaitingForVBlank {
+                    fullscreen_request: true,
+                }
+            )
+    }
+
+    fn push_fullscreen_blocker(&self, barrier: Barrier, surface: WlSurface, client: Client) {
+        self.user_data()
+            .get_or_insert_threadsafe(|| FullscreenBlockers(Mutex::new(VecDeque::new())))
+            .0
+            .lock()
+            .unwrap()
+            .push_back(FifoBarrierItem {
+                barrier,
+                surface,
+                client,
+            });
+    }
+
+    fn signal_fullscreen_blocker(&self, state: &mut State) -> bool {
+        let Some(blockers) = self.user_data().get::<FullscreenBlockers>() else {
+            return false;
+        };
+
+        let item = blockers.0.lock().unwrap().pop_front();
+        if let Some(item) = item {
+            item.barrier.signal();
+            if item.surface.is_alive() {
+                let dh = state.common.display_handle.clone();
+                state
+                    .client_compositor_state(&item.client)
+                    .surface_blocker_cleared(&item.surface, state, &dh);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    fn clear_fullscreen_blockers(&self, state: &mut State) {
+        let Some(blockers) = self.user_data().get::<FullscreenBlockers>() else {
+            return;
+        };
+
+        let mut items = Vec::new();
+        blockers.0.lock().unwrap().drain(..).for_each(|item| {
+            item.barrier.signal();
+            if item.surface.is_alive() && !items.iter().any(|(s, _)| s == &item.surface) {
                 items.push((item.surface, item.client));
             }
         });
@@ -674,4 +866,113 @@ pub fn surface_tree_is_yuv(surface: &WlSurface) -> bool {
         }
     });
     found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smithay::output::{PhysicalProperties, Subpixel};
+
+    fn create_test_output() -> Output {
+        Output::new(
+            "test-out".into(),
+            PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: Subpixel::Unknown,
+                make: "Cosmic".into(),
+                model: "Pacer".into(),
+                serial_number: "1".into(),
+            },
+        )
+    }
+
+    #[test]
+    fn test_output_queue_state_and_fullscreen_render_queued() {
+        let output = create_test_output();
+
+        // Default state is Idle
+        assert_eq!(output.surface_queue_state(), OutputQueueState::Idle);
+        assert!(!output.is_fullscreen_render_queued());
+
+        // Non-fullscreen queued state does not flag fullscreen render queued
+        output.set_surface_queue_state(OutputQueueState::Queued {
+            is_fullscreen: false,
+        });
+        assert_eq!(
+            output.surface_queue_state(),
+            OutputQueueState::Queued {
+                is_fullscreen: false
+            }
+        );
+        assert!(!output.is_fullscreen_render_queued());
+
+        // Fullscreen queued state flags fullscreen render queued
+        output.set_surface_queue_state(OutputQueueState::Queued {
+            is_fullscreen: true,
+        });
+        assert_eq!(
+            output.surface_queue_state(),
+            OutputQueueState::Queued {
+                is_fullscreen: true
+            }
+        );
+        assert!(output.is_fullscreen_render_queued());
+
+        // WaitingForVBlank with fullscreen request flags fullscreen render queued
+        output.set_surface_queue_state(OutputQueueState::WaitingForVBlank {
+            fullscreen_request: true,
+        });
+        assert!(output.is_fullscreen_render_queued());
+
+        // WaitingForVBlank without fullscreen request does NOT flag fullscreen render queued (allows 1 in-flight frame for double buffering overlap)
+        output.set_surface_queue_state(OutputQueueState::WaitingForVBlank {
+            fullscreen_request: false,
+        });
+        assert!(!output.is_fullscreen_render_queued());
+
+        // Reset to Idle
+        output.set_surface_queue_state(OutputQueueState::Idle);
+        assert!(!output.is_fullscreen_render_queued());
+    }
+
+    #[test]
+    fn test_output_fullscreen_vrr_fifo() {
+        let output = create_test_output();
+        // Default is false
+        assert!(!output.fullscreen_vrr_fifo());
+
+        output.set_fullscreen_vrr_fifo(true);
+        assert!(output.fullscreen_vrr_fifo());
+
+        output.set_fullscreen_vrr_fifo(false);
+        assert!(!output.fullscreen_vrr_fifo());
+    }
+
+    #[test]
+    fn test_output_fullscreen_commit_pacer() {
+        let output = create_test_output();
+        assert_eq!(output.avg_fullscreen_commit_interval(), None);
+
+        let mut time = Time::from(Duration::from_secs(10));
+        output.record_fullscreen_commit(time);
+
+        // Record commits alternating 8ms and 24ms
+        for i in 0..12 {
+            let step = if i % 2 == 0 {
+                Duration::from_millis(8)
+            } else {
+                Duration::from_millis(24)
+            };
+            time = Time::from(Duration::from(time) + step);
+            output.record_fullscreen_commit(time);
+        }
+
+        assert_eq!(
+            output.avg_fullscreen_commit_interval(),
+            Some(Duration::from_millis(16))
+        );
+
+        output.reset_fullscreen_commit_pacer();
+        assert_eq!(output.avg_fullscreen_commit_interval(), None);
+    }
 }

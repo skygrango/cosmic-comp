@@ -425,6 +425,10 @@ impl Config {
         clock: &Clock<Monotonic>,
     ) -> anyhow::Result<()> {
         let outputs = output_state.outputs().collect::<Vec<_>>();
+        for output in &outputs {
+            let fifo = self.cosmic_conf.fullscreen_vrr_fifo_for(&output.name());
+            output.set_fullscreen_vrr_fifo(fifo);
+        }
         let mut infos = outputs
             .iter()
             .cloned()
@@ -976,6 +980,53 @@ fn config_changed(config: cosmic_config::Config, keys: Vec<String>, state: &mut 
                 if new != state.common.config.cosmic_conf.allow_tearing_outputs {
                     state.common.config.cosmic_conf.allow_tearing_outputs = new.clone();
                     set_allow_tearing_outputs(new);
+                }
+            }
+            "fullscreen_vrr_fifo" => {
+                let new = get_config::<bool>(&config, "fullscreen_vrr_fifo");
+                if new != state.common.config.cosmic_conf.fullscreen_vrr_fifo {
+                    state.common.config.cosmic_conf.fullscreen_vrr_fifo = new;
+                    for output in state.common.output_configuration_state.outputs() {
+                        let fifo = state
+                            .common
+                            .config
+                            .cosmic_conf
+                            .fullscreen_vrr_fifo_for(&output.name());
+                        output.set_fullscreen_vrr_fifo(fifo);
+                    }
+                    for output in state.common.shell.read().outputs() {
+                        let fifo = state
+                            .common
+                            .config
+                            .cosmic_conf
+                            .fullscreen_vrr_fifo_for(&output.name());
+                        output.set_fullscreen_vrr_fifo(fifo);
+                    }
+                }
+            }
+            "fullscreen_vrr_fifo_outputs" => {
+                let new = get_config::<std::collections::HashMap<String, bool>>(
+                    &config,
+                    "fullscreen_vrr_fifo_outputs",
+                );
+                if new != state.common.config.cosmic_conf.fullscreen_vrr_fifo_outputs {
+                    state.common.config.cosmic_conf.fullscreen_vrr_fifo_outputs = new;
+                    for output in state.common.output_configuration_state.outputs() {
+                        let fifo = state
+                            .common
+                            .config
+                            .cosmic_conf
+                            .fullscreen_vrr_fifo_for(&output.name());
+                        output.set_fullscreen_vrr_fifo(fifo);
+                    }
+                    for output in state.common.shell.read().outputs() {
+                        let fifo = state
+                            .common
+                            .config
+                            .cosmic_conf
+                            .fullscreen_vrr_fifo_for(&output.name());
+                        output.set_fullscreen_vrr_fifo(fifo);
+                    }
                 }
             }
             "hdr_enabled_outputs" => {

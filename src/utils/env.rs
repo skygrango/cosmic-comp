@@ -399,7 +399,7 @@ fn try_parse_dev_from_str(val: &str) -> Option<DeviceIdentifier> {
 
 #[cfg(test)]
 mod tests {
-    use super::HdrPolicy;
+    use super::*;
     use std::{collections::HashMap, time::Duration};
 
     #[test]

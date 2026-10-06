@@ -977,6 +977,9 @@ impl KmsState {
     }
 
     pub fn schedule_render_fullscreen(&mut self, output: &Output) {
+        output.set_surface_queue_state(OutputQueueState::Queued {
+            is_fullscreen: true,
+        });
         self.schedule_backend(output, true);
     }
 
@@ -1094,6 +1097,9 @@ impl KmsGuard<'_> {
     }
 
     pub fn schedule_render_fullscreen(&mut self, output: &Output) {
+        output.set_surface_queue_state(OutputQueueState::Queued {
+            is_fullscreen: true,
+        });
         self.schedule_backend(output, true);
     }
 

@@ -184,6 +184,47 @@ impl CompositorHandler for State {
 
     fn new_surface(&mut self, surface: &WlSurface) {
         add_pre_commit_hook::<Self, _>(surface, move |state, _dh, surface| {
+            let timestamp = with_states(surface, |states| {
+                states
+                    .data_map
+                    .get::<CommitTimerStateUserData>()
+                    .and_then(|state| state.borrow_mut().timestamp.take())
+            });
+
+            if let Some(timestamp) = timestamp {
+                let barrier = with_states(surface, |states| {
+                    let barrier_state = states
+                        .data_map
+                        .get_or_insert(CommitTimerBarrierStateUserData::default);
+                    barrier_state.lock().unwrap().register(timestamp)
+                });
+
+                state.schedule_commit_timing(surface, timestamp, Some(barrier));
+            } else {
+                let shell = state.common.shell.read();
+                if let Some(output) = shell.visible_output_for_surface(surface) {
+                    let is_fullscreen_occupied = output
+                        .is_foreground_fullscreen_occupied()
+                        .is_some_and(|cosmic_surface| {
+                            cosmic_surface.has_surface(surface, WindowSurfaceType::ALL)
+                        });
+                    let is_vrr = output.adaptive_sync() != AdaptiveSync::Disabled;
+                    let is_fifo = output.fullscreen_vrr_fifo();
+
+                    if is_fullscreen_occupied && is_vrr && is_fifo {
+                        output.record_fullscreen_commit(state.common.clock.now());
+
+                        if output.is_fullscreen_render_queued() {
+                            if let Some(client) = surface.client() {
+                                let barrier = Barrier::new(false);
+                                add_blocker(surface, barrier.clone());
+                                output.push_fullscreen_blocker(barrier, surface.clone(), client);
+                            }
+                        }
+                    }
+                }
+            }
+
             let mut acquire_point = None;
             let maybe_dmabuf = with_states(surface, |surface_data| {
                 acquire_point = surface_data
@@ -223,9 +264,7 @@ impl CompositorHandler for State {
                         }
                     }
                     // Explicit sync protocol forbids falling back to implicit sync on the dmabuf
-                    return;
-                }
-                if let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ) {
+                } else if let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ) {
                     let client = surface.client().unwrap();
                     let surface_clone = surface.clone();
                     let res =
@@ -237,83 +276,6 @@ impl CompositorHandler for State {
                                 state
                                     .client_compositor_state(&client)
                                     .surface_blocker_cleared(&surface_clone, state, &dh);
-                                Ok(())
-                            });
-                    if res.is_ok() {
-                        add_blocker(surface, blocker);
-                    }
-                }
-            }
-
-            let timestamp = with_states(surface, |states| {
-                states
-                    .data_map
-                    .get::<CommitTimerStateUserData>()
-                    .and_then(|state| state.borrow_mut().timestamp.take())
-            });
-
-            if let Some(timestamp) = timestamp {
-                let barrier = with_states(surface, |states| {
-                    let barrier_state = states
-                        .data_map
-                        .get_or_insert(CommitTimerBarrierStateUserData::default);
-                    barrier_state.lock().unwrap().register(timestamp)
-                });
-
-                state.schedule_commit_timing(surface, timestamp, Some(barrier));
-            }
-
-            let mut acquire_point = None;
-            let maybe_dmabuf = with_states(surface, |surface_data| {
-                acquire_point = surface_data
-                    .cached_state
-                    .get::<DrmSyncobjCachedState>()
-                    .pending()
-                    .acquire_point
-                    .clone();
-                surface_data
-                    .cached_state
-                    .get::<SurfaceAttributes>()
-                    .pending()
-                    .buffer
-                    .as_ref()
-                    .and_then(|assignment| match assignment {
-                        BufferAssignment::NewBuffer(buffer) => get_dmabuf(buffer).ok().cloned(),
-                        _ => None,
-                    })
-            });
-            if let Some(dmabuf) = maybe_dmabuf {
-                if let Some(acquire_point) = acquire_point {
-                    if let Ok((blocker, source)) = acquire_point.generate_blocker() {
-                        let client = surface.client().unwrap();
-                        let res = state.common.event_loop_handle.insert_source(
-                            source,
-                            move |_, _, state| {
-                                let dh = state.common.display_handle.clone();
-                                state
-                                    .client_compositor_state(&client)
-                                    .blocker_cleared(state, &dh);
-                                Ok(())
-                            },
-                        );
-                        if res.is_ok() {
-                            add_blocker(surface, blocker);
-                        }
-                    }
-                    // Explicit sync protocol forbids falling back to implicit sync on the dmabuf
-                    return;
-                }
-                if let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ) {
-                    let client = surface.client().unwrap();
-                    let res =
-                        state
-                            .common
-                            .event_loop_handle
-                            .insert_source(source, move |_, _, state| {
-                                let dh = state.common.display_handle.clone();
-                                state
-                                    .client_compositor_state(&client)
-                                    .blocker_cleared(state, &dh);
                                 Ok(())
                             });
                     if res.is_ok() {
@@ -406,6 +368,18 @@ impl CompositorHandler for State {
                     });
             if is_fullscreen {
                 output.refresh_fullscreen_occupied_flags();
+                if matches!(
+                    output.surface_queue_state(),
+                    OutputQueueState::WaitingForVBlank { .. }
+                ) {
+                    output.set_surface_queue_state(OutputQueueState::WaitingForVBlank {
+                        fullscreen_request: true,
+                    });
+                } else {
+                    output.set_surface_queue_state(OutputQueueState::Queued {
+                        is_fullscreen: true,
+                    });
+                }
                 self.backend.schedule_render_fullscreen(output);
             } else {
                 self.backend.schedule_render(output);

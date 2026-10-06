@@ -449,6 +449,8 @@ pub enum ThreadCommand {
 #[derive(Debug)]
 pub enum SurfaceCommand {
     SignalFIFO,
+    SignalFullscreenBlocker,
+    ClearFullscreenBlockers,
     SendFrames(usize),
     RenderStates(RenderElementStates),
     FatalRenderError(String),
@@ -568,6 +570,12 @@ impl Surface {
             .insert_source(rx2, move |command, _, state| match command {
                 Event::Msg(SurfaceCommand::SignalFIFO) => {
                     output_clone.signal_fifo(state);
+                }
+                Event::Msg(SurfaceCommand::SignalFullscreenBlocker) => {
+                    output_clone.signal_fullscreen_blocker(state);
+                }
+                Event::Msg(SurfaceCommand::ClearFullscreenBlockers) => {
+                    output_clone.clear_fullscreen_blockers(state);
                 }
                 Event::Msg(SurfaceCommand::ProcessShmScreencopy) => {
                     if let Some(pending_captures) = output_clone.user_data().get::<OutputPendingShmCaptures>() {
@@ -1646,6 +1654,8 @@ impl SurfaceThreadState {
             QueueState::WaitingForEstimatedVBlankAndQueued { .. } => unreachable!(),
         };
 
+        self.output.set_surface_queue_state(OutputQueueState::Idle);
+
         if redraw_needed
             || (!self.timings.vrr() && self.shell.read().output_animations_going(&self.output))
         {
@@ -1714,6 +1724,10 @@ impl SurfaceThreadState {
                     redraw_needed: true,
                     fullscreen_request: is_fullscreen,
                 };
+                self.output
+                    .set_surface_queue_state(OutputQueueState::WaitingForVBlank {
+                        fullscreen_request: is_fullscreen,
+                    });
             }
             return;
         }
@@ -1730,12 +1744,21 @@ impl SurfaceThreadState {
             };
         }
 
+        let fifo = self.output.fullscreen_vrr_fifo();
+        self.timings.set_fullscreen_vrr_fifo(fifo);
+        self.timings
+            .set_avg_fullscreen_commit_interval(self.output.avg_fullscreen_commit_interval());
         let estimated_presentation = self.timings.next_presentation_time(&self.clock);
+        if self.timings.is_fullscreen && self.timings.vrr() && fifo {
+            let now_dur: Duration = self.clock.now().into();
+            self.timings
+                .mark_presentation_scheduled(now_dur + estimated_presentation);
+        }
         let render_start = if is_fullscreen_skip_other {
             // To prevent the fullscreen surface from unexpectedly stopping updates, register a fallback redraw request.
             // If the fullscreen surface commits an update within the min_vrr interval, it will replace this fallback request.
             self.min_vrr_frame_time.unwrap_or(_30_HZ)
-        } else if immediate {
+        } else if immediate || (self.timings.is_fullscreen && self.timings.vrr() && fifo) {
             Duration::ZERO
         } else {
             self.timings.next_render_time(&self.clock)
@@ -1784,16 +1807,22 @@ impl SurfaceThreadState {
         match &self.state {
             QueueState::Idle => {
                 self.state = QueueState::Queued(token);
+                self.output
+                    .set_surface_queue_state(OutputQueueState::Queued { is_fullscreen });
             }
             QueueState::WaitingForEstimatedVBlank(estimated_vblank) => {
                 self.state = QueueState::WaitingForEstimatedVBlankAndQueued {
                     estimated_vblank: *estimated_vblank,
                     queued_render: token,
                 };
+                self.output
+                    .set_surface_queue_state(OutputQueueState::Queued { is_fullscreen });
             }
             QueueState::Queued(old_token) if force => {
                 self.loop_handle.remove(*old_token);
                 self.state = QueueState::Queued(token);
+                self.output
+                    .set_surface_queue_state(OutputQueueState::Queued { is_fullscreen });
             }
             QueueState::WaitingForEstimatedVBlankAndQueued {
                 estimated_vblank,
@@ -1804,6 +1833,8 @@ impl SurfaceThreadState {
                     estimated_vblank: *estimated_vblank,
                     queued_render: token,
                 };
+                self.output
+                    .set_surface_queue_state(OutputQueueState::Queued { is_fullscreen });
             }
             _ => unreachable!(),
         }
@@ -1894,6 +1925,16 @@ impl SurfaceThreadState {
                 fullscreen_surface.as_ref(),
                 &mut allow_primary_scanout,
             );
+            let was_fullscreen = self.fullscreen.is_some();
+            let is_fs = fullscreen_surface.is_some();
+            self.timings.set_fullscreen_active(is_fs);
+            if was_fullscreen && !is_fs {
+                let _ = self
+                    .thread_sender
+                    .send(SurfaceCommand::ClearFullscreenBlockers);
+                self.timings.reset_fullscreen_pacer();
+                self.output.reset_fullscreen_commit_pacer();
+            }
             self.fullscreen = fullscreen_surface;
         }
 
@@ -2273,6 +2314,11 @@ impl SurfaceThreadState {
                                 redraw_needed: false,
                                 fullscreen_request: false,
                             };
+                            self.output.set_surface_queue_state(
+                                OutputQueueState::WaitingForVBlank {
+                                    fullscreen_request: false,
+                                },
+                            );
                             match mem::replace(&mut self.state, new_state) {
                                 QueueState::Idle => unreachable!(),
                                 QueueState::Queued(_) => (),
@@ -2309,6 +2355,12 @@ impl SurfaceThreadState {
                             self.send_dmabuf_feedback(states);
                         }
 
+                        if has_active_fullscreen && self.mirroring.is_none() {
+                            let _ = self
+                                .thread_sender
+                                .send(SurfaceCommand::SignalFullscreenBlocker);
+                        }
+
                         if x.is_ok() {
                             self.send_signal_fifo_callbacks();
 
@@ -2337,6 +2389,8 @@ impl SurfaceThreadState {
                         }
                     }
                     Err(err) => {
+                        self.output.set_surface_queue_state(OutputQueueState::Idle);
+
                         for (_session, frame, _) in frames {
                             frame.fail(CaptureFailureReason::Unknown);
                         }
@@ -2421,6 +2475,16 @@ impl SurfaceThreadState {
                 fullscreen_surface.as_ref(),
                 &mut allow_primary_scanout,
             );
+            let was_fullscreen = self.fullscreen.is_some();
+            let is_fs = fullscreen_surface.is_some();
+            self.timings.set_fullscreen_active(is_fs);
+            if was_fullscreen && !is_fs {
+                let _ = self
+                    .thread_sender
+                    .send(SurfaceCommand::ClearFullscreenBlockers);
+                self.timings.reset_fullscreen_pacer();
+                self.output.reset_fullscreen_commit_pacer();
+            }
             self.fullscreen = fullscreen_surface;
             self.is_scanout = false;
             self.swapchin_is_scanout = false;
@@ -2712,6 +2776,11 @@ impl SurfaceThreadState {
                                 redraw_needed: false,
                                 fullscreen_request: false,
                             };
+                            self.output.set_surface_queue_state(
+                                OutputQueueState::WaitingForVBlank {
+                                    fullscreen_request: false,
+                                },
+                            );
                             match mem::replace(&mut self.state, new_state) {
                                 QueueState::Idle => unreachable!(),
                                 QueueState::Queued(_) => (),
@@ -2734,6 +2803,12 @@ impl SurfaceThreadState {
                         }
 
                         if x.is_ok() {
+                            if has_active_fullscreen && self.mirroring.is_none() {
+                                let _ = self
+                                    .thread_sender
+                                    .send(SurfaceCommand::SignalFullscreenBlocker);
+                            }
+
                             if let Some(hdr_state) =
                                 self.output.user_data().get::<drm_helpers::HdrOutputState>()
                             {
@@ -2751,6 +2826,12 @@ impl SurfaceThreadState {
                             }
                         } else {
                             let _ = self.vblank_frame.take();
+                            self.output.set_surface_queue_state(OutputQueueState::Idle);
+                            if has_active_fullscreen && self.mirroring.is_none() {
+                                let _ = self
+                                    .thread_sender
+                                    .send(SurfaceCommand::SignalFullscreenBlocker);
+                            }
 
                             if self.fullscreen.is_some() && self.timings.vrr() {
                                 match mem::replace(&mut self.state, QueueState::Idle) {
@@ -2782,6 +2863,12 @@ impl SurfaceThreadState {
                         }
                     }
                     Err(err) => {
+                        self.output.set_surface_queue_state(OutputQueueState::Idle);
+                        if has_active_fullscreen && self.mirroring.is_none() {
+                            let _ = self
+                                .thread_sender
+                                .send(SurfaceCommand::SignalFullscreenBlocker);
+                        }
                         return Err(err).with_context(|| "Failed to submit result for display");
                     }
                 };

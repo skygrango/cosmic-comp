@@ -11,7 +11,7 @@ use crate::{
     dbus::DBusState,
     input::{PointerFocusState, gestures::GestureState},
     shell::{CosmicSurface, SeatExt, Shell, grabs::SeatMoveGrabState},
-    utils::{env::hdr_policy, prelude::OutputExt},
+    utils::{env::hdr_policy, prelude::*},
     wayland::{
         handlers::{
             color_management::description_for_output, data_device::get_dnd_icon,
@@ -409,6 +409,9 @@ impl BackendData {
     }
 
     pub fn schedule_render_fullscreen(&mut self, output: &Output) {
+        output.set_surface_queue_state(OutputQueueState::Queued {
+            is_fullscreen: true,
+        });
         self.schedule_backend(output, true);
     }
 

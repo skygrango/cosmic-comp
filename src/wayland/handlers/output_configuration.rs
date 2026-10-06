@@ -155,6 +155,15 @@ impl State {
             }
         }
 
+        for (output, _) in &backups {
+            output.set_fullscreen_vrr_fifo(
+                self.common
+                    .config
+                    .cosmic_conf
+                    .fullscreen_vrr_fifo_for(&output.name()),
+            );
+        }
+
         let mut backend = self.backend.lock();
         let res = backend.apply_config_for_outputs(
             test_only,

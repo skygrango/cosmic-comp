@@ -1537,6 +1537,12 @@ impl Drop for OutputId {
 
 impl Common {
     pub fn add_output(&mut self, output: &Output) {
+        let fifo = self
+            .config
+            .cosmic_conf
+            .fullscreen_vrr_fifo_for(&output.name());
+        output.set_fullscreen_vrr_fifo(fifo);
+
         let mut shell = self.shell.write();
         shell
             .workspaces

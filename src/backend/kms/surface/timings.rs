@@ -8,6 +8,7 @@ use tracing::{debug, error};
 
 const BASE_SAFETY_MARGIN: Duration = Duration::from_millis(3);
 pub const SAMPLE_TIME_WINDOW: usize = 5;
+pub const FULLSCREEN_VRR_PACER_WINDOW: usize = 12;
 
 pub struct Timings {
     pub refresh_interval_ns: Option<NonZeroU64>,
@@ -20,6 +21,14 @@ pub struct Timings {
 
     pub pending_frame: Option<PendingFrame>,
     pub previous_frames: VecDeque<Frame>,
+
+    // Fullscreen VRR Pacing
+    pub last_fullscreen_commit: Option<Time<Monotonic>>,
+    pub fullscreen_commit_intervals: VecDeque<Duration>,
+    pub avg_fullscreen_commit_interval: Option<Duration>,
+    pub last_scheduled_presentation: Option<Duration>,
+    pub is_fullscreen: bool,
+    pub fullscreen_vrr_fifo: bool,
 }
 
 #[derive(Debug)]
@@ -95,7 +104,112 @@ impl Timings {
 
             pending_frame: None,
             previous_frames: VecDeque::new(),
+
+            last_fullscreen_commit: None,
+            fullscreen_commit_intervals: VecDeque::with_capacity(FULLSCREEN_VRR_PACER_WINDOW),
+            avg_fullscreen_commit_interval: None,
+            last_scheduled_presentation: None,
+            is_fullscreen: false,
+            fullscreen_vrr_fifo: false,
         }
+    }
+
+    #[cfg(test)]
+    pub fn new_for_test(
+        refresh_interval: Option<Duration>,
+        min_interval: Option<Duration>,
+        vrr: bool,
+    ) -> Self {
+        let refresh_interval_ns = if let Some(interval) = &refresh_interval {
+            assert_eq!(interval.as_secs(), 0);
+            Some(NonZeroU64::new(interval.subsec_nanos().into()).unwrap())
+        } else {
+            None
+        };
+
+        let min_refresh_interval_ns = if let Some(interval) = &min_interval {
+            assert_eq!(interval.as_secs(), 0);
+            Some(NonZeroU64::new(interval.subsec_nanos().into()).unwrap())
+        } else {
+            None
+        };
+
+        Self {
+            refresh_interval_ns,
+            origin_refresh_interval_ns: refresh_interval_ns,
+            vrr_target_rate_internal_ns: refresh_interval_ns,
+            min_refresh_interval_ns,
+            vrr,
+            vendor: None,
+
+            pending_frame: None,
+            previous_frames: VecDeque::new(),
+
+            last_fullscreen_commit: None,
+            fullscreen_commit_intervals: VecDeque::with_capacity(FULLSCREEN_VRR_PACER_WINDOW),
+            avg_fullscreen_commit_interval: None,
+            last_scheduled_presentation: None,
+            is_fullscreen: false,
+            fullscreen_vrr_fifo: false,
+        }
+    }
+
+    pub fn record_fullscreen_commit(&mut self, now: Time<Monotonic>) {
+        if let Some(last) = self.last_fullscreen_commit {
+            let diff = Time::elapsed(&last, now);
+            if diff > Duration::from_millis(250) {
+                self.fullscreen_commit_intervals.clear();
+                self.avg_fullscreen_commit_interval = None;
+            } else if !diff.is_zero() {
+                self.fullscreen_commit_intervals.push_back(diff);
+                if self.fullscreen_commit_intervals.len() > FULLSCREEN_VRR_PACER_WINDOW {
+                    self.fullscreen_commit_intervals.pop_front();
+                }
+                let sum: Duration = self.fullscreen_commit_intervals.iter().sum();
+                self.avg_fullscreen_commit_interval =
+                    Some(sum / (self.fullscreen_commit_intervals.len() as u32));
+            }
+        }
+        self.last_fullscreen_commit = Some(now);
+    }
+
+    pub fn set_fullscreen_active(&mut self, active: bool) {
+        if self.is_fullscreen != active {
+            self.is_fullscreen = active;
+            self.reset_fullscreen_pacer();
+        }
+    }
+
+    pub fn reset_fullscreen_pacer(&mut self) {
+        self.last_fullscreen_commit = None;
+        self.fullscreen_commit_intervals.clear();
+        self.avg_fullscreen_commit_interval = None;
+        self.last_scheduled_presentation = None;
+    }
+
+    pub fn set_fullscreen_vrr_fifo(&mut self, fifo: bool) {
+        if self.fullscreen_vrr_fifo != fifo {
+            self.fullscreen_vrr_fifo = fifo;
+            if !fifo {
+                self.reset_fullscreen_pacer();
+            }
+        }
+    }
+
+    pub fn fullscreen_vrr_fifo(&self) -> bool {
+        self.fullscreen_vrr_fifo
+    }
+
+    pub fn set_avg_fullscreen_commit_interval(&mut self, interval: Option<Duration>) {
+        self.avg_fullscreen_commit_interval = interval;
+    }
+
+    pub fn avg_fullscreen_commit_interval(&self) -> Option<Duration> {
+        self.avg_fullscreen_commit_interval
+    }
+
+    pub fn mark_presentation_scheduled(&mut self, target: Duration) {
+        self.last_scheduled_presentation = Some(target);
     }
 
     pub fn refresh_interval(&self) -> Duration {
@@ -318,6 +432,30 @@ impl Timings {
         let refresh_interval_ns = refresh_interval_ns.get();
 
         if self.vrr {
+            if self.is_fullscreen
+                && self.fullscreen_vrr_fifo
+                && let Some(avg_interval) = self.avg_fullscreen_commit_interval
+            {
+                let refresh_interval = Duration::from_nanos(refresh_interval_ns);
+                // Strategy: if average rate is faster than screen refresh rate, use refresh_interval;
+                // otherwise use avg_interval.
+                let target_interval = if avg_interval < refresh_interval {
+                    refresh_interval
+                } else {
+                    avg_interval
+                };
+
+                let base_time = match self.last_scheduled_presentation {
+                    Some(scheduled) if scheduled > last_presentation_time && scheduled > now => {
+                        scheduled
+                    }
+                    _ => last_presentation_time.max(now),
+                };
+
+                let target_presentation = base_time + target_interval;
+                return target_presentation.saturating_sub(now);
+            }
+
             let earliest_presentation =
                 last_presentation_time + Duration::from_nanos(refresh_interval_ns);
             return earliest_presentation.saturating_sub(now);
@@ -423,5 +561,183 @@ impl Timings {
         };
 
         estimated_presentation_time.saturating_sub(margin)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_dummy_timings(
+        refresh_interval: Option<Duration>,
+        min_interval: Option<Duration>,
+        vrr: bool,
+    ) -> Timings {
+        Timings::new_for_test(refresh_interval, min_interval, vrr)
+    }
+
+    #[test]
+    fn test_fullscreen_vrr_commit_rolling_average() {
+        let mut timings = create_dummy_timings(Some(Duration::from_millis(16)), None, true);
+        timings.set_fullscreen_active(true);
+
+        let mut clock_now = Time::from(Duration::from_secs(10));
+        timings.record_fullscreen_commit(clock_now);
+
+        // Simulate 2x Frame Generation jitter: alternating 8ms and 24ms intervals
+        for i in 0..12 {
+            let interval = if i % 2 == 0 {
+                Duration::from_millis(8)
+            } else {
+                Duration::from_millis(24)
+            };
+            clock_now = Time::from(Duration::from(clock_now) + interval);
+            timings.record_fullscreen_commit(clock_now);
+        }
+
+        assert_eq!(
+            timings.fullscreen_commit_intervals.len(),
+            FULLSCREEN_VRR_PACER_WINDOW
+        );
+        // (8 * 6 + 24 * 6) / 12 = 16ms
+        assert_eq!(
+            timings.avg_fullscreen_commit_interval,
+            Some(Duration::from_millis(16))
+        );
+
+        // Record another frame (8ms). The oldest interval was 8ms, so average remains 16ms!
+        clock_now = Time::from(Duration::from(clock_now) + Duration::from_millis(8));
+        timings.record_fullscreen_commit(clock_now);
+        assert_eq!(
+            timings.fullscreen_commit_intervals.len(),
+            FULLSCREEN_VRR_PACER_WINDOW
+        );
+        assert_eq!(
+            timings.avg_fullscreen_commit_interval,
+            Some(Duration::from_millis(16))
+        );
+    }
+
+    #[test]
+    fn test_fullscreen_vrr_pacer_pacing_strategy() {
+        let refresh_interval = Duration::from_nanos(6_944_444); // ~144Hz
+        let mut timings = create_dummy_timings(Some(refresh_interval), None, true);
+        timings.set_fullscreen_active(true);
+        timings.set_fullscreen_vrr_fifo(true);
+
+        let clock: Clock<Monotonic> = Clock::new();
+        let now_dur: Duration = clock.now().into();
+
+        timings.previous_frames.push_back(Frame {
+            render_start: Time::from(now_dur),
+            render_duration_elements: Duration::ZERO,
+            render_duration_draw: Duration::ZERO,
+            presentation_submitted: Time::from(now_dur),
+            presentation_presented: Time::from(now_dur),
+        });
+
+        // Case A: Commit rate faster than refresh rate (e.g. 4ms interval)
+        // Must clamp to refresh_interval (6.944ms)
+        timings.avg_fullscreen_commit_interval = Some(Duration::from_millis(4));
+        let wait_a = timings.next_presentation_time(&clock);
+        // Since now is roughly equal to presentation_presented, wait_a should be approx refresh_interval
+        assert!(wait_a <= refresh_interval);
+        assert!(wait_a > Duration::from_millis(3));
+
+        // Case B: Commit rate slower than refresh rate (e.g. 16.6ms / 60fps)
+        // Must use avg_interval (16.6ms)
+        let slow_interval = Duration::from_millis(16);
+        timings.avg_fullscreen_commit_interval = Some(slow_interval);
+        let wait_b = timings.next_presentation_time(&clock);
+        assert!(wait_b <= slow_interval);
+        assert!(wait_b > refresh_interval);
+    }
+
+    #[test]
+    fn test_presentation_time_chaining_burst() {
+        let refresh_interval = Duration::from_millis(10);
+        let mut timings = create_dummy_timings(Some(refresh_interval), None, true);
+        timings.set_fullscreen_active(true);
+        timings.set_fullscreen_vrr_fifo(true);
+        timings.avg_fullscreen_commit_interval = Some(Duration::from_millis(10));
+
+        let clock: Clock<Monotonic> = Clock::new();
+        let now_dur: Duration = clock.now().into();
+
+        timings.previous_frames.push_back(Frame {
+            render_start: Time::from(now_dur),
+            render_duration_elements: Duration::ZERO,
+            render_duration_draw: Duration::ZERO,
+            presentation_submitted: Time::from(now_dur),
+            presentation_presented: Time::from(now_dur),
+        });
+
+        // Schedule first frame at T1 = now_dur + 10ms
+        let target1 = now_dur + Duration::from_millis(10);
+        timings.mark_presentation_scheduled(target1);
+
+        // Next presentation time should chain from target1, targeting target2 = target1 + 10ms
+        let wait_second = timings.next_presentation_time(&clock);
+        let current_now: Duration = clock.now().into();
+        let expected_target2 = target1 + Duration::from_millis(10);
+        let expected_wait = expected_target2.saturating_sub(current_now);
+
+        // Tolerance within 1ms due to clock progression
+        let diff = if wait_second > expected_wait {
+            wait_second - expected_wait
+        } else {
+            expected_wait - wait_second
+        };
+        assert!(diff < Duration::from_millis(1));
+    }
+
+    #[test]
+    fn test_fullscreen_pacer_reset() {
+        let mut timings = create_dummy_timings(Some(Duration::from_millis(16)), None, true);
+        timings.set_fullscreen_active(true);
+        timings.last_fullscreen_commit = Some(Time::from(Duration::from_secs(1)));
+        timings
+            .fullscreen_commit_intervals
+            .push_back(Duration::from_millis(16));
+        timings.avg_fullscreen_commit_interval = Some(Duration::from_millis(16));
+        timings.last_scheduled_presentation = Some(Duration::from_secs(2));
+
+        timings.set_fullscreen_active(false);
+
+        assert!(!timings.is_fullscreen);
+        assert!(timings.last_fullscreen_commit.is_none());
+        assert!(timings.fullscreen_commit_intervals.is_empty());
+        assert!(timings.avg_fullscreen_commit_interval.is_none());
+        assert!(timings.last_scheduled_presentation.is_none());
+    }
+
+    #[test]
+    fn test_fullscreen_vrr_fifo_toggle() {
+        let clock = Clock::<Monotonic>::new();
+        let mut timings = create_dummy_timings(Some(Duration::from_millis(16)), None, true);
+        timings.set_fullscreen_active(true);
+        timings.avg_fullscreen_commit_interval = Some(Duration::from_millis(20));
+
+        let now_dur: Duration = clock.now().into();
+        timings.previous_frames.push_back(Frame {
+            render_start: Time::from(now_dur),
+            render_duration_elements: Duration::ZERO,
+            render_duration_draw: Duration::ZERO,
+            presentation_submitted: Time::from(now_dur),
+            presentation_presented: Time::from(now_dur),
+        });
+
+        // When fullscreen_vrr_fifo is true, pacing strategy uses avg_fullscreen_commit_interval (20ms)
+        timings.set_fullscreen_vrr_fifo(true);
+        let wait_with_fifo = timings.next_presentation_time(&clock);
+        assert!(wait_with_fifo >= Duration::from_millis(19));
+
+        // When fullscreen_vrr_fifo is set to false, it resets pacer and falls back to standard earliest presentation (16ms)
+        timings.set_fullscreen_vrr_fifo(false);
+        assert!(!timings.fullscreen_vrr_fifo());
+        assert!(timings.avg_fullscreen_commit_interval.is_none());
+
+        let wait_without_fifo = timings.next_presentation_time(&clock);
+        assert!(wait_without_fifo <= Duration::from_millis(17));
     }
 }
