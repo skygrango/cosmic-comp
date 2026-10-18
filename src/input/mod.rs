@@ -3022,13 +3022,9 @@ impl State {
         &mut self,
         surface: &WlSurface,
         pointer: &PointerHandle<Self>,
-        mut location: Point<f64, Logical>,
+        location: Point<f64, Logical>,
         constraint: Option<&PointerConstraint>,
     ) {
-        let Some(client) = surface.client() else {
-            return;
-        };
-        location = location.downscale(self.client_compositor_state(&client).client_scale());
 
         let point_and_output = {
             let shell = self.common.shell.read();
