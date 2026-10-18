@@ -305,7 +305,7 @@ impl CosmicMapped {
         self.windows().find_map(|(window, window_offset)| {
             window
                 .surface_offset(surface)
-                .map(|offset| window_offset + offset)
+                .map(|offset| window_offset + offset - window.geometry().loc)
         })
     }
 
