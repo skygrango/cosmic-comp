@@ -573,7 +573,7 @@ impl State {
                                 PointerFocusTarget::WlSurface { surface, .. } => {
                                     if under_from_surface_tree(
                                         surface,
-                                        position.as_logical() - surface_loc.to_f64(),
+                                        pos.as_logical() - surface_loc.to_f64(),
                                         (0, 0),
                                         WindowSurfaceType::ALL,
                                     )
@@ -585,7 +585,7 @@ impl State {
                                 PointerFocusTarget::X11Surface { surface, .. } => {
                                     if surface
                                         .surface_under(
-                                            position.as_logical() - surface_loc.to_f64(),
+                                            pos.as_logical() - surface_loc.to_f64(),
                                             (0, 0),
                                             WindowSurfaceType::ALL,
                                         )
