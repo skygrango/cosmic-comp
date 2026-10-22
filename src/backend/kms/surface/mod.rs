@@ -1491,6 +1491,7 @@ impl SurfaceThreadState {
     }
 
     fn node_removed(&mut self, node: DrmNode) {
+        self.postprocess_textures.remove(&node);
         match &mut self.api {
             SurfaceGpuApi::Glow(api) => {
                 api.as_mut().remove_node(&node);

@@ -62,9 +62,18 @@ struct CachedNinePatchWindow {
 static FORCE_NINEPATCH: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var_os("COSMIC_FORCE_NINEPATCH_SHADOW").is_some());
 
+static NINE_PATCH_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<NinePatchKey, CachedNinePatchTexture>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
 thread_local! {
-    static NINE_PATCH_CACHE: RefCell<HashMap<NinePatchKey, CachedNinePatchTexture>> = RefCell::new(HashMap::new());
     static NINE_PATCH_ELEMENT_CACHE: RefCell<HashMap<CosmicMappedKey, CachedNinePatchWindow>> = RefCell::new(HashMap::new());
+}
+
+pub fn evict_nine_patch_cache(context_id: ErasedContextId) {
+    if let Ok(mut cache) = NINE_PATCH_CACHE.lock() {
+        cache.retain(|k, _| k.context_id != context_id);
+    }
 }
 
 // CC0 Gaussian and erf approximation functions taken from Evan Wallace:
@@ -910,13 +919,15 @@ impl ShadowShader {
         };
 
         let (texture, tex_size, margins) = {
-            let cached = NINE_PATCH_CACHE.with(|cache| {
-                cache.borrow().get(&tex_key).and_then(|c| {
+            let cached = NINE_PATCH_CACHE
+                .lock()
+                .unwrap()
+                .get(&tex_key)
+                .and_then(|c| {
                     c.texture
                         .downcast_ref::<R::TextureId>()
                         .map(|t| (t.clone(), c.size, c.margins))
-                })
-            });
+                });
 
             if let Some(res) = cached {
                 res
@@ -924,16 +935,14 @@ impl ShadowShader {
                 let (pixels, sz, margins) =
                     generate_nine_patch_shadow_bitmap(radius, scale, dark_mode);
                 let tex = renderer.import_memory(&pixels, Fourcc::Abgr8888, sz, false)?;
-                NINE_PATCH_CACHE.with(|cache| {
-                    cache.borrow_mut().insert(
-                        tex_key,
-                        CachedNinePatchTexture {
-                            texture: Box::new(tex.clone()),
-                            size: sz,
-                            margins,
-                        },
-                    );
-                });
+                NINE_PATCH_CACHE.lock().unwrap().insert(
+                    tex_key,
+                    CachedNinePatchTexture {
+                        texture: Box::new(tex.clone()),
+                        size: sz,
+                        margins,
+                    },
+                );
                 (tex, sz, margins)
             }
         };

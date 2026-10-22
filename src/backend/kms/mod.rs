@@ -124,13 +124,19 @@ impl KmsGpuApi {
     }
 
     pub fn reevaluate(&mut self, primary_node: Option<&DrmNode>) {
-        if let Some(primary_node) = primary_node {
-            match self {
-                KmsGpuApi::Glow(api) => {
+        match self {
+            KmsGpuApi::Glow(api) => {
+                if let Some(primary_node) = primary_node {
                     let _ = api.single_renderer(primary_node);
+                } else {
+                    let _ = api.devices();
                 }
-                KmsGpuApi::Vulkan { api, .. } => {
+            }
+            KmsGpuApi::Vulkan { api, .. } => {
+                if let Some(primary_node) = primary_node {
                     let _ = api.single_renderer(primary_node);
+                } else {
+                    let _ = api.devices();
                 }
             }
         }
@@ -685,8 +691,11 @@ impl State {
             .values_mut()
             .find(|d| d.inner.render_node == render_node)
         {
-            let _ = device.inner.vulkan.take();
-            let _ = device.inner.pending_vulkan_renderer.take();
+            if let Some(vulkan) = device.inner.vulkan.take() {
+                crate::backend::render::shadow::evict_nine_patch_cache(
+                    vulkan.device.context().erased(),
+                );
+            }
             api.as_mut().remove_node(&render_node);
 
             match device
@@ -910,69 +919,147 @@ impl KmsState {
         _global: &DmabufGlobal,
         dmabuf: Dmabuf,
     ) -> Result<DrmNode> {
-        let device_node = dmabuf
+        let primary_node = *self.primary_node.read().unwrap();
+        let initial_node = dmabuf
             .node()
-            .unwrap_or_else(|| self.primary_node.read().unwrap().unwrap());
-        let mut device = self
-            .drm_devices
-            .values_mut()
-            .find(|dev| dev.inner.render_node == device_node)
-            .ok_or(anyhow::anyhow!(
-                "Unable to find device for node: {}",
-                device_node
-            ))?;
+            .or_else(|| {
+                client
+                    .as_ref()
+                    .and_then(crate::state::advertised_node_for_client)
+            })
+            .or(primary_node)
+            .context("No primary DRM node available for dmabuf import")?;
 
-        // If device advertised to client doesn't support format/modifier, select
-        // first device that does. This is needed for image-copy from
-        // output/toplevel on a different node.
-        if dmabuf.node().is_none() && !device.texture_formats.contains(&dmabuf.format()) {
-            device = self
+        let mut candidate_nodes = Vec::new();
+        if let Some(dev) = self
+            .drm_devices
+            .values()
+            .find(|dev| dev.inner.render_node == initial_node)
+        {
+            if dmabuf.node().is_some() || dev.texture_formats.contains(&dmabuf.format()) {
+                candidate_nodes.push(initial_node);
+            }
+        }
+        if dmabuf.node().is_none() {
+            for dev in self.drm_devices.values() {
+                let node = dev.inner.render_node;
+                if node != initial_node && dev.texture_formats.contains(&dmabuf.format()) {
+                    candidate_nodes.push(node);
+                }
+            }
+        }
+
+        if candidate_nodes.is_empty() {
+            anyhow::bail!("Dmabuf cannot be imported on any gpu");
+        }
+
+        let mut last_err = None;
+        for candidate_node in candidate_nodes {
+            let Some(device) = self
                 .drm_devices
                 .values_mut()
-                .find(|device| device.texture_formats.contains(&dmabuf.format()))
-                .context("Dmabuf cannot be imported on any gpu")?;
-        }
+                .find(|dev| dev.inner.render_node == candidate_node)
+            else {
+                continue;
+            };
 
-        let new_client = if let Some(client) = client {
-            let new = device.inner.active_clients.insert(client.id());
+            let was_active = device.inner.vulkan.is_some() || device.inner.egl.is_some();
+            let added_client = if let Some(ref client) = client {
+                device.inner.active_clients.insert(client.id())
+            } else {
+                false
+            };
+
             let updated = match &mut self.api {
-                KmsGpuApi::Glow(api) => device
-                    .inner
-                    .update_egl(self.primary_node.read().unwrap().as_ref(), api.as_mut())?,
+                KmsGpuApi::Glow(api) => {
+                    device.inner.update_egl(primary_node.as_ref(), api.as_mut())
+                }
                 KmsGpuApi::Vulkan { api, .. } => device
                     .inner
-                    .update_vulkan(self.primary_node.read().unwrap().as_ref(), api.as_mut())?,
+                    .update_vulkan(primary_node.as_ref(), api.as_mut()),
             };
-            updated && new
-        } else {
-            false
-        };
+            let updated = match updated {
+                Ok(u) => u,
+                Err(err) => {
+                    if added_client && let Some(ref client) = client {
+                        device.inner.active_clients.remove(&client.id());
+                    }
+                    last_err = Some(err);
+                    continue;
+                }
+            };
 
-        if !device.inner.is_vulkan {
-            let egl = device
-                .inner
-                .egl
-                .as_ref()
-                .context("EGL initialization Error")?;
-            egl.display
-                .create_image_from_dmabuf(&dmabuf)
-                .inspect(|image| unsafe {
-                    smithay::backend::egl::ffi::egl::DestroyImageKHR(
-                        **egl.display.get_display_handle(),
-                        *image,
-                    );
-                })
-                .context("Failed to create EGLImage from dmabuf")?;
+            let import_res: Result<()> = if device.inner.is_vulkan {
+                match &mut self.api {
+                    KmsGpuApi::Vulkan { api, .. } => api
+                        .single_renderer(&candidate_node)
+                        .context("Failed to acquire Vulkan renderer for dmabuf import")
+                        .and_then(|mut renderer| {
+                            renderer
+                                .import_dmabuf(&dmabuf, None)
+                                .map(|_| ())
+                                .context("Failed to import dmabuf into Vulkan")
+                        }),
+                    _ => unreachable!(),
+                }
+            } else {
+                let egl = device
+                    .inner
+                    .egl
+                    .as_ref()
+                    .context("EGL initialization Error")?;
+                egl.display
+                    .create_image_from_dmabuf(&dmabuf)
+                    .inspect(|image| unsafe {
+                        smithay::backend::egl::ffi::egl::DestroyImageKHR(
+                            **egl.display.get_display_handle(),
+                            *image,
+                        );
+                    })
+                    .map(|_| ())
+                    .context("Failed to create EGLImage from dmabuf")
+            };
+
+            match import_res {
+                Ok(()) => {
+                    dmabuf.set_node(candidate_node);
+                    if !was_active && updated {
+                        self.refresh_used_devices()?;
+                    }
+                    return Ok(candidate_node);
+                }
+                Err(err) => {
+                    if added_client && let Some(ref client) = client {
+                        if let Some(device) = self
+                            .drm_devices
+                            .values_mut()
+                            .find(|dev| dev.inner.render_node == candidate_node)
+                        {
+                            device.inner.active_clients.remove(&client.id());
+                            if !device.inner.in_use(primary_node.as_ref()) {
+                                match &mut self.api {
+                                    KmsGpuApi::Glow(api) => {
+                                        let _ = device
+                                            .inner
+                                            .update_egl(primary_node.as_ref(), api.as_mut());
+                                        let _ = api.devices();
+                                    }
+                                    KmsGpuApi::Vulkan { api, .. } => {
+                                        let _ = device
+                                            .inner
+                                            .update_vulkan(primary_node.as_ref(), api.as_mut());
+                                        let _ = api.devices();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    last_err = Some(err);
+                }
+            }
         }
 
-        let node = device.inner.render_node;
-        dmabuf.set_node(node);
-
-        if new_client {
-            self.refresh_used_devices()?;
-        }
-
-        Ok(node)
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Dmabuf cannot be imported on any gpu")))
     }
 
     pub fn schedule_render(&mut self, output: &Output) {
