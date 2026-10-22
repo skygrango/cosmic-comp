@@ -451,11 +451,11 @@ fn determine_primary_gpu(
         return Ok(Some(boot));
     }
 
-    // else just take the first
+    // else just take the first non-software gpu (or any Vulkan device if only software Vulkan is available)
     Ok(drm_devices
         .values()
-        .next()
-        .filter(|dev| !dev.inner.is_software)
+        .find(|dev| !dev.inner.is_software)
+        .or_else(|| drm_devices.values().find(|dev| dev.inner.is_vulkan))
         .map(|dev| dev.inner.render_node))
 }
 
@@ -686,6 +686,7 @@ impl State {
             .find(|d| d.inner.render_node == render_node)
         {
             let _ = device.inner.vulkan.take();
+            let _ = device.inner.pending_vulkan_renderer.take();
             api.as_mut().remove_node(&render_node);
 
             match device
@@ -795,15 +796,17 @@ impl State {
                     kms.dmabuf_global.as_ref().unwrap(),
                 ));
             }
-        } else if kms.software_renderer.is_none() {
-            info!("Failed to find a suitable gpu, using software renderingr");
-            kms.software_renderer = match software_renderer() {
-                Ok(renderer) => Some(renderer),
-                Err(err) => {
-                    error!(?err, "Failed to initialize software EGL renderer.");
-                    None
-                }
-            };
+        } else {
+            if !kms.is_vulkan() && kms.software_renderer.is_none() {
+                info!("Failed to find a suitable gpu, using software renderer");
+                kms.software_renderer = match software_renderer() {
+                    Ok(renderer) => Some(renderer),
+                    Err(err) => {
+                        error!(?err, "Failed to initialize software EGL renderer.");
+                        None
+                    }
+                };
+            }
 
             if let Some(drm) = self.common.wl_drm_state.take() {
                 remove_global_with_timer(dh, &self.common.event_loop_handle, drm.global().clone());

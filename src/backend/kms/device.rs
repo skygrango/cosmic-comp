@@ -149,6 +149,7 @@ pub struct InnerDevice {
     pub egl: Option<EGLInternals>,
     pub vulkan: Option<VulkanInternals>,
     pub vulkan_phd: Option<PhysicalDevice>,
+    pub pending_vulkan_renderer: Option<VulkanRenderer>,
     pub is_vulkan: bool,
     pub fd: DrmDeviceFd,
 
@@ -740,77 +741,87 @@ impl Device {
 
         let gbm = GbmDevice::new(fd.clone())
             .with_context(|| format!("Failed to initialize GBM device for {}", path.display()))?;
-        let (render_node, render_formats, texture_formats, is_software, egl, vulkan_phd, is_vulkan) =
-            if let Some(instance) = vulkan_instance {
-                let dev_render_node = dev_node
-                    .node_with_type(smithay::backend::drm::NodeType::Render)
-                    .and_then(|res| res.ok());
-                let dev_primary_node = dev_node
-                    .node_with_type(smithay::backend::drm::NodeType::Primary)
-                    .and_then(|res| res.ok());
-                let phd = PhysicalDevice::enumerate(instance)?
-                    .find(|phd| {
-                        if let Ok(Some(primary)) = phd.primary_node() {
-                            if primary == dev_node || Some(primary) == dev_primary_node {
-                                return true;
-                            }
+        let (
+            render_node,
+            render_formats,
+            texture_formats,
+            is_software,
+            egl,
+            vulkan_phd,
+            pending_vulkan_renderer,
+            is_vulkan,
+        ) = if let Some(instance) = vulkan_instance {
+            let dev_render_node = dev_node
+                .node_with_type(smithay::backend::drm::NodeType::Render)
+                .and_then(|res| res.ok());
+            let dev_primary_node = dev_node
+                .node_with_type(smithay::backend::drm::NodeType::Primary)
+                .and_then(|res| res.ok());
+            let phd = PhysicalDevice::enumerate(instance)?
+                .find(|phd| {
+                    if let Ok(Some(primary)) = phd.primary_node() {
+                        if primary == dev_node || Some(primary) == dev_primary_node {
+                            return true;
                         }
-                        if let Ok(Some(render)) = phd.render_node() {
-                            if render == dev_node || Some(render) == dev_render_node {
-                                return true;
-                            }
+                    }
+                    if let Ok(Some(render)) = phd.render_node() {
+                        if render == dev_node || Some(render) == dev_render_node {
+                            return true;
                         }
-                        false
-                    })
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Failed to find matching Vulkan physical device for DRM node {:?}",
-                            dev_node
-                        )
-                    })?;
+                    }
+                    false
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Failed to find matching Vulkan physical device for DRM node {:?}",
+                        dev_node
+                    )
+                })?;
 
-                let render_node = phd.render_node().ok().flatten().unwrap_or(dev_node);
-                let is_software =
-                    phd.ty() == smithay::backend::vulkan::ash::vk::PhysicalDeviceType::CPU;
-                let temp_renderer = VulkanRenderer::new(&phd, Some(fd.clone()))
-                    .context("Failed to create temporary Vulkan renderer to query formats")?;
-                let texture_formats = temp_renderer.dmabuf_formats();
-                let render_formats = smithay::backend::renderer::Bind::<
-                    smithay::backend::allocator::dmabuf::Dmabuf,
-                >::supported_formats(&temp_renderer)
-                .unwrap_or_else(|| texture_formats.clone());
+            let render_node = phd.render_node().ok().flatten().unwrap_or(dev_node);
+            let is_software =
+                phd.ty() == smithay::backend::vulkan::ash::vk::PhysicalDeviceType::CPU;
+            let initial_renderer = VulkanRenderer::new(&phd, Some(fd.clone()))
+                .context("Failed to create initial Vulkan renderer")?;
+            let texture_formats = initial_renderer.dmabuf_formats();
+            let render_formats = smithay::backend::renderer::Bind::<
+                smithay::backend::allocator::dmabuf::Dmabuf,
+            >::supported_formats(&initial_renderer)
+            .unwrap_or_else(|| texture_formats.clone());
 
-                (
-                    render_node,
-                    render_formats,
-                    texture_formats,
-                    is_software,
-                    None,
-                    Some(phd),
-                    true,
-                )
-            } else {
-                let egl = init_egl(&gbm)?;
+            (
+                render_node,
+                render_formats,
+                texture_formats,
+                is_software,
+                None,
+                Some(phd),
+                Some(initial_renderer),
+                true,
+            )
+        } else {
+            let egl = init_egl(&gbm)?;
 
-                let render_node = egl
-                    .device
-                    .try_get_render_node()
-                    .ok()
-                    .and_then(std::convert::identity)
-                    .unwrap_or(dev_node);
-                let render_formats = egl.context.dmabuf_render_formats().clone();
-                let texture_formats = egl.context.dmabuf_texture_formats().clone();
+            let render_node = egl
+                .device
+                .try_get_render_node()
+                .ok()
+                .and_then(std::convert::identity)
+                .unwrap_or(dev_node);
+            let render_formats = egl.context.dmabuf_render_formats().clone();
+            let texture_formats = egl.context.dmabuf_texture_formats().clone();
 
-                (
-                    render_node,
-                    render_formats,
-                    texture_formats,
-                    egl.device.is_software(),
-                    None,
-                    None,
-                    false,
-                )
-            };
+            (
+                render_node,
+                render_formats,
+                texture_formats,
+                egl.device.is_software(),
+                None,
+                None,
+                None,
+                false,
+            )
+        };
 
         let kms_thread = start_kms_thread(notifier);
 
@@ -865,6 +876,7 @@ impl Device {
                 egl,
                 vulkan: None,
                 vulkan_phd,
+                pending_vulkan_renderer,
                 is_vulkan,
                 fd,
 
@@ -1253,8 +1265,11 @@ impl InnerDevice {
                     .vulkan_phd
                     .as_ref()
                     .context("No Vulkan physical device found")?;
-                let renderer = VulkanRenderer::new(phd, Some(self.fd.clone()))
-                    .context("Failed to create Vulkan renderer")?;
+                let renderer = match self.pending_vulkan_renderer.take() {
+                    Some(renderer) => renderer,
+                    None => VulkanRenderer::new(phd, Some(self.fd.clone()))
+                        .context("Failed to create Vulkan renderer")?,
+                };
                 api.add_node(
                     self.render_node,
                     GbmAllocator::new(
@@ -1267,6 +1282,9 @@ impl InnerDevice {
             }
             Ok(true)
         } else {
+            if primary_node.is_some() {
+                let _ = self.pending_vulkan_renderer.take();
+            }
             // For Vulkan, do not destroy the renderer simply because outputs are temporarily sleeping or inactive.
             // Keeping the renderer alive preserves allocated surface textures across DPMS off/on cycles.
             // The renderer will only be cleaned up when cosmic-comp shuts down or on device removal.
