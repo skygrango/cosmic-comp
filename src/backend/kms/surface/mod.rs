@@ -3586,8 +3586,9 @@ fn send_screencopy_result_vulkan<'a>(
             })
             .collect::<Vec<_>>();
 
-        let fullscreen_surface = output
-            .is_foreground_fullscreen_occupied()
+        let fullscreen_surface = (output_transform == Transform::Normal)
+            .then(|| output.is_foreground_fullscreen_occupied())
+            .flatten()
             .filter(|f| f.surface.alive());
 
         if let Some(fullscreen) = fullscreen_surface {
@@ -3622,6 +3623,9 @@ fn send_screencopy_result_vulkan<'a>(
                             smithay::backend::renderer::utils::with_renderer_surface_state(
                                 &wl_surface,
                                 |state| {
+                                    if state.buffer_transform() != Transform::Normal {
+                                        return None;
+                                    }
                                     let buffer = state.buffer()?;
                                     get_dmabuf(buffer).ok().cloned()
                                 },
@@ -3666,7 +3670,7 @@ fn send_screencopy_result_vulkan<'a>(
 
                 if !direct_blit_done {
                     let mut frame = renderer
-                        .render(fb.as_mut().unwrap(), output_size, output_transform)
+                        .render(fb.as_mut().unwrap(), output_size, Transform::Normal)
                         .map_err(|err| {
                             tracing::error!(
                                 "send_screencopy_result_vulkan: fullscreen render failed: {:#}",
@@ -3729,7 +3733,7 @@ fn send_screencopy_result_vulkan<'a>(
                         .collect::<Vec<_>>();
                     if !cursor_elements.is_empty() {
                         let mut frame = renderer
-                            .render(fb.as_mut().unwrap(), output_size, output_transform)
+                            .render(fb.as_mut().unwrap(), output_size, Transform::Normal)
                             .map_err(|err| {
                                 RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(err)
                             })?;
@@ -3753,7 +3757,7 @@ fn send_screencopy_result_vulkan<'a>(
             sync = frame_result
                 .blit_frame_result(
                     output_size,
-                    output_transform,
+                    output_transform.invert(),
                     output_scale,
                     renderer,
                     fb.as_mut().unwrap(),

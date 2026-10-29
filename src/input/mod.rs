@@ -3025,7 +3025,6 @@ impl State {
         location: Point<f64, Logical>,
         constraint: Option<&PointerConstraint>,
     ) {
-
         let point_and_output = {
             let shell = self.common.shell.read();
             let found = shell.workspaces.sets.iter().find_map(|(out, set)| {

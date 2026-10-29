@@ -950,6 +950,9 @@ pub fn render_window_to_buffer(
 
         let window_dmabuf = toplevel.wl_surface().and_then(|wl_surface| {
             with_renderer_surface_state(&wl_surface, |state| {
+                if state.buffer_transform() != Transform::Normal {
+                    return None;
+                }
                 let buffer = state.buffer()?;
                 get_dmabuf(buffer).ok().cloned()
             })
